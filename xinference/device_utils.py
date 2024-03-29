@@ -78,7 +78,7 @@ def get_device_preferred_dtype(device: str) -> Union[torch.dtype, None]:
     if device == "cpu":
         return torch.float32
     elif device == "cuda" or device == "mps" or device == "npu":
-        return torch.float16
+        return torch.float32
     elif device == "xpu":
         return torch.bfloat16
 
