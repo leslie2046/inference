@@ -145,3 +145,4 @@ doc/source/savefig/
 asv/results
 
 .DS_Store
+nohup.out
