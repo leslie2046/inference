@@ -20,12 +20,18 @@
      "A man is riding a horse.",
      "A woman is playing violin."]
 	 }' -w "\n时间总计: %{time_total} 秒\n"  
+curl -X 'POST'   'http://192.168.1.88:9997/v1/embeddings' \
+-H 'accept: application/json'   -H 'Content-Type: application/json' \
+-d '{
+"model": "bge-m3",
+"input": ["我是中国人"]
+
+}'  -w "\n时间总计: %{time_total} 秒\n"
   curl -X 'POST'   'http://192.168.1.88:9997/v1/audio/transcriptions' \
     -H 'accept: application/json' \
     -H "Content-Type: multipart/form-data" \
     -F file="@./bill_gates-TED.mp3" \
     -F model="SenseVoiceSmall" \
-    -F language="en" \
     -w "\n时间总计: %{time_total} 秒\n"
     
             curl -X 'POST'   'http://192.168.1.88:9997/v1/audio/transcriptions' \
@@ -36,10 +42,3 @@
     -F model="SenseVoiceSmall" \
     -F language="en" \
     -w "\n时间总计: %{time_total} 秒\n"
-curl -X 'POST'   'http://192.168.1.88:9997/v1/embeddings' \
--H 'accept: application/json'   -H 'Content-Type: application/json' \
--d '{
-"model": "bge-m3",
-"input": ["我是中国人"]
-
-}'  -w "\n时间总计: %{time_total} 秒\n"
