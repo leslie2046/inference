@@ -1,5 +1,5 @@
 #!/bin/sh
- curl -X 'POST'   'http://192.168.1.88:9997/v1/rerank'   -H 'accept: application/json'   -H 'Content-Type: application/json'   -d '{
+curl -X 'POST'   'http://192.168.1.88:9997/v1/rerank'   -H 'accept: application/json'   -H 'Content-Type: application/json'   -d '{
  "model": "bge-reranker-large",
  "query": "A man is eating pasta.",
  "documents": [
@@ -10,7 +10,7 @@
      "A woman is playing violin."]
 	 }' -w "\n时间总计: %{time_total} 秒\n"
 	 
-  curl -X 'POST'   'http://192.168.1.88:9997/v1/rerank'   -H 'accept: application/json'   -H 'Content-Type: application/json'   -d '{
+curl -X 'POST'   'http://192.168.1.88:9997/v1/rerank'   -H 'accept: application/json'   -H 'Content-Type: application/json'   -d '{
  "model": "jina-reranker-v2",
  "query": "A man is eating pasta.",
  "documents": [
@@ -20,21 +20,22 @@
      "A man is riding a horse.",
      "A woman is playing violin."]
 	 }' -w "\n时间总计: %{time_total} 秒\n"  
+
 curl -X 'POST'   'http://192.168.1.88:9997/v1/embeddings' \
 -H 'accept: application/json'   -H 'Content-Type: application/json' \
 -d '{
 "model": "bge-m3",
 "input": ["我是中国人"]
-
 }'  -w "\n时间总计: %{time_total} 秒\n"
-  curl -X 'POST'   'http://192.168.1.88:9997/v1/audio/transcriptions' \
+
+curl -X 'POST'   'http://192.168.1.88:9997/v1/audio/transcriptions' \
     -H 'accept: application/json' \
     -H "Content-Type: multipart/form-data" \
     -F file="@./bill_gates-TED.mp3" \
     -F model="SenseVoiceSmall" \
     -w "\n时间总计: %{time_total} 秒\n"
     
-            curl -X 'POST'   'http://192.168.1.88:9997/v1/audio/transcriptions' \
+curl -X 'POST'   'http://192.168.1.88:9997/v1/audio/transcriptions' \
     -H 'accept: application/json' \
     -H "Content-Type: multipart/form-data" \
     -F file="@./chinese_test.wav" \
