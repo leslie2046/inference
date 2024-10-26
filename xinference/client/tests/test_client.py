@@ -99,15 +99,9 @@ def test_RESTful_client(setup):
         for _ in range(2):
             r = executor.submit(_check_stream)
             results.append(r)
-    # Parallel generation is not supported by llama-cpp-python.
-    error_count = 0
+
     for r in results:
-        try:
-            r.result()
-        except Exception as ex:
-            assert "Parallel generation" in str(ex)
-            error_count += 1
-    assert error_count == 1
+        r.result()
 
     # After iteration finish, we can iterate again.
     _check_stream()
@@ -143,18 +137,12 @@ def test_RESTful_client(setup):
 
     for stream in [True, False]:
         results = []
-        error_count = 0
         with ThreadPoolExecutor() as executor:
             for _ in range(3):
                 r = executor.submit(_check, stream=stream)
                 results.append(r)
         for r in results:
-            try:
-                r.result()
-            except Exception as ex:
-                assert "Parallel generation" in str(ex)
-                error_count += 1
-        assert error_count == (2 if stream else 0)
+            r.result()
 
     client.terminate_model(model_uid=model_uid)
     assert len(client.list_models()) == 0
@@ -194,13 +182,6 @@ def test_RESTful_client_for_embedding(setup):
 
     completion = model.create_embedding("write a poem.")
     assert len(completion["data"][0]["embedding"]) == 768
-
-    kwargs = {
-        "invalid": "invalid",
-    }
-    with pytest.raises(RuntimeError) as err:
-        completion = model.create_embedding("write a poem.", **kwargs)
-    assert "unexpected" in str(err.value)
 
     client.terminate_model(model_uid=model_uid)
     assert len(client.list_models()) == 0

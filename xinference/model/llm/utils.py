@@ -29,6 +29,7 @@ from ...types import (
     ChatCompletion,
     ChatCompletionChoice,
     ChatCompletionChunk,
+    ChatCompletionMessage,
     Completion,
     CompletionChoice,
     CompletionChunk,
@@ -50,11 +51,16 @@ QWEN_TOOL_CALL_FAMILY = [
     "qwen1.5-moe-chat",
     "qwen2-instruct",
     "qwen2-moe-instruct",
+    "qwen2.5-instruct",
 ]
 
 GLM4_TOOL_CALL_FAMILY = [
     "glm4-chat",
     "glm4-chat-1m",
+]
+
+LLAMA3_TOOL_CALL_FAMILY = [
+    "llama-3.1-instruct",
 ]
 
 QWEN_TOOL_CALL_SYMBOLS = ["<tool_call>", "</tool_call>"]
@@ -113,7 +119,7 @@ class ChatModelMixin:
             return self._build_from_raw_template(messages, chat_template, **kwargs)
 
     @staticmethod
-    def get_specific_prompt(model_family: str, messages: List[Dict]):
+    def get_specific_prompt(model_family: str, messages: List[ChatCompletionMessage]):
         """
         Inspired by FastChat. Format chat history into a prompt according to the prompty style of
         different models.
@@ -129,7 +135,7 @@ class ChatModelMixin:
             ret = (
                 "<s>"
                 if system_prompt == ""
-                else "<s><|im_start|>system\n"
+                else "<s><|im_start|>system\n"  # type: ignore
                 + system_prompt
                 + intra_message_sep
                 + "\n"
@@ -159,14 +165,25 @@ class ChatModelMixin:
                         for image_url in image_urls:
                             fut = executor.submit(_decode_image, image_url)
                             image_futures.append(fut)
-                    images = [fut.result() for fut in image_futures]
+                    images.extend([fut.result() for fut in image_futures])
                     if len(image_futures) == 0:
                         ret += role + "\n" + text + intra_message_sep + "\n"
                     else:
-                        ret += (
-                            role + "\n" + f"<image>\n{text}" + intra_message_sep + "\n"
+                        placeholders = "\n".join(
+                            f"Image-{i+1}: <image>\n"
+                            for i in range(
+                                len(images) - len(image_futures), len(images)
+                            )
                         )
-
+                        ret += (
+                            role
+                            + "\n"
+                            + f"{placeholders}\n{text}"
+                            + intra_message_sep
+                            + "\n"
+                        )
+            if len(images) == 1:
+                ret = ret.replace("Image-1: <image>\n", "<image>\n")
             return ret, images
         else:
             raise ValueError(f"Invalid model family: {model_family}")
@@ -301,85 +318,82 @@ class ChatModelMixin:
         }
 
     @staticmethod
-    def _eval_glm_chat_arguments(c):
+    def _eval_glm_chat_arguments(c) -> List[Tuple]:
+        """
+        Currently, glm4 tool call only supports one function
+        """
         try:
             if isinstance(c, dict):
-                return None, c["name"], c["arguments"]
+                return [(None, c["name"], c["arguments"])]
         except KeyError:
             logger.error("Can't parse glm output: %s", c)
-            return str(c), None, None
+            return [(str(c), None, None)]
         else:
-            return str(c), None, None
+            return [(str(c), None, None)]
 
-    @staticmethod
-    def _eval_qwen_chat_arguments(c):
+    @classmethod
+    def _handle_qwen_tool_result(cls, text: str) -> List[Tuple]:
+        text: str = text.strip()  # type: ignore
+        contents: List[str] = text.split(QWEN_TOOL_CALL_SYMBOLS[1])
+        results: List[Tuple] = []
+        for content in contents:
+            content = content.strip()
+            if content:
+                pos = content.find(QWEN_TOOL_CALL_SYMBOLS[0])
+                if pos != -1:
+                    content = content[pos + len(QWEN_TOOL_CALL_SYMBOLS[0]) :]
+                content = content.strip()
+                try:
+                    res = json.loads(content)
+                    results.append((None, res["name"], res["arguments"]))
+                except Exception as e:
+                    logger.error(
+                        "Can't parse single qwen tool call output: %s. Error: %s",
+                        content,
+                        e,
+                    )
+                    results.append((content, None, None))
+        return results
+
+    @classmethod
+    def _eval_qwen_chat_arguments(cls, c) -> List[Tuple]:
         text = c["choices"][0]["text"]
-        text: str = text.strip()
-        if text.startswith(QWEN_TOOL_CALL_SYMBOLS[0]):
-            text = text[len(QWEN_TOOL_CALL_SYMBOLS[0]) :]
-        if text.endswith(QWEN_TOOL_CALL_SYMBOLS[1]):
-            text = text[: -len(QWEN_TOOL_CALL_SYMBOLS[1])]
-        text = text.strip()
+        return cls._handle_qwen_tool_result(text)
+
+    @classmethod
+    def _eval_llama3_chat_arguments(cls, c) -> List[Tuple]:
+        text = c["choices"][0]["text"]
         try:
-            content = json.loads(text)
-            return None, content["name"], content["arguments"]
-        except Exception as e:
-            logger.error("Can't parse qwen tool call output: %s. Error: %s", text, e)
-            return text, None, None
+            data = eval(text, {}, {})
+            return [(None, data["name"], data["parameters"])]
+        except Exception:
+            return [(text, None, None)]
 
     @classmethod
     def _eval_tool_arguments(cls, model_family, c):
         family = model_family.model_family or model_family.model_name
         if family in GLM4_TOOL_CALL_FAMILY:
-            content, func, args = cls._eval_glm_chat_arguments(c)
+            result = cls._eval_glm_chat_arguments(c)
         elif family in QWEN_TOOL_CALL_FAMILY:
-            content, func, args = cls._eval_qwen_chat_arguments(c)
+            result = cls._eval_qwen_chat_arguments(c)
+        elif family in LLAMA3_TOOL_CALL_FAMILY:
+            result = cls._eval_llama3_chat_arguments(c)
         else:
             raise Exception(
                 f"Model {model_family.model_name} is not support tool calls."
             )
-        logger.debug("Tool call content: %s, func: %s, args: %s", content, func, args)
-        return content, func, args
+        logger.debug(f"Tool call content: {result}")
+        return result
 
     @classmethod
-    def _tools_token_filter(cls, model_family):
-        """
-        Generates a filter function for Qwen series models to retain outputs after "\nFinal Answer:".
-
-        Returns:
-            A function that takes tokens (string output by the model so far) and delta (new tokens added) as input,
-            returns the part after "\nFinal Answer:" if found, else returns delta.
-        """
-        family = model_family.model_family or model_family.model_name
-        if family in QWEN_TOOL_CALL_FAMILY:
-            # Encapsulating function to reset 'found' after each call
-            found = False
-
-            def process_tokens(tokens: str, delta: str):
-                nonlocal found
-                # Once "Final Answer:" is found, future tokens are allowed.
-                if found:
-                    return delta
-                # Check if the token ends with "\nFinal Answer:" and update `found`.
-                final_answer_idx = tokens.lower().rfind("\nfinal answer:")
-                if final_answer_idx != -1:
-                    found = True
-                    return tokens[final_answer_idx + len("\nfinal answer:") :]
-                return ""
-
-            return process_tokens
-        else:
-            return lambda tokens, delta: delta
-
-    @classmethod
-    def _tool_calls_completion_chunk(cls, model_family, model_uid, c):
-        _id = str(uuid.uuid4())
-        content, func, args = cls._eval_tool_arguments(model_family, c)
-        if func:
-            d = {
-                "role": "assistant",
-                "content": content,
-                "tool_calls": [
+    def _tool_calls_completion_chunk(cls, model_family, model_uid, c, chunk_id=None):
+        _id = chunk_id if chunk_id is not None else str(uuid.uuid4())
+        tool_result = cls._eval_tool_arguments(model_family, c)
+        tool_calls = []
+        failed_contents = []
+        for content, func, args in tool_result:
+            if func:
+                tool_calls.append(
                     {
                         "id": f"call_{_id}",
                         "type": "function",
@@ -388,12 +402,15 @@ class ChatModelMixin:
                             "arguments": json.dumps(args, ensure_ascii=False),
                         },
                     }
-                ],
-            }
-            finish_reason = "tool_calls"
-        else:
-            d = {"role": "assistant", "content": content, "tool_calls": []}
-            finish_reason = "stop"
+                )
+            else:
+                failed_contents.append(content)
+        finish_reason = "tool_calls" if tool_calls else "stop"
+        d = {
+            "role": "assistant",
+            "content": ". ".join(failed_contents) if failed_contents else None,
+            "tool_calls": tool_calls,
+        }
         try:
             usage = c.get("usage")
             assert "prompt_tokens" in usage
@@ -422,12 +439,13 @@ class ChatModelMixin:
     @classmethod
     def _tool_calls_completion(cls, model_family, model_uid, c):
         _id = str(uuid.uuid4())
-        content, func, args = cls._eval_tool_arguments(model_family, c)
-        if func:
-            m = {
-                "role": "assistant",
-                "content": content,
-                "tool_calls": [
+        tool_result = cls._eval_tool_arguments(model_family, c)
+
+        tool_calls = []
+        failed_contents = []
+        for content, func, args in tool_result:
+            if func:
+                tool_calls.append(
                     {
                         "id": f"call_{_id}",
                         "type": "function",
@@ -436,12 +454,15 @@ class ChatModelMixin:
                             "arguments": json.dumps(args, ensure_ascii=False),
                         },
                     }
-                ],
-            }
-            finish_reason = "tool_calls"
-        else:
-            m = {"role": "assistant", "content": content, "tool_calls": []}
-            finish_reason = "stop"
+                )
+            else:
+                failed_contents.append(content)
+        finish_reason = "tool_calls" if tool_calls else "stop"
+        m = {
+            "role": "assistant",
+            "content": ". ".join(failed_contents) if failed_contents else None,
+            "tool_calls": tool_calls,
+        }
         try:
             usage = c.get("usage")
             assert "prompt_tokens" in usage
@@ -465,6 +486,34 @@ class ChatModelMixin:
             ],
             "usage": usage,
         }
+
+    def _transform_messages(
+        self,
+        messages: List[ChatCompletionMessage],
+    ):
+        transformed_messages = []
+        for msg in messages:
+            new_content = []
+            role = msg["role"]
+            content = msg["content"]
+            if isinstance(content, str):
+                new_content.append({"type": "text", "text": content})
+            elif isinstance(content, List):
+                for item in content:  # type: ignore
+                    if "text" in item:
+                        new_content.append({"type": "text", "text": item["text"]})
+                    elif "image_url" in item:
+                        new_content.append(
+                            {"type": "image", "image": item["image_url"]["url"]}
+                        )
+                    elif "video_url" in item:
+                        new_content.append(
+                            {"type": "video", "video": item["video_url"]["url"]}
+                        )
+            new_message = {"role": role, "content": new_content}
+            transformed_messages.append(new_message)
+
+        return transformed_messages
 
 
 def get_file_location(
@@ -547,6 +596,32 @@ def generate_completion_chunk(
         created=int(time.time()),
         model=model_uid,
         choices=choices,
+        usage=CompletionUsage(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=total_tokens,
+        ),
+    )
+
+
+def generate_completion(
+    model_uid: str,
+    response: str,
+    prompt_tokens=-1,
+    completion_tokens=-1,
+    total_tokens=-1,
+    finish_reason="stop",
+) -> Completion:
+    return Completion(
+        id=str(uuid.uuid1()),
+        object="text_completion",
+        created=int(time.time()),
+        model=model_uid,
+        choices=[
+            CompletionChoice(
+                text=response, index=0, logprobs=None, finish_reason=finish_reason
+            )
+        ],
         usage=CompletionUsage(
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,

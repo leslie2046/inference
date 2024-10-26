@@ -23,12 +23,15 @@ import huggingface_hub
 import numpy as np
 import torch
 
-from ..constants import XINFERENCE_CACHE_DIR, XINFERENCE_ENV_MODEL_SRC
+from ..constants import (
+    XINFERENCE_CACHE_DIR,
+    XINFERENCE_DOWNLOAD_MAX_ATTEMPTS,
+    XINFERENCE_ENV_MODEL_SRC,
+)
 from ..device_utils import get_available_device, is_device_available
 from .core import CacheableModelSpec
 
 logger = logging.getLogger(__name__)
-MAX_ATTEMPTS = 3
 IS_NEW_HUGGINGFACE_HUB: bool = huggingface_hub.__version__ >= "0.23.0"
 
 
@@ -100,11 +103,11 @@ def retry_download(
     **kwargs,
 ):
     last_ex = None
-    for current_attempt in range(1, MAX_ATTEMPTS + 1):
+    for current_attempt in range(1, XINFERENCE_DOWNLOAD_MAX_ATTEMPTS + 1):
         try:
             return download_func(*args, **kwargs)
         except Exception as e:
-            remaining_attempts = MAX_ATTEMPTS - current_attempt
+            remaining_attempts = XINFERENCE_DOWNLOAD_MAX_ATTEMPTS - current_attempt
             last_ex = e
             logger.debug(
                 "Download failed: %s, download func: %s, download args: %s, kwargs: %s",
@@ -298,31 +301,6 @@ def cache(model_spec: CacheableModelSpec, model_description_type: type):
         desc = model_description_type(None, None, model_spec)
         json.dump(desc.to_dict(), f)
     return cache_dir
-
-
-def patch_trust_remote_code():
-    """sentence-transformers calls transformers without the trust_remote_code=True, some embedding
-    models will fail to load, e.g. jina-embeddings-v2-base-en
-
-    :return:
-    """
-    try:
-        from transformers.dynamic_module_utils import resolve_trust_remote_code
-    except ImportError:
-        logger.error("Patch transformers trust_remote_code failed.")
-    else:
-
-        def _patched_resolve_trust_remote_code(*args, **kwargs):
-            logger.info("Patched resolve_trust_remote_code: %s %s", args, kwargs)
-            return True
-
-        if (
-            resolve_trust_remote_code.__code__
-            != _patched_resolve_trust_remote_code.__code__
-        ):
-            resolve_trust_remote_code.__code__ = (
-                _patched_resolve_trust_remote_code.__code__
-            )
 
 
 def select_device(device):

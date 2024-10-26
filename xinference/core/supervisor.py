@@ -130,6 +130,7 @@ class SupervisorActor(xo.StatelessActor):
             )
         logger.info(f"Xinference supervisor {self.address} started")
         from .cache_tracker import CacheTrackerActor
+        from .progress_tracker import ProgressTrackerActor
         from .status_guard import StatusGuardActor
 
         self._status_guard_ref: xo.ActorRefType[  # type: ignore
@@ -141,6 +142,13 @@ class SupervisorActor(xo.StatelessActor):
             "CacheTrackerActor"
         ] = await xo.create_actor(
             CacheTrackerActor, address=self.address, uid=CacheTrackerActor.default_uid()
+        )
+        self._progress_tracker: xo.ActorRefType[  # type: ignore
+            "ProgressTrackerActor"
+        ] = await xo.create_actor(
+            ProgressTrackerActor,
+            address=self.address,
+            uid=ProgressTrackerActor.default_uid(),
         )
 
         from .event import EventCollectorActor
@@ -315,6 +323,7 @@ class SupervisorActor(xo.StatelessActor):
     @staticmethod
     async def get_builtin_families() -> Dict[str, List[str]]:
         from ..model.llm.llm_family import (
+            BUILTIN_LLM_FAMILIES,
             BUILTIN_LLM_MODEL_CHAT_FAMILIES,
             BUILTIN_LLM_MODEL_GENERATE_FAMILIES,
             BUILTIN_LLM_MODEL_TOOL_CALL_FAMILIES,
@@ -324,6 +333,11 @@ class SupervisorActor(xo.StatelessActor):
             "chat": list(BUILTIN_LLM_MODEL_CHAT_FAMILIES),
             "generate": list(BUILTIN_LLM_MODEL_GENERATE_FAMILIES),
             "tools": list(BUILTIN_LLM_MODEL_TOOL_CALL_FAMILIES),
+            "vision": [
+                family.model_name
+                for family in BUILTIN_LLM_FAMILIES
+                if "vision" in family.model_ability
+            ],
         }
 
     async def get_devices_count(self) -> int:
@@ -1354,3 +1368,6 @@ class SupervisorActor(xo.StatelessActor):
     @staticmethod
     def record_metrics(name, op, kwargs):
         record_metrics(name, op, kwargs)
+
+    async def get_progress(self, request_id: str) -> float:
+        return await self._progress_tracker.get_progress(request_id)

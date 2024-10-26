@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import asyncio
+import json
 import logging
 import multiprocessing
 import os
@@ -33,6 +34,7 @@ from typing import (
 from ....types import (
     ChatCompletion,
     ChatCompletionChunk,
+    ChatCompletionMessage,
     Completion,
     CompletionChoice,
     CompletionChunk,
@@ -47,6 +49,7 @@ from ..utils import (
     ChatModelMixin,
     generate_completion_chunk,
 )
+from .utils import vllm_check
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +68,7 @@ class VLLMModelConfig(TypedDict, total=False):
     max_num_seqs: int
     quantization: Optional[str]
     max_model_len: Optional[int]
+    limit_mm_per_prompt: Optional[Dict[str, int]]
 
 
 class VLLMGenerateConfig(TypedDict, total=False):
@@ -90,9 +94,7 @@ try:
 except ImportError:
     VLLM_INSTALLED = False
 
-VLLM_SUPPORTED_VISION_MODEL_LIST: List[str] = [
-    "internvl2",
-]
+VLLM_SUPPORTED_VISION_MODEL_LIST: List[str] = []
 VLLM_SUPPORTED_MODELS = [
     "llama-2",
     "llama-3",
@@ -104,6 +106,7 @@ VLLM_SUPPORTED_MODELS = [
     "code-llama-python",
     "deepseek",
     "deepseek-coder",
+    "yi-coder",
 ]
 VLLM_SUPPORTED_CHAT_MODELS = [
     "llama-2-chat",
@@ -130,12 +133,18 @@ VLLM_SUPPORTED_CHAT_MODELS = [
     "codegeex4",
     "deepseek-chat",
     "deepseek-coder-instruct",
+    "yi-coder-chat",
 ]
 if VLLM_INSTALLED and vllm.__version__ >= "0.3.0":
     VLLM_SUPPORTED_CHAT_MODELS.append("qwen1.5-chat")
     VLLM_SUPPORTED_MODELS.append("codeqwen1.5")
     VLLM_SUPPORTED_CHAT_MODELS.append("codeqwen1.5-chat")
     VLLM_SUPPORTED_CHAT_MODELS.append("qwen2-instruct")
+    VLLM_SUPPORTED_MODELS.append("qwen2.5")
+    VLLM_SUPPORTED_CHAT_MODELS.append("qwen2.5-instruct")
+    VLLM_SUPPORTED_MODELS.append("qwen2.5-coder")
+    VLLM_SUPPORTED_CHAT_MODELS.append("qwen2.5-coder-instruct")
+
 
 if VLLM_INSTALLED and vllm.__version__ >= "0.3.2":
     VLLM_SUPPORTED_CHAT_MODELS.append("gemma-it")
@@ -149,6 +158,12 @@ if VLLM_INSTALLED and vllm.__version__ >= "0.4.0":
     VLLM_SUPPORTED_CHAT_MODELS.append("qwen2-moe-instruct")
     VLLM_SUPPORTED_CHAT_MODELS.append("c4ai-command-r-v01")
 
+if VLLM_INSTALLED and vllm.__version__ >= "0.5.1":
+    VLLM_SUPPORTED_CHAT_MODELS.append("deepseek-v2-chat")
+    VLLM_SUPPORTED_CHAT_MODELS.append("deepseek-v2-chat-0628")
+    VLLM_SUPPORTED_CHAT_MODELS.append("deepseek-v2.5")
+
+
 if VLLM_INSTALLED and vllm.__version__ >= "0.5.3":
     VLLM_SUPPORTED_CHAT_MODELS.append("gemma-2-it")
     VLLM_SUPPORTED_CHAT_MODELS.append("mistral-nemo-instruct")
@@ -157,6 +172,12 @@ if VLLM_INSTALLED and vllm.__version__ >= "0.5.3":
 if VLLM_INSTALLED and vllm.__version__ > "0.5.3":
     VLLM_SUPPORTED_MODELS.append("llama-3.1")
     VLLM_SUPPORTED_CHAT_MODELS.append("llama-3.1-instruct")
+
+if VLLM_INSTALLED and vllm.__version__ >= "0.6.1":
+    VLLM_SUPPORTED_VISION_MODEL_LIST.append("internvl2")
+
+if VLLM_INSTALLED and vllm.__version__ >= "0.6.3":
+    VLLM_SUPPORTED_VISION_MODEL_LIST.append("qwen2-vl-instruct")
 
 
 class VLLMModel(LLM):
@@ -291,7 +312,7 @@ class VLLMModel(LLM):
         model_config.setdefault("gpu_memory_utilization", 0.90)
         model_config.setdefault("max_num_seqs", 256)
         model_config.setdefault("quantization", None)
-        model_config.setdefault("max_model_len", 4096)
+        model_config.setdefault("max_model_len", None)
 
         return model_config
 
@@ -421,6 +442,7 @@ class VLLMModel(LLM):
             usage=usage,
         )
 
+    @vllm_check
     async def async_generate(
         self,
         prompt: Union[str, Dict[str, Any]],
@@ -652,6 +674,7 @@ class VLLMChatModel(VLLMModel, ChatModelMixin):
                     yield self._to_chat_completion_chunk(chunk)
             i += 1
 
+    @vllm_check
     async def async_chat(
         self,
         messages: List[Dict],
@@ -694,11 +717,26 @@ class VLLMVisionModel(VLLMModel, ChatModelMixin):
     def match(
         cls, llm_family: "LLMFamilyV1", llm_spec: "LLMSpecV1", quantization: str
     ) -> bool:
-        if llm_spec.model_format != "pytorch":
+        if not cls._has_cuda_device():
+            return False
+        if not cls._is_linux():
+            return False
+        if llm_spec.model_format not in ["pytorch", "gptq", "awq", "fp8"]:
             return False
         if llm_spec.model_format == "pytorch":
             if quantization != "none" and not (quantization is None):
                 return False
+        if llm_spec.model_format == "awq":
+            # Currently, only 4-bit weight quantization is supported for AWQ, but got 8 bits.
+            if "4" not in quantization:
+                return False
+        if llm_spec.model_format == "gptq":
+            if VLLM_INSTALLED and vllm.__version__ >= "0.3.3":
+                if not any(q in quantization for q in ("3", "4", "8")):
+                    return False
+            else:
+                if "4" not in quantization:
+                    return False
         if isinstance(llm_family, CustomLLMFamilyV1):
             if llm_family.model_family not in VLLM_SUPPORTED_VISION_MODEL_LIST:
                 return False
@@ -708,6 +746,33 @@ class VLLMVisionModel(VLLMModel, ChatModelMixin):
         if "vision" not in llm_family.model_ability:
             return False
         return VLLM_INSTALLED
+
+    def _sanitize_model_config(
+        self, model_config: Optional[VLLMModelConfig]
+    ) -> VLLMModelConfig:
+        if model_config is None:
+            model_config = VLLMModelConfig()
+
+        cuda_count = self._get_cuda_count()
+
+        model_config.setdefault("tokenizer_mode", "auto")
+        model_config.setdefault("trust_remote_code", True)
+        model_config.setdefault("tensor_parallel_size", cuda_count)
+        model_config.setdefault("block_size", 16)
+        model_config.setdefault("swap_space", 4)
+        model_config.setdefault("gpu_memory_utilization", 0.90)
+        model_config.setdefault("max_num_seqs", 256)
+        model_config.setdefault("quantization", None)
+        model_config.setdefault("max_model_len", None)
+        model_config["limit_mm_per_prompt"] = (
+            json.loads(model_config.get("limit_mm_per_prompt"))  # type: ignore
+            if model_config.get("limit_mm_per_prompt")
+            else {
+                "image": 2,  # default 2 images all chat
+            }
+        )
+
+        return model_config
 
     def _sanitize_chat_config(
         self,
@@ -728,24 +793,47 @@ class VLLMVisionModel(VLLMModel, ChatModelMixin):
                     )
         return generate_config
 
+    @vllm_check
     async def async_chat(
         self,
-        messages: List[Dict],
+        messages: List[ChatCompletionMessage],  # type: ignore
         generate_config: Optional[Dict] = None,
         request_id: Optional[str] = None,
     ) -> Union[ChatCompletion, AsyncGenerator[ChatCompletionChunk, None]]:
-        # only support single image, waiting vllm support multi images
-        model_family = self.model_family.model_family or self.model_family.model_name
-        prompt, images = self.get_specific_prompt(model_family, messages)
+        messages = self._transform_messages(messages)
+        tools = generate_config.pop("tools", []) if generate_config else None
 
-        if len(images) == 0:
+        model_family = self.model_family.model_family or self.model_family.model_name
+
+        if "internvl2" not in model_family.lower():
+            from qwen_vl_utils import process_vision_info
+
+            full_context_kwargs = {}
+            if tools and model_family in QWEN_TOOL_CALL_FAMILY:
+                full_context_kwargs["tools"] = tools
+            assert self.model_family.chat_template is not None
+            prompt = self.get_full_context(
+                messages, self.model_family.chat_template, **full_context_kwargs
+            )
+            images, video_inputs = process_vision_info(messages)
+            if video_inputs:
+                raise ValueError("Not support video input now.")
+        else:
+            prompt, images = self.get_specific_prompt(model_family, messages)
+
+        if not images:
             inputs = {
                 "prompt": prompt,
+            }
+        elif len(images) == 1:
+            inputs = {
+                "prompt": prompt,
+                "multi_modal_data": {"image": images[-1]},  # type: ignore
             }
         else:
             inputs = {
                 "prompt": prompt,
-                "multi_modal_data": {"image": images[-1]},  # type: ignore
+                "multi_modal_data": {"image": images},  # type: ignore
             }
         generate_config = self._sanitize_chat_config(generate_config)
 

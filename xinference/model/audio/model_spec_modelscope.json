@@ -9,6 +9,15 @@
     "multilingual": true
   },
   {
+    "model_name": "whisper-large-v3-turbo",
+    "model_family": "whisper",
+    "model_hub": "modelscope",
+    "model_id": "AI-ModelScope/whisper-large-v3-turbo",
+    "model_revision": "master",
+    "model_ability": "audio-to-text",
+    "multilingual": true
+  },
+  {
     "model_name": "SenseVoiceSmall",
     "model_family": "funasr",
     "model_hub": "modelscope",
@@ -33,7 +42,7 @@
     "model_name": "ChatTTS",
     "model_family": "ChatTTS",
     "model_hub": "modelscope",
-    "model_id": "pzc163/chatTTS",
+    "model_id": "AI-ModelScope/ChatTTS",
     "model_revision": "master",
     "model_ability": "text-to-audio",
     "multilingual": true

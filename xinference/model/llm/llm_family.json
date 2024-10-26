@@ -206,7 +206,7 @@
           "none"
         ],
         "model_id": "THUDM/glm-4-9b-chat",
-        "model_revision": "f6e0743b285dd808084530f070ad08e504386750"
+        "model_revision": "eb55a443d66541f30869f6caac5ad0d2e95bcbaa"
       },
       {
         "model_format": "ggufv2",
@@ -1111,7 +1111,8 @@
       "th"
     ],
     "model_ability": [
-      "chat"
+      "chat",
+      "tools"
     ],
     "model_description": "The Llama 3.1 instruction tuned models are optimized for dialogue use cases and outperform many of the available open source chat models on common industry benchmarks..",
     "model_specs": [
@@ -1299,14 +1300,16 @@
         "model_id": "hugging-quants/Meta-Llama-3.1-405B-Instruct-AWQ-INT4"
       }
     ],
-    "chat_template": "{{- '<|begin_of_text|>' }}\n{%- if custom_tools is defined %}\n    {%- set tools = custom_tools %}\n{%- endif %}\n{%- if not tools_in_user_message is defined %}\n    {%- set tools_in_user_message = true %}\n{%- endif %}\n{%- if not date_string is defined %}\n    {%- set date_string = \"26 Jul 2024\" %}\n{%- endif %}\n{%- if not tools is defined %}\n    {%- set tools = none %}\n{%- endif %}\n\n{#- This block extracts the system message, so we can slot it into the right place. #}\n{%- if messages[0]['role'] == 'system' %}\n    {%- set system_message = messages[0]['content']|trim %}\n    {%- set messages = messages[1:] %}\n{%- else %}\n    {%- set system_message = \"\" %}\n{%- endif %}\n\n{#- System message + builtin tools #}\n{{- \"<|start_header_id|>system<|end_header_id|>\n\n\" }}\n{%- if builtin_tools is defined or tools is not none %}\n    {{- \"Environment: ipython\n\" }}\n{%- endif %}\n{%- if builtin_tools is defined %}\n    {{- \"Tools: \" + builtin_tools | reject('equalto', 'code_interpreter') | join(\", \") + \"\n\n\"}}\n{%- endif %}\n{{- \"Cutting Knowledge Date: December 2023\n\" }}\n{{- \"Today Date: \" + date_string + \"\n\n\" }}\n{%- if tools is not none and not tools_in_user_message %}\n    {{- \"You have access to the following functions. To call a function, please respond with JSON for a function call.\" }}\n    {{- 'Respond in the format {\"name\": function name, \"parameters\": dictionary of argument name and its value}.' }}\n    {{- \"Do not use variables.\n\n\" }}\n    {%- for t in tools %}\n        {{- t | tojson(indent=4) }}\n        {{- \"\n\n\" }}\n    {%- endfor %}\n{%- endif %}\n{{- system_message }}\n{{- \"<|eot_id|>\" }}\n\n{#- Custom tools are passed in a user message with some extra guidance #}\n{%- if tools_in_user_message and not tools is none %}\n    {#- Extract the first user message so we can plug it in here #}\n    {%- if messages | length != 0 %}\n        {%- set first_user_message = messages[0]['content']|trim %}\n        {%- set messages = messages[1:] %}\n    {%- else %}\n        {{- raise_exception(\"Cannot put tools in the first user message when there's no first user message!\") }}\n{%- endif %}\n    {{- '<|start_header_id|>user<|end_header_id|>\n\n' -}}\n    {{- \"Given the following functions, please respond with a JSON for a function call \" }}\n    {{- \"with its proper arguments that best answers the given prompt.\n\n\" }}\n    {{- 'Respond in the format {\"name\": function name, \"parameters\": dictionary of argument name and its value}.' }}\n    {{- \"Do not use variables.\n\n\" }}\n    {%- for t in tools %}\n        {{- t | tojson(indent=4) }}\n        {{- \"\n\n\" }}\n    {%- endfor %}\n    {{- first_user_message + \"<|eot_id|>\"}}\n{%- endif %}\n\n{%- for message in messages %}\n    {%- if not (message.role == 'ipython' or message.role == 'tool' or 'tool_calls' in message) %}\n        {{- '<|start_header_id|>' + message['role'] + '<|end_header_id|>\n\n'+ message['content'] | trim + '<|eot_id|>' }}\n    {%- elif 'tool_calls' in message %}\n        {%- if not message.tool_calls|length == 1 %}\n            {{- raise_exception(\"This model only supports single tool-calls at once!\") }}\n        {%- endif %}\n        {%- set tool_call = message.tool_calls[0].function %}\n        {%- if builtin_tools is defined and tool_call.name in builtin_tools %}\n            {{- '<|start_header_id|>assistant<|end_header_id|>\n\n' -}}\n            {{- \"<|python_tag|>\" + tool_call.name + \".call(\" }}\n            {%- for arg_name, arg_val in tool_call.arguments | items %}\n                {{- arg_name + '=\"' + arg_val + '\"' }}\n                {%- if not loop.last %}\n                    {{- \", \" }}\n                {%- endif %}\n                {%- endfor %}\n            {{- \")\" }}\n        {%- else  %}\n            {{- '<|start_header_id|>assistant<|end_header_id|>\n\n' -}}\n            {{- '{\"name\": \"' + tool_call.name + '\", ' }}\n            {{- '\"parameters\": ' }}\n            {{- tool_call.arguments | tojson }}\n            {{- \"}\" }}\n        {%- endif %}\n        {%- if builtin_tools is defined %}\n            {#- This means we're in ipython mode #}\n            {{- \"<|eom_id|>\" }}\n        {%- else %}\n            {{- \"<|eot_id|>\" }}\n        {%- endif %}\n    {%- elif message.role == \"tool\" or message.role == \"ipython\" %}\n        {{- \"<|start_header_id|>ipython<|end_header_id|>\n\n\" }}\n        {%- if message.content is mapping or message.content is iterable %}\n            {{- message.content | tojson }}\n        {%- else %}\n            {{- message.content }}\n        {%- endif %}\n        {{- \"<|eot_id|>\" }}\n    {%- endif %}\n{%- endfor %}\n{%- if add_generation_prompt %}\n    {{- '<|start_header_id|>assistant<|end_header_id|>\n\n' }}\n{%- endif %}\n",
+    "chat_template": "{{- bos_token }}\n{%- if custom_tools is defined %}\n    {%- set tools = custom_tools %}\n{%- endif %}\n{%- if not tools_in_user_message is defined %}\n    {%- set tools_in_user_message = true %}\n{%- endif %}\n{%- if not date_string is defined %}\n    {%- set date_string = \"26 Jul 2024\" %}\n{%- endif %}\n{%- if not tools is defined %}\n    {%- set tools = none %}\n{%- endif %}\n\n{#- This block extracts the system message, so we can slot it into the right place. #}\n{%- if messages[0]['role'] == 'system' %}\n    {%- set system_message = messages[0]['content']|trim %}\n    {%- set messages = messages[1:] %}\n{%- else %}\n    {%- set system_message = \"\" %}\n{%- endif %}\n\n{#- System message + builtin tools #}\n{{- \"<|start_header_id|>system<|end_header_id|>\\n\\n\" }}\n{%- if builtin_tools is defined or tools is not none %}\n    {{- \"Environment: ipython\\n\" }}\n{%- endif %}\n{%- if builtin_tools is defined %}\n    {{- \"Tools: \" + builtin_tools | reject('equalto', 'code_interpreter') | join(\", \") + \"\\n\\n\"}}\n{%- endif %}\n{{- \"Cutting Knowledge Date: December 2023\\n\" }}\n{{- \"Today Date: \" + date_string + \"\\n\\n\" }}\n{%- if tools is not none and not tools_in_user_message %}\n    {{- \"You have access to the following functions. To call a function, please respond with JSON for a function call.\" }}\n    {{- 'Respond in the format {\"name\": function name, \"parameters\": dictionary of argument name and its value}.' }}\n    {{- \"Do not use variables.\\n\\n\" }}\n    {%- for t in tools %}\n        {{- t | tojson(indent=4) }}\n        {{- \"\\n\\n\" }}\n    {%- endfor %}\n{%- endif %}\n{{- system_message }}\n{{- \"<|eot_id|>\" }}\n\n{#- Custom tools are passed in a user message with some extra guidance #}\n{%- if tools_in_user_message and not tools is none %}\n    {#- Extract the first user message so we can plug it in here #}\n    {%- if messages | length != 0 %}\n        {%- set first_user_message = messages[0]['content']|trim %}\n        {%- set messages = messages[1:] %}\n    {%- else %}\n        {{- raise_exception(\"Cannot put tools in the first user message when there's no first user message!\") }}\n{%- endif %}\n    {{- '<|start_header_id|>user<|end_header_id|>\\n\\n' -}}\n    {{- \"Given the following functions, please respond with a JSON for a function call \" }}\n    {{- \"with its proper arguments that best answers the given prompt.\\n\\n\" }}\n    {{- 'Respond in the format {\"name\": function name, \"parameters\": dictionary of argument name and its value}.' }}\n    {{- \"Do not use variables.\\n\\n\" }}\n    {%- for t in tools %}\n        {{- t | tojson(indent=4) }}\n        {{- \"\\n\\n\" }}\n    {%- endfor %}\n    {{- first_user_message + \"<|eot_id|>\"}}\n{%- endif %}\n\n{%- for message in messages %}\n    {%- if not (message.role == 'ipython' or message.role == 'tool' or 'tool_calls' in message) %}\n        {{- '<|start_header_id|>' + message['role'] + '<|end_header_id|>\\n\\n'+ message['content'] | trim + '<|eot_id|>' }}\n    {%- elif 'tool_calls' in message %}\n        {%- if not message.tool_calls|length == 1 %}\n            {{- raise_exception(\"This model only supports single tool-calls at once!\") }}\n        {%- endif %}\n        {%- set tool_call = message.tool_calls[0].function %}\n        {%- if builtin_tools is defined and tool_call.name in builtin_tools %}\n            {{- '<|start_header_id|>assistant<|end_header_id|>\\n\\n' -}}\n            {{- \"<|python_tag|>\" + tool_call.name + \".call(\" }}\n            {%- for arg_name, arg_val in tool_call.arguments | items %}\n                {{- arg_name + '=\"' + arg_val + '\"' }}\n                {%- if not loop.last %}\n                    {{- \", \" }}\n                {%- endif %}\n                {%- endfor %}\n            {{- \")\" }}\n        {%- else  %}\n            {{- '<|start_header_id|>assistant<|end_header_id|>\\n\\n' -}}\n            {{- '{\"name\": \"' + tool_call.name + '\", ' }}\n            {{- '\"parameters\": ' }}\n            {{- tool_call.arguments | tojson }}\n            {{- \"}\" }}\n        {%- endif %}\n        {%- if builtin_tools is defined %}\n            {#- This means we're in ipython mode #}\n            {{- \"<|eom_id|>\" }}\n        {%- else %}\n            {{- \"<|eot_id|>\" }}\n        {%- endif %}\n    {%- elif message.role == \"tool\" or message.role == \"ipython\" %}\n        {{- \"<|start_header_id|>ipython<|end_header_id|>\\n\\n\" }}\n        {%- if message.content is mapping or message.content is iterable %}\n            {{- message.content | tojson }}\n        {%- else %}\n            {{- message.content }}\n        {%- endif %}\n        {{- \"<|eot_id|>\" }}\n    {%- endif %}\n{%- endfor %}\n{%- if add_generation_prompt %}\n    {{- '<|start_header_id|>assistant<|end_header_id|>\\n\\n' }}\n{%- endif %}\n",
     "stop_token_ids": [
       128001,
+      128008,
       128009
     ],
     "stop": [
       "<|end_of_text|>",
-      "<|eot_id|>"
+      "<|eot_id|>",
+      "<|eom_id|>"
     ]
   },
   {
@@ -6483,8 +6486,7 @@
             "8-bit",
             "none"
           ],
-          "model_id": "OpenGVLab/InternVL2-1B",
-          "model_revision": "a9fc14aea824b6ea1d44f8778cad6b35512c4ce1"
+          "model_id": "OpenGVLab/InternVL2-1B"
         },
         {
           "model_format": "pytorch",
@@ -6494,8 +6496,7 @@
             "8-bit",
             "none"
           ],
-          "model_id": "OpenGVLab/InternVL2-2B",
-          "model_revision": "422ad7c6335917bfb514958233955512338485a6"
+          "model_id": "OpenGVLab/InternVL2-2B"
         },
         {
           "model_format": "awq",
@@ -6503,8 +6504,7 @@
           "quantizations": [
             "Int4"
           ],
-          "model_id": "OpenGVLab/InternVL2-2B-AWQ",
-          "model_revision": "701bc3fc098a8a3b686b3b4135cfb77202be89e0"
+          "model_id": "OpenGVLab/InternVL2-2B-AWQ"
         },
         {
           "model_format": "pytorch",
@@ -6514,8 +6514,7 @@
             "8-bit",
             "none"
           ],
-          "model_id": "OpenGVLab/InternVL2-4B",
-          "model_revision": "b50544dafada6c41e80bfde2f57cc9b0140fc21c"
+          "model_id": "OpenGVLab/InternVL2-4B"
         },
         {
           "model_format": "pytorch",
@@ -6525,8 +6524,7 @@
             "8-bit",
             "none"
           ],
-          "model_id": "OpenGVLab/InternVL2-8B",
-          "model_revision": "3bfd3664dea4f3da628785f5125d30f889701253"
+          "model_id": "OpenGVLab/InternVL2-8B"
         },
         {
           "model_format": "awq",
@@ -6534,8 +6532,7 @@
           "quantizations": [
             "Int4"
           ],
-          "model_id": "OpenGVLab/InternVL2-8B-AWQ",
-          "model_revision": "9f1a4756b7ae18eb26d8a22b618dfc283e8193b3"
+          "model_id": "OpenGVLab/InternVL2-8B-AWQ"
         },
         {
           "model_format": "pytorch",
@@ -6545,8 +6542,7 @@
             "8-bit",
             "none"
           ],
-          "model_id": "OpenGVLab/InternVL2-26B",
-          "model_revision": "b9f3c7e6d575b0115e076a3ffc46fd20b7586899"
+          "model_id": "OpenGVLab/InternVL2-26B"
         },
         {
           "model_format": "awq",
@@ -6554,8 +6550,7 @@
           "quantizations": [
             "Int4"
           ],
-          "model_id": "OpenGVLab/InternVL2-26B-AWQ",
-          "model_revision": "469e0019ffd251e22ff6501a5c2321964e86ef0d"
+          "model_id": "OpenGVLab/InternVL2-26B-AWQ"
         },
         {
           "model_format": "pytorch",
@@ -6565,8 +6560,7 @@
             "8-bit",
             "none"
           ],
-          "model_id": "OpenGVLab/InternVL2-40B",
-          "model_revision": "725a12063bb855c966e30a0617d0ccd9e870d772"
+          "model_id": "OpenGVLab/InternVL2-40B"
         },
         {
           "model_format": "awq",
@@ -6574,8 +6568,7 @@
           "quantizations": [
             "Int4"
           ],
-          "model_id": "OpenGVLab/InternVL2-40B-AWQ",
-          "model_revision": "d92e140f6dfe8ea9679924c6a31898f42c4e1846"
+          "model_id": "OpenGVLab/InternVL2-40B-AWQ"
         },
         {
           "model_format": "pytorch",
@@ -6585,8 +6578,7 @@
             "8-bit",
             "none"
           ],
-          "model_id": "OpenGVLab/InternVL2-Llama3-76B",
-          "model_revision": "cf7914905f78e9e3560ddbd6f5dfc39becac494f"
+          "model_id": "OpenGVLab/InternVL2-Llama3-76B"
         },
         {
           "model_format": "awq",
@@ -6594,8 +6586,7 @@
           "quantizations": [
             "Int4"
           ],
-          "model_id": "OpenGVLab/InternVL2-Llama3-76B-AWQ",
-          "model_revision": "1bc796bf80f2ebc7d6a14c15f55217a4600d50a4"
+          "model_id": "OpenGVLab/InternVL2-Llama3-76B-AWQ"
         }
     ],
     "chat_template": "{% for message in messages %}{% if loop.first and messages[0]['role'] != 'system' %}{{ '<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n' }}{% endif %}{{'<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>' + '\n'}}{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant\n' }}{% endif %}",
@@ -6829,6 +6820,33 @@
         "model_id":"Qwen/Qwen2-VL-2B-Instruct",
         "model_revision":"096da3b96240e3d66d35be0e5ccbe282eea8d6b1"
       },
+         {
+        "model_format":"gptq",
+        "model_size_in_billions":2,
+        "quantizations":[
+          "Int8"
+        ],
+        "model_id":"Qwen/Qwen2-VL-2B-Instruct-GPTQ-Int8",
+        "model_revision":"d15fb11857ccc566903e2e71341f9db7babb567b"
+      },
+        {
+        "model_format":"gptq",
+        "model_size_in_billions":2,
+        "quantizations":[
+          "Int4"
+        ],
+        "model_id":"Qwen/Qwen2-VL-2B-Instruct-GPTQ-Int4",
+        "model_revision":"800d396518c82960ce6d231adecd07bbc474f0a9"
+      },
+         {
+        "model_format":"awq",
+        "model_size_in_billions":2,
+        "quantizations":[
+          "Int4"
+        ],
+        "model_id":"Qwen/Qwen2-VL-2B-Instruct-AWQ",
+        "model_revision":"ea8c5854c0044e28626719292de0d9b1a671f6fc"
+      },
       {
         "model_format":"pytorch",
         "model_size_in_billions":7,
@@ -6837,6 +6855,133 @@
         ],
         "model_id":"Qwen/Qwen2-VL-7B-Instruct",
         "model_revision":"6010982c1010c3b222fa98afc81575f124aa9bd6"
+      },
+        {
+        "model_format":"gptq",
+        "model_size_in_billions":7,
+        "quantizations":[
+          "Int8"
+        ],
+        "model_id":"Qwen/Qwen2-VL-7B-Instruct-GPTQ-Int8",
+        "model_revision":"3d152a77eaccfd72d59baedb0b183a1b8fd56e48"
+      },
+      {
+        "model_format":"gptq",
+        "model_size_in_billions":7,
+        "quantizations":[
+          "Int4"
+        ],
+        "model_id":"Qwen/Qwen2-VL-7B-Instruct-GPTQ-Int4",
+        "model_revision":"5ab897112fa83b9699826be8753ef9184585c77d"
+      },
+      {
+        "model_format":"awq",
+        "model_size_in_billions":7,
+        "quantizations":[
+          "Int4"
+        ],
+        "model_id":"Qwen/Qwen2-VL-7B-Instruct-AWQ",
+        "model_revision":"f94216e8b513933bccd567bcd9b7350199f32538"
+      },
+      {
+        "model_format":"pytorch",
+        "model_size_in_billions":72,
+        "quantizations":[
+          "none"
+        ],
+        "model_id":"Qwen/Qwen2-VL-72B-Instruct"
+      },
+      {
+        "model_format":"awq",
+        "model_size_in_billions":72,
+        "quantizations":[
+          "Int4"
+        ],
+        "model_id":"Qwen/Qwen2-VL-72B-Instruct-AWQ"
+      },
+      {
+        "model_format":"gptq",
+        "model_size_in_billions":72,
+        "quantizations":[
+          "Int4",
+          "Int8"
+        ],
+        "model_id":"Qwen/Qwen2-VL-72B-Instruct-GPTQ-{quantization}"
+      }
+    ],
+    "chat_template": "{% set image_count = namespace(value=0) %}{% set video_count = namespace(value=0) %}{% for message in messages %}{% if loop.first and message['role'] != 'system' %}<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n{% endif %}<|im_start|>{{ message['role'] }}\n{% if message['content'] is string %}{{ message['content'] }}<|im_end|>\n{% else %}{% for content in message['content'] %}{% if content['type'] == 'image' or 'image' in content or 'image_url' in content %}{% set image_count.value = image_count.value + 1 %}{% if add_vision_id %}Picture {{ image_count.value }}: {% endif %}<|vision_start|><|image_pad|><|vision_end|>{% elif content['type'] == 'video' or 'video' in content %}{% set video_count.value = video_count.value + 1 %}{% if add_vision_id %}Video {{ video_count.value }}: {% endif %}<|vision_start|><|video_pad|><|vision_end|>{% elif 'text' in content %}{{ content['text'] }}{% endif %}{% endfor %}<|im_end|>\n{% endif %}{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}",
+    "stop_token_ids": [
+      151645,
+      151643
+    ],
+    "stop": [
+      "<|im_end|>",
+      "<|endoftext|>"
+    ]
+  },
+  {
+    "version": 1,
+    "context_length": 32768,
+    "model_name": "minicpm3-4b",
+    "model_lang": [
+      "zh"
+    ],
+    "model_ability": [
+      "chat"
+    ],
+    "model_description": "MiniCPM3-4B is the 3rd generation of MiniCPM series. The overall performance of MiniCPM3-4B surpasses Phi-3.5-mini-Instruct and GPT-3.5-Turbo-0125, being comparable with many recent 7B~9B models.",
+    "model_specs": [
+      {
+        "model_format": "pytorch",
+        "model_size_in_billions": 4,
+        "quantizations": [
+          "none"
+        ],
+        "model_id": "openbmb/MiniCPM3-4B",
+        "model_revision": "75f9f1097d9d66d11f37fff49210bf940455f8ac"
+      },
+      {
+        "model_format": "gptq",
+        "model_size_in_billions": 4,
+        "quantizations": [
+          "none"
+        ],
+        "model_id": "openbmb/MiniCPM3-4B-GPTQ-Int4",
+        "model_revision": "97a66a62f7d09c1ee35b087b42694716a8113dce"
+      }
+    ],
+    "chat_template": "{% for message in messages %}{{'<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>' + '\n'}}{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant\n' }}{% endif %}",
+    "stop_token_ids": [
+      1,
+      2
+    ],
+    "stop": [
+      "<s>",
+      "</s>"
+    ]
+  },
+  {
+    "version":1,
+    "context_length":32768,
+    "model_name":"qwen2-audio-instruct",
+    "model_lang":[
+      "en",
+      "zh"
+    ],
+    "model_ability":[
+      "chat",
+      "audio"
+    ],
+    "model_description":"Qwen2-Audio: A large-scale audio-language model which is capable of accepting various audio signal inputs and performing audio analysis or direct textual responses with regard to speech instructions.",
+    "model_specs":[
+      {
+        "model_format":"pytorch",
+        "model_size_in_billions":7,
+        "quantizations":[
+          "none"
+        ],
+        "model_id":"Qwen/Qwen2-Audio-7B-Instruct",
+        "model_revision":"bac62d2c6808845904c709c17a0402d817558c64"
       }
     ],
     "prompt_style":{
@@ -6851,5 +6996,1266 @@
         "<|endoftext|>"
       ]
     }
+  },
+  {
+    "version":1,
+    "context_length":32768,
+    "model_name":"qwen2-audio",
+    "model_lang":[
+      "en",
+      "zh"
+    ],
+    "model_ability":[
+      "chat",
+      "audio"
+    ],
+    "model_description":"Qwen2-Audio: A large-scale audio-language model which is capable of accepting various audio signal inputs and performing audio analysis or direct textual responses with regard to speech instructions.",
+    "model_specs":[
+      {
+        "model_format":"pytorch",
+        "model_size_in_billions":7,
+        "quantizations":[
+          "none"
+        ],
+        "model_id":"Qwen/Qwen2-Audio-7B",
+        "model_revision":"8577bc71d330c8fa32ffe9f8a1374100759f2466"
+      }
+    ],
+    "prompt_style":{
+      "style_name":"QWEN",
+      "system_prompt":"You are a helpful assistant",
+      "roles":[
+        "user",
+        "assistant"
+      ],
+      "stop": [
+        "<|im_end|>",
+        "<|endoftext|>"
+      ]
+    }
+  },
+  {
+    "version": 1,
+    "context_length": 128000,
+    "model_name": "deepseek-v2",
+    "model_lang": [
+      "en",
+      "zh"
+    ],
+    "model_ability": [
+      "generate"
+    ],
+    "model_description": "DeepSeek-V2, a strong Mixture-of-Experts (MoE) language model characterized by economical training and efficient inference. ",
+    "model_specs": [
+      {
+        "model_format": "pytorch",
+        "model_size_in_billions": 16,
+        "quantizations": [
+          "4-bit",
+          "8-bit",
+          "none"
+        ],
+        "model_id": "deepseek-ai/DeepSeek-V2-Lite",
+        "model_revision": "604d5664dddd88a0433dbae533b7fe9472482de0"
+      },
+      {
+        "model_format": "pytorch",
+        "model_size_in_billions": 236,
+        "quantizations": [
+          "4-bit",
+          "8-bit",
+          "none"
+        ],
+        "model_id": "deepseek-ai/DeepSeek-V2",
+        "model_revision": "4461458f186c35188585855f28f77af5661ad489"
+      }
+    ]
+  },
+  {
+    "version": 1,
+    "context_length": 128000,
+    "model_name": "deepseek-v2-chat",
+    "model_lang": [
+      "en",
+      "zh"
+    ],
+    "model_ability": [
+      "chat"
+    ],
+    "model_description": "DeepSeek-V2, a strong Mixture-of-Experts (MoE) language model characterized by economical training and efficient inference. ",
+    "model_specs": [
+      {
+        "model_format": "pytorch",
+        "model_size_in_billions": 16,
+        "quantizations": [
+          "4-bit",
+          "8-bit",
+          "none"
+        ],
+        "model_id": "deepseek-ai/DeepSeek-V2-Lite-Chat",
+        "model_revision": "85864749cd611b4353ce1decdb286193298f64c7"
+      },
+      {
+        "model_format": "pytorch",
+        "model_size_in_billions": 236,
+        "quantizations": [
+          "4-bit",
+          "8-bit",
+          "none"
+        ],
+        "model_id": "deepseek-ai/DeepSeek-V2-Chat",
+        "model_revision": "8e3f5f6c2226787e41ba3e9283a06389d178c926"
+      }
+    ],
+    "chat_template": "{% if not add_generation_prompt is defined %}{% set add_generation_prompt = false %}{% endif %}{{ '<｜begin▁of▁sentence｜>' }}{% for message in messages %}{% if message['role'] == 'user' %}{{ 'User: ' + message['content'] + '\n\n' }}{% elif message['role'] == 'assistant' %}{{ 'Assistant: ' + message['content'] + '<｜end▁of▁sentence｜>' }}{% elif message['role'] == 'system' %}{{ message['content'] + '\n\n' }}{% endif %}{% endfor %}{% if add_generation_prompt %}{{ 'Assistant:' }}{% endif %}",
+    "stop_token_ids": [
+      100001
+    ],
+    "stop": [
+      "<｜end▁of▁sentence｜>"
+    ]
+  },
+  {
+    "version": 1,
+    "context_length": 128000,
+    "model_name": "deepseek-v2-chat-0628",
+    "model_lang": [
+      "en",
+      "zh"
+    ],
+    "model_ability": [
+      "chat"
+    ],
+    "model_description": "DeepSeek-V2-Chat-0628 is an improved version of DeepSeek-V2-Chat. ",
+    "model_specs": [
+      {
+        "model_format": "pytorch",
+        "model_size_in_billions": 236,
+        "quantizations": [
+          "4-bit",
+          "8-bit",
+          "none"
+        ],
+        "model_id": "deepseek-ai/DeepSeek-V2-Chat-0628",
+        "model_revision": "5d09e272c2b223830f4e84359cd9dd047a5d7c78"
+      }
+    ],
+    "chat_template": "{% if not add_generation_prompt is defined %}{% set add_generation_prompt = false %}{% endif %}{{ '<｜begin▁of▁sentence｜>' }}{% for message in messages %}{% if message['role'] == 'user' %}{{ '<｜User｜>' + message['content'] }}{% elif message['role'] == 'assistant' %}{{ '<｜Assistant｜>' + message['content'] + '<｜end▁of▁sentence｜>' }}{% elif message['role'] == 'system' %}{{ message['content'] + '\n\n' }}{% endif %}{% endfor %}{% if add_generation_prompt %}{{ '<｜Assistant｜>' }}{% endif %}",
+    "stop_token_ids": [
+      100001
+    ],
+    "stop": [
+      "<｜end▁of▁sentence｜>"
+    ]
+  },
+  {
+    "version": 1,
+    "context_length": 128000,
+    "model_name": "deepseek-v2.5",
+    "model_lang": [
+      "en",
+      "zh"
+    ],
+    "model_ability": [
+      "chat"
+    ],
+    "model_description": "DeepSeek-V2.5 is an upgraded version that combines DeepSeek-V2-Chat and DeepSeek-Coder-V2-Instruct. The new model integrates the general and coding abilities of the two previous versions.",
+    "model_specs": [
+      {
+        "model_format": "pytorch",
+        "model_size_in_billions": 236,
+        "quantizations": [
+          "4-bit",
+          "8-bit",
+          "none"
+        ],
+        "model_id": "deepseek-ai/DeepSeek-V2.5",
+        "model_revision": "24b08cb750e0c2757de112d2e16327cb21ed4833"
+      }
+    ],
+    "chat_template": "{% if not add_generation_prompt is defined %}{% set add_generation_prompt = false %}{% endif %}{% set ns = namespace(is_first=false, is_tool=false, is_output_first=true, system_prompt='') %}{%- for message in messages %}    {%- if message['role'] == 'system' %}        {% set ns.system_prompt = message['content'] %}    {%- endif %}{%- endfor %}{{'<｜begin▁of▁sentence｜>'}}{{ns.system_prompt}}{%- for message in messages %}    {%- if message['role'] == 'user' %}    {%- set ns.is_tool = false -%}{{'<｜User｜>' + message['content']}}    {%- endif %}    {%- if message['role'] == 'assistant' and message['content'] is none %}        {%- set ns.is_tool = false -%}        {%- for tool in message['tool_calls']%}            {%- if not ns.is_first %}{{'<｜Assistant｜><｜tool▁calls▁begin｜><｜tool▁call▁begin｜>' + tool['type'] + '<｜tool▁sep｜>' + tool['function']['name'] + '\\n' + '```json' + '\\n' + tool['function']['arguments'] + '\\n' + '```' + '<｜tool▁call▁end｜>'}}            {%- set ns.is_first = true -%}            {%- else %}{{'\\n' + '<｜tool▁call▁begin｜>' + tool['type'] + '<｜tool▁sep｜>' + tool['function']['name'] + '\\n' + '```json' + '\\n' + tool['function']['arguments'] + '\\n' + '```' + '<｜tool▁call▁end｜>'}}{{'<｜tool▁calls▁end｜><｜end▁of▁sentence｜>'}}                   {%- endif %}        {%- endfor %}    {%- endif %}    {%- if message['role'] == 'assistant' and message['content'] is not none %}        {%- if ns.is_tool %}{{'<｜tool▁outputs▁end｜>' + message['content'] + '<｜end▁of▁sentence｜>'}}        {%- set ns.is_tool = false -%}        {%- else %}{{'<｜Assistant｜>' + message['content'] + '<｜end▁of▁sentence｜>'}}        {%- endif %}    {%- endif %}    {%- if message['role'] == 'tool' %}        {%- set ns.is_tool = true -%}        {%- if ns.is_output_first %}{{'<｜tool▁outputs▁begin｜><｜tool▁output▁begin｜>' + message['content'] + '<｜tool▁output▁end｜>'}}        {%- set ns.is_output_first = false %}        {%- else %}{{'\\n<｜tool▁output▁begin｜>' + message['content'] + '<｜tool▁output▁end｜>'}}        {%- endif %}    {%- endif %}{%- endfor -%}{% if ns.is_tool %}{{'<｜tool▁outputs▁end｜>'}}{% endif %}{% if add_generation_prompt and not ns.is_tool %}{{'<｜Assistant｜>'}}{% endif %}",
+    "stop_token_ids": [
+      100001
+    ],
+    "stop": [
+      "<｜end▁of▁sentence｜>"
+    ]
+  },
+  {
+    "version": 1,
+    "context_length": 131072,
+    "model_name": "yi-coder-chat",
+    "model_lang": [
+      "en"
+    ],
+    "model_ability": [
+      "chat"
+    ],
+    "model_description": "Yi-Coder is a series of open-source code language models that delivers state-of-the-art coding performance with fewer than 10 billion parameters.Excelling in long-context understanding with a maximum context length of 128K tokens.Supporting 52 major programming languages, including popular ones such as Java, Python, JavaScript, and C++.",
+    "model_specs": [
+      {
+        "model_format": "pytorch",
+        "model_size_in_billions": 9,
+        "quantizations": [
+          "none"
+        ],
+        "model_id": "01ai/Yi-Coder-9B-Chat",
+        "model_revision": "356a1f8d4e4a606d0b879e54191ca809918576b8"
+      },
+      {
+        "model_format": "pytorch",
+        "model_size_in_billions": "1_5",
+        "quantizations": [
+          "none"
+        ],
+        "model_id": "01ai/Yi-Coder-1.5B-Chat",
+        "model_revision": "92fdd1b2f1539ac990e7f4a921db5601da2f0299"
+      }
+    ],
+    "chat_template": "{% if messages[0]['role'] == 'system' %}{% set system_message = messages[0]['content'] %}{% endif %}{% if system_message is defined %}{{ '<|im_start|>system\n' + system_message + '<|im_end|>\n' }}{% endif %}{% for message in messages %}{% set content = message['content'] %}{% if message['role'] == 'user' %}{{ '<|im_start|>user\n' + content + '<|im_end|>\n<|im_start|>assistant\n' }}{% elif message['role'] == 'assistant' %}{{ content + '<|im_end|>' + '\n' }}{% endif %}{% endfor %}",
+    "stop_token_ids": [
+      1,
+      2,
+      6,
+      7
+    ],
+    "stop": [
+      "<|startoftext|>",
+      "<|endoftext|>",
+      "<|im_start|>",
+      "<|im_end|>"
+    ]
+  },
+  {
+    "version": 1,
+    "context_length": 131072,
+    "model_name": "yi-coder",
+    "model_lang": [
+      "en"
+    ],
+    "model_ability": [
+      "generate"
+    ],
+    "model_description": "Yi-Coder is a series of open-source code language models that delivers state-of-the-art coding performance with fewer than 10 billion parameters.Excelling in long-context understanding with a maximum context length of 128K tokens.Supporting 52 major programming languages, including popular ones such as Java, Python, JavaScript, and C++.",
+    "model_specs": [
+      {
+        "model_format": "pytorch",
+        "model_size_in_billions": 9,
+        "quantizations": [
+          "none"
+        ],
+        "model_id": "01-ai/Yi-Coder-9B",
+        "model_revision": "e20f8087a9507ac8bce409dc5db5d0c608124238"
+      },
+      {
+        "model_format": "pytorch",
+        "model_size_in_billions": "1_5",
+        "quantizations": [
+          "none"
+        ],
+        "model_id": "01-ai/Yi-Coder-1.5B",
+        "model_revision": "00e59e64f47d3c78e4cfbdd345888479797e8109"
+      }
+    ]
+  },
+  {
+    "version": 1,
+    "context_length": 32768,
+    "model_name": "qwen2.5",
+    "model_lang": [
+      "en",
+      "zh"
+    ],
+    "model_ability": [
+      "generate"
+    ],
+    "model_description": "Qwen2.5 is the latest series of Qwen large language models. For Qwen2.5, we release a number of base language models and instruction-tuned language models ranging from 0.5 to 72 billion parameters.",
+    "model_specs": [
+      {
+        "model_format": "pytorch",
+        "model_size_in_billions": "0_5",
+        "quantizations": [
+          "4-bit",
+          "8-bit",
+          "none"
+        ],
+        "model_id": "Qwen/Qwen2.5-0.5B",
+        "model_revision": "2630d3d2321bc1f1878f702166d1b2af019a7310"
+      },
+      {
+        "model_format": "pytorch",
+        "model_size_in_billions": "1_5",
+        "quantizations": [
+          "4-bit",
+          "8-bit",
+          "none"
+        ],
+        "model_id": "Qwen/Qwen2.5-1.5B",
+        "model_revision": "e5dfabbcffd9b0c7b31d89b82c5a6b72e663f32c"
+      },
+      {
+        "model_format": "pytorch",
+        "model_size_in_billions": 3,
+        "quantizations": [
+          "4-bit",
+          "8-bit",
+          "none"
+        ],
+        "model_id": "Qwen/Qwen2.5-3B",
+        "model_revision": "e4aa5ac50aa507415cda96cc99eb77ad0a3d2d34"
+      },
+      {
+        "model_format": "pytorch",
+        "model_size_in_billions": 7,
+        "quantizations": [
+          "4-bit",
+          "8-bit",
+          "none"
+        ],
+        "model_id": "Qwen/Qwen2.5-7B",
+        "model_revision": "09a0bac5707b43ec44508eab308b0846320c1ed4"
+      },
+      {
+        "model_format": "pytorch",
+        "model_size_in_billions": 14,
+        "quantizations": [
+          "4-bit",
+          "8-bit",
+          "none"
+        ],
+        "model_id": "Qwen/Qwen2.5-14B",
+        "model_revision": "d02b64ba1ce86bf9948668a13f82709600431ccc"
+      },
+      {
+        "model_format": "pytorch",
+        "model_size_in_billions": 32,
+        "quantizations": [
+          "4-bit",
+          "8-bit",
+          "none"
+        ],
+        "model_id": "Qwen/Qwen2.5-32B",
+        "model_revision": "ff23665d01c3665be5fdb271d18a62090b65c06d"
+      },
+      {
+        "model_format": "pytorch",
+        "model_size_in_billions": 72,
+        "quantizations": [
+          "4-bit",
+          "8-bit",
+          "none"
+        ],
+        "model_id": "Qwen/Qwen2.5-72B",
+        "model_revision": "587cc4061cf6a7cc0d429d05c109447e5cf063af"
+      }
+    ]
+  },
+  {
+    "version": 1,
+    "context_length": 32768,
+    "model_name": "qwen2.5-instruct",
+    "model_lang": [
+      "en",
+      "zh"
+    ],
+    "model_ability": [
+      "chat",
+      "tools"
+    ],
+    "model_description": "Qwen2.5 is the latest series of Qwen large language models. For Qwen2.5, we release a number of base language models and instruction-tuned language models ranging from 0.5 to 72 billion parameters.",
+    "model_specs": [
+      {
+        "model_format": "pytorch",
+        "model_size_in_billions": "0_5",
+        "quantizations": [
+          "4-bit",
+          "8-bit",
+          "none"
+        ],
+        "model_id": "Qwen/Qwen2.5-0.5B-Instruct"
+      },
+      {
+        "model_format": "pytorch",
+        "model_size_in_billions": "1_5",
+        "quantizations": [
+          "4-bit",
+          "8-bit",
+          "none"
+        ],
+        "model_id": "Qwen/Qwen2.5-1.5B-Instruct"
+      },
+      {
+        "model_format": "pytorch",
+        "model_size_in_billions": 3,
+        "quantizations": [
+          "4-bit",
+          "8-bit",
+          "none"
+        ],
+        "model_id": "Qwen/Qwen2.5-3B-Instruct"
+      },
+      {
+        "model_format": "pytorch",
+        "model_size_in_billions": 7,
+        "quantizations": [
+          "4-bit",
+          "8-bit",
+          "none"
+        ],
+        "model_id": "Qwen/Qwen2.5-7B-Instruct"
+      },
+      {
+        "model_format": "pytorch",
+        "model_size_in_billions": 14,
+        "quantizations": [
+          "4-bit",
+          "8-bit",
+          "none"
+        ],
+        "model_id": "Qwen/Qwen2.5-14B-Instruct"
+      },
+      {
+        "model_format": "pytorch",
+        "model_size_in_billions": 32,
+        "quantizations": [
+          "4-bit",
+          "8-bit",
+          "none"
+        ],
+        "model_id": "Qwen/Qwen2.5-32B-Instruct"
+      },
+      {
+        "model_format": "pytorch",
+        "model_size_in_billions": 72,
+        "quantizations": [
+          "4-bit",
+          "8-bit",
+          "none"
+        ],
+        "model_id": "Qwen/Qwen2.5-72B-Instruct"
+      },
+      {
+        "model_format": "gptq",
+        "model_size_in_billions": "0_5",
+        "quantizations": [
+          "Int4",
+          "Int8"
+        ],
+        "model_id": "Qwen/Qwen2.5-0.5B-Instruct-GPTQ-{quantization}"
+      },
+      {
+        "model_format": "gptq",
+        "model_size_in_billions": "1_5",
+        "quantizations": [
+          "Int4",
+          "Int8"
+        ],
+        "model_id": "Qwen/Qwen2.5-1.5B-Instruct-GPTQ-{quantization}"
+      },
+      {
+        "model_format": "gptq",
+        "model_size_in_billions": 3,
+        "quantizations": [
+          "Int4",
+          "Int8"
+        ],
+        "model_id": "Qwen/Qwen2.5-3B-Instruct-GPTQ-{quantization}"
+      },
+      {
+        "model_format": "gptq",
+        "model_size_in_billions": 7,
+        "quantizations": [
+          "Int4",
+          "Int8"
+        ],
+        "model_id": "Qwen/Qwen2.5-7B-Instruct-GPTQ-{quantization}"
+      },
+      {
+        "model_format": "gptq",
+        "model_size_in_billions": 14,
+        "quantizations": [
+          "Int4",
+          "Int8"
+        ],
+        "model_id": "Qwen/Qwen2.5-14B-Instruct-GPTQ-{quantization}"
+      },
+      {
+        "model_format": "gptq",
+        "model_size_in_billions": 32,
+        "quantizations": [
+          "Int4",
+          "Int8"
+        ],
+        "model_id": "Qwen/Qwen2.5-32B-Instruct-GPTQ-{quantization}"
+      },
+      {
+        "model_format": "gptq",
+        "model_size_in_billions": 72,
+        "quantizations": [
+          "Int4",
+          "Int8"
+        ],
+        "model_id": "Qwen/Qwen2.5-72B-Instruct-GPTQ-{quantization}"
+      },
+      {
+        "model_format": "awq",
+        "model_size_in_billions": "0_5",
+        "quantizations": [
+          "Int4"
+        ],
+        "model_id": "Qwen/Qwen2.5-0.5B-Instruct-AWQ"
+      },
+      {
+        "model_format": "awq",
+        "model_size_in_billions": "1_5",
+        "quantizations": [
+          "Int4"
+        ],
+        "model_id": "Qwen/Qwen2.5-1.5B-Instruct-AWQ"
+      },
+      {
+        "model_format": "awq",
+        "model_size_in_billions": 3,
+        "quantizations": [
+          "Int4"
+        ],
+        "model_id": "Qwen/Qwen2.5-3B-Instruct-AWQ"
+      },
+      {
+        "model_format": "awq",
+        "model_size_in_billions": 7,
+        "quantizations": [
+          "Int4"
+        ],
+        "model_id": "Qwen/Qwen2.5-7B-Instruct-AWQ"
+      },
+      {
+        "model_format": "awq",
+        "model_size_in_billions": 14,
+        "quantizations": [
+          "Int4"
+        ],
+        "model_id": "Qwen/Qwen2.5-14B-Instruct-AWQ"
+      },
+      {
+        "model_format": "awq",
+        "model_size_in_billions": 32,
+        "quantizations": [
+          "Int4"
+        ],
+        "model_id": "Qwen/Qwen2.5-32B-Instruct-AWQ"
+      },
+      {
+        "model_format": "awq",
+        "model_size_in_billions": 72,
+        "quantizations": [
+          "Int4"
+        ],
+        "model_id": "Qwen/Qwen2.5-72B-Instruct-AWQ"
+      },
+      {
+        "model_format": "ggufv2",
+        "model_size_in_billions": "0_5",
+        "quantizations": [
+          "q2_k",
+          "q3_k_m",
+          "q4_0",
+          "q4_k_m",
+          "q5_0",
+          "q5_k_m",
+          "q6_k",
+          "q8_0"
+        ],
+        "model_id": "Qwen/Qwen2.5-0.5B-Instruct-GGUF",
+        "model_file_name_template": "qwen2.5-0.5b-instruct-{quantization}.gguf"
+      },
+      {
+        "model_format": "ggufv2",
+        "model_size_in_billions": "1_5",
+        "quantizations": [
+          "q2_k",
+          "q3_k_m",
+          "q4_0",
+          "q4_k_m",
+          "q5_0",
+          "q5_k_m",
+          "q6_k",
+          "q8_0"
+        ],
+        "model_id": "Qwen/Qwen2.5-1.5B-Instruct-GGUF",
+        "model_file_name_template": "qwen2.5-1.5b-instruct-{quantization}.gguf"
+      },
+      {
+        "model_format": "ggufv2",
+        "model_size_in_billions": 3,
+        "quantizations": [
+          "q2_k",
+          "q3_k_m",
+          "q4_0",
+          "q4_k_m",
+          "q5_0",
+          "q5_k_m",
+          "q6_k",
+          "q8_0"
+        ],
+        "model_id": "Qwen/Qwen2.5-3B-Instruct-GGUF",
+        "model_file_name_template": "qwen2.5-3b-instruct-{quantization}.gguf"
+      },
+      {
+        "model_format": "ggufv2",
+        "model_size_in_billions": 7,
+        "quantizations": [
+          "q2_k",
+          "q3_k_m",
+          "q4_0",
+          "q4_k_m",
+          "q5_0",
+          "q5_k_m",
+          "q6_k",
+          "q8_0"
+        ],
+        "model_id": "Qwen/Qwen2.5-7B-Instruct-GGUF",
+        "model_file_name_template": "qwen2.5-7b-instruct-{quantization}.gguf",
+        "model_file_name_split_template": "qwen2.5-7b-instruct-{quantization}-{part}.gguf",
+        "quantization_parts": {
+          "q4_0": [
+            "00001-of-00002",
+            "00002-of-00002"
+          ],
+          "q4_k_m": [
+            "00001-of-00002",
+            "00002-of-00002"
+          ],
+          "q5_0": [
+            "00001-of-00002",
+            "00002-of-00002"
+          ],
+          "q5_k_m": [
+            "00001-of-00002",
+            "00002-of-00002"
+          ],
+          "q6_k": [
+            "00001-of-00002",
+            "00002-of-00002"
+          ],
+          "q8_0": [
+            "00001-of-00002",
+            "00002-of-00002"
+          ]
+        }
+      },
+      {
+        "model_format": "ggufv2",
+        "model_size_in_billions": 14,
+        "quantizations": [
+          "q2_k",
+          "q3_k_m",
+          "q4_0",
+          "q4_k_m",
+          "q5_0",
+          "q5_k_m",
+          "q6_k",
+          "q8_0"
+        ],
+        "model_id": "Qwen/Qwen2.5-14B-Instruct-GGUF",
+        "model_file_name_template": "qwen2.5-14b-instruct-{quantization}.gguf",
+        "model_file_name_split_template": "qwen2.5-14b-instruct-{quantization}-{part}.gguf",
+        "quantization_parts": {
+          "q2_k": [
+            "00001-of-00002",
+            "00002-of-00002"
+          ],
+          "q3_k_m": [
+            "00001-of-00002",
+            "00002-of-00002"
+          ],
+          "q4_0": [
+            "00001-of-00003",
+            "00002-of-00003",
+            "00003-of-00003"
+          ],
+          "q4_k_m": [
+            "00001-of-00003",
+            "00002-of-00003",
+            "00003-of-00003"
+          ],
+          "q5_0": [
+            "00001-of-00003",
+            "00002-of-00003",
+            "00003-of-00003"
+          ],
+          "q5_k_m": [
+            "00001-of-00003",
+            "00002-of-00003",
+            "00003-of-00003"
+          ],
+          "q6_k": [
+            "00001-of-00004",
+            "00002-of-00004",
+            "00003-of-00004",
+            "00004-of-00004"
+          ],
+          "q8_0": [
+            "00001-of-00004",
+            "00002-of-00004",
+            "00003-of-00004",
+            "00004-of-00004"
+          ]
+        }
+      },
+      {
+        "model_format": "ggufv2",
+        "model_size_in_billions": 32,
+        "quantizations": [
+          "q2_k",
+          "q3_k_m",
+          "q4_0",
+          "q4_k_m",
+          "q5_0",
+          "q5_k_m",
+          "q6_k",
+          "q8_0"
+        ],
+        "model_id": "Qwen/Qwen2.5-32B-Instruct-GGUF",
+        "model_file_name_template": "qwen2_5-32b-instruct-{quantization}.gguf",
+        "model_file_name_split_template": "qwen2.5-32b-instruct-{quantization}-{part}.gguf",
+        "quantization_parts": {
+          "q2_k": [
+            "00001-of-00004",
+            "00002-of-00004",
+            "00003-of-00004",
+            "00004-of-00004"
+          ],
+          "q3_k_m": [
+            "00001-of-00005",
+            "00002-of-00005",
+            "00003-of-00005",
+            "00004-of-00005",
+            "00005-of-00005"
+          ],
+          "q4_0": [
+            "00001-of-00005",
+            "00002-of-00005",
+            "00003-of-00005",
+            "00004-of-00005",
+            "00005-of-00005"
+          ],
+          "q4_k_m": [
+            "00001-of-00005",
+            "00002-of-00005",
+            "00003-of-00005",
+            "00004-of-00005",
+            "00005-of-00005"
+          ],
+          "q5_0": [
+            "00001-of-00006",
+            "00002-of-00006",
+            "00003-of-00006",
+            "00004-of-00006",
+            "00005-of-00006",
+            "00006-of-00006"
+          ],
+          "q5_k_m": [
+            "00001-of-00006",
+            "00002-of-00006",
+            "00003-of-00006",
+            "00004-of-00006",
+            "00005-of-00006",
+            "00006-of-00006"
+          ],
+          "q6_k": [
+            "00001-of-00007",
+            "00002-of-00007",
+            "00003-of-00007",
+            "00004-of-00007",
+            "00005-of-00007",
+            "00006-of-00007",
+            "00007-of-00007"
+          ],
+          "q8_0": [
+            "00001-of-00009",
+            "00002-of-00009",
+            "00003-of-00009",
+            "00004-of-00009",
+            "00005-of-00009",
+            "00006-of-00009",
+            "00007-of-00009",
+            "00008-of-00009",
+            "00009-of-00009"
+          ]
+        }
+      },
+      {
+        "model_format": "ggufv2",
+        "model_size_in_billions": 72,
+        "quantizations": [
+          "q2_k",
+          "q3_k_m",
+          "q4_0",
+          "q4_k_m",
+          "q5_0",
+          "q5_k_m",
+          "q6_k",
+          "q8_0",
+          "fp16"
+        ],
+        "model_id": "Qwen/Qwen2.5-72B-Instruct-GGUF",
+        "model_file_name_template": "qwen2_5-72b-instruct-{quantization}.gguf",
+        "model_file_name_split_template": "qwen2.5-72b-instruct-{quantization}-{part}.gguf",
+        "quantization_parts": {
+           "q2_k": [
+            "00001-of-00007",
+            "00002-of-00007",
+            "00003-of-00007",
+            "00004-of-00007",
+            "00005-of-00007",
+            "00006-of-00007",
+            "00007-of-00007"
+          ],
+          "q3_k_m": [
+            "00001-of-00009",
+            "00002-of-00009",
+            "00003-of-00009",
+            "00004-of-00009",
+            "00005-of-00009",
+            "00006-of-00009",
+            "00007-of-00009",
+            "00008-of-00009",
+            "00009-of-00009"
+          ],
+          "q4_0": [
+            "00001-of-00011",
+            "00002-of-00011",
+            "00003-of-00011",
+            "00004-of-00011",
+            "00005-of-00011",
+            "00006-of-00011",
+            "00007-of-00011",
+            "00008-of-00011",
+            "00009-of-00011",
+            "00010-of-00011",
+            "00011-of-00011"
+          ],
+          "q4_k_m": [
+            "00001-of-00012",
+            "00002-of-00012",
+            "00003-of-00012",
+            "00004-of-00012",
+            "00005-of-00012",
+            "00006-of-00012",
+            "00007-of-00012",
+            "00008-of-00012",
+            "00009-of-00012",
+            "00010-of-00012",
+            "00011-of-00012",
+            "00012-of-00012"
+          ],
+          "q5_0": [
+            "00001-of-00013",
+            "00002-of-00013",
+            "00003-of-00013",
+            "00004-of-00013",
+            "00005-of-00013",
+            "00006-of-00013",
+            "00007-of-00013",
+            "00008-of-00013",
+            "00009-of-00013",
+            "00010-of-00013",
+            "00011-of-00013",
+            "00012-of-00013",
+            "00013-of-00013"
+          ],
+          "q5_k_m": [
+            "00001-of-00014",
+            "00002-of-00014",
+            "00003-of-00014",
+            "00004-of-00014",
+            "00005-of-00014",
+            "00006-of-00014",
+            "00007-of-00014",
+            "00008-of-00014",
+            "00009-of-00014",
+            "00010-of-00014",
+            "00011-of-00014",
+            "00012-of-00014",
+            "00013-of-00014",
+            "00014-of-00014"
+          ],
+          "q6_k": [
+            "00001-of-00016",
+            "00002-of-00016",
+            "00003-of-00016",
+            "00004-of-00016",
+            "00005-of-00016",
+            "00006-of-00016",
+            "00007-of-00016",
+            "00008-of-00016",
+            "00009-of-00016",
+            "00010-of-00016",
+            "00011-of-00016",
+            "00012-of-00016",
+            "00013-of-00016",
+            "00014-of-00016",
+            "00015-of-00016",
+            "00016-of-00016"
+          ],
+          "q8_0": [
+            "00001-of-00021",
+            "00002-of-00021",
+            "00003-of-00021",
+            "00004-of-00021",
+            "00005-of-00021",
+            "00006-of-00021",
+            "00007-of-00021",
+            "00008-of-00021",
+            "00009-of-00021",
+            "00010-of-00021",
+            "00011-of-00021",
+            "00012-of-00021",
+            "00013-of-00021",
+            "00014-of-00021",
+            "00015-of-00021",
+            "00016-of-00021",
+            "00017-of-00021",
+            "00018-of-00021",
+            "00019-of-00021",
+            "00020-of-00021",
+            "00021-of-00021"
+          ]
+        }
+      },
+      {
+        "model_format": "mlx",
+        "model_size_in_billions": "0_5",
+        "quantizations": [
+          "4-bit"
+        ],
+        "model_id": "mlx-community/Qwen2.5-0.5B-Instruct-4bit"
+      },
+      {
+        "model_format": "mlx",
+        "model_size_in_billions": "0_5",
+        "quantizations": [
+          "8-bit"
+        ],
+        "model_id": "mlx-community/Qwen2.5-0.5B-Instruct-8bit"
+      },
+      {
+        "model_format": "mlx",
+        "model_size_in_billions": "0_5",
+        "quantizations": [
+          "none"
+        ],
+        "model_id": "mlx-community/Qwen2.5-0.5B-Instruct-bf16"
+      },
+      {
+        "model_format": "mlx",
+        "model_size_in_billions": "1_5",
+        "quantizations": [
+          "4-bit"
+        ],
+        "model_id": "mlx-community/Qwen2.5-1.5B-Instruct-4bit"
+      },
+      {
+        "model_format": "mlx",
+        "model_size_in_billions": "1_5",
+        "quantizations": [
+          "8-bit"
+        ],
+        "model_id": "mlx-community/Qwen2.5-1.5B-Instruct-8bit"
+      },
+      {
+        "model_format": "mlx",
+        "model_size_in_billions": "1_5",
+        "quantizations": [
+          "none"
+        ],
+        "model_id": "mlx-community/Qwen2.5-1.5B-Instruct-bf16"
+      },
+      {
+        "model_format": "mlx",
+        "model_size_in_billions": 3,
+        "quantizations": [
+          "4-bit"
+        ],
+        "model_id": "mlx-community/Qwen2.5-3B-Instruct-4bit"
+      },
+      {
+        "model_format": "mlx",
+        "model_size_in_billions": 3,
+        "quantizations": [
+          "8-bit"
+        ],
+        "model_id": "mlx-community/Qwen2.5-3B-Instruct-8bit"
+      },
+      {
+        "model_format": "mlx",
+        "model_size_in_billions": 3,
+        "quantizations": [
+          "none"
+        ],
+        "model_id": "mlx-community/Qwen2.5-3B-Instruct-bf16"
+      },
+      {
+        "model_format": "mlx",
+        "model_size_in_billions": 7,
+        "quantizations": [
+          "4-bit"
+        ],
+        "model_id": "mlx-community/Qwen2.5-7B-Instruct-4bit"
+      },
+      {
+        "model_format": "mlx",
+        "model_size_in_billions": 7,
+        "quantizations": [
+          "8-bit"
+        ],
+        "model_id": "mlx-community/Qwen2.5-7B-Instruct-8bit"
+      },
+      {
+        "model_format": "mlx",
+        "model_size_in_billions": 7,
+        "quantizations": [
+          "none"
+        ],
+        "model_id": "mlx-community/Qwen2.5-7B-Instruct-bf16"
+      },
+      {
+        "model_format": "mlx",
+        "model_size_in_billions": 14,
+        "quantizations": [
+          "4-bit"
+        ],
+        "model_id": "mlx-community/Qwen2.5-14B-Instruct-4bit"
+      },
+      {
+        "model_format": "mlx",
+        "model_size_in_billions": 14,
+        "quantizations": [
+          "8-bit"
+        ],
+        "model_id": "mlx-community/Qwen2.5-14B-Instruct-8bit"
+      },
+      {
+        "model_format": "mlx",
+        "model_size_in_billions": 14,
+        "quantizations": [
+          "none"
+        ],
+        "model_id": "mlx-community/Qwen2.5-14B-Instruct-bf16"
+      },
+      {
+        "model_format": "mlx",
+        "model_size_in_billions": 32,
+        "quantizations": [
+          "4-bit"
+        ],
+        "model_id": "mlx-community/Qwen2.5-32B-Instruct-4bit"
+      },
+      {
+        "model_format": "mlx",
+        "model_size_in_billions": 32,
+        "quantizations": [
+          "8-bit"
+        ],
+        "model_id": "mlx-community/Qwen2.5-32B-Instruct-8bit"
+      },
+      {
+        "model_format": "mlx",
+        "model_size_in_billions": 32,
+        "quantizations": [
+          "none"
+        ],
+        "model_id": "mlx-community/Qwen2.5-32B-Instruct-bf16"
+      },
+      {
+        "model_format": "mlx",
+        "model_size_in_billions": 72,
+        "quantizations": [
+          "4-bit"
+        ],
+        "model_id": "mlx-community/Qwen2.5-72B-Instruct-4bit"
+      },
+      {
+        "model_format": "mlx",
+        "model_size_in_billions": 72,
+        "quantizations": [
+          "8-bit"
+        ],
+        "model_id": "mlx-community/Qwen2.5-72B-Instruct-8bit"
+      },
+      {
+        "model_format": "mlx",
+        "model_size_in_billions": 72,
+        "quantizations": [
+          "none"
+        ],
+        "model_id": "mlx-community/Qwen2.5-72B-Instruct-bf16"
+      }
+    ],
+    "chat_template": "{%- if tools %}\n    {{- '<|im_start|>system\\n' }}\n    {%- if messages[0]['role'] == 'system' %}\n        {{- messages[0]['content'] }}\n    {%- else %}\n        {{- 'You are Qwen, created by Alibaba Cloud. You are a helpful assistant.' }}\n    {%- endif %}\n    {{- \"\\n\\n# Tools\\n\\nYou may call one or more functions to assist with the user query.\\n\\nYou are provided with function signatures within <tools></tools> XML tags:\\n<tools>\" }}\n    {%- for tool in tools %}\n        {{- \"\\n\" }}\n        {{- tool | tojson }}\n    {%- endfor %}\n    {{- \"\\n</tools>\\n\\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\\n<tool_call>\\n{\\\"name\\\": <function-name>, \\\"arguments\\\": <args-json-object>}\\n</tool_call><|im_end|>\\n\" }}\n{%- else %}\n    {%- if messages[0]['role'] == 'system' %}\n        {{- '<|im_start|>system\\n' + messages[0]['content'] + '<|im_end|>\\n' }}\n    {%- else %}\n        {{- '<|im_start|>system\\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\\n' }}\n    {%- endif %}\n{%- endif %}\n{%- for message in messages %}\n    {%- if (message.role == \"user\") or (message.role == \"system\" and not loop.first) or (message.role == \"assistant\" and not message.tool_calls) %}\n        {{- '<|im_start|>' + message.role + '\\n' + message.content + '<|im_end|>' + '\\n' }}\n    {%- elif message.role == \"assistant\" %}\n        {{- '<|im_start|>' + message.role }}\n        {%- if message.content %}\n            {{- '\\n' + message.content }}\n        {%- endif %}\n        {%- for tool_call in message.tool_calls %}\n            {%- if tool_call.function is defined %}\n                {%- set tool_call = tool_call.function %}\n            {%- endif %}\n            {{- '\\n<tool_call>\\n{\"name\": \"' }}\n            {{- tool_call.name }}\n            {{- '\", \"arguments\": ' }}\n            {{- tool_call.arguments | tojson }}\n            {{- '}\\n</tool_call>' }}\n        {%- endfor %}\n        {{- '<|im_end|>\\n' }}\n    {%- elif message.role == \"tool\" %}\n        {%- if (loop.index0 == 0) or (messages[loop.index0 - 1].role != \"tool\") %}\n            {{- '<|im_start|>user' }}\n        {%- endif %}\n        {{- '\\n<tool_response>\\n' }}\n        {{- message.content }}\n        {{- '\\n</tool_response>' }}\n        {%- if loop.last or (messages[loop.index0 + 1].role != \"tool\") %}\n            {{- '<|im_end|>\\n' }}\n        {%- endif %}\n    {%- endif %}\n{%- endfor %}\n{%- if add_generation_prompt %}\n    {{- '<|im_start|>assistant\\n' }}\n{%- endif %}\n",
+    "stop_token_ids": [
+      151643,
+      151644,
+      151645
+    ],
+    "stop": [
+      "<|endoftext|>",
+      "<|im_start|>",
+      "<|im_end|>"
+    ]
+  },
+  {
+    "version": 1,
+    "context_length": 32768,
+    "model_name": "qwen2.5-coder",
+    "model_lang": [
+      "en",
+      "zh"
+    ],
+    "model_ability": [
+      "generate"
+    ],
+    "model_description": "Qwen2.5-Coder is the latest series of Code-Specific Qwen large language models (formerly known as CodeQwen).",
+    "model_specs": [
+      {
+        "model_format": "pytorch",
+        "model_size_in_billions": "1_5",
+        "quantizations": [
+          "4-bit",
+          "8-bit",
+          "none"
+        ],
+        "model_id": "Qwen/Qwen2.5-Coder-1.5B",
+        "model_revision": "d3586cfe793730945f8e4d7ef31032a3ee50247d"
+      },
+      {
+        "model_format": "pytorch",
+        "model_size_in_billions": 7,
+        "quantizations": [
+          "4-bit",
+          "8-bit",
+          "none"
+        ],
+        "model_id": "Qwen/Qwen2.5-Coder-7B",
+        "model_revision": "30b6a7e874a78d46b80fa1db3194ea427dd41b08"
+      }
+    ]
+  },
+  {
+    "version": 1,
+    "context_length": 32768,
+    "model_name": "qwen2.5-coder-instruct",
+    "model_lang": [
+      "en",
+      "zh"
+    ],
+    "model_ability": [
+      "chat",
+      "tools"
+    ],
+    "model_description": "Qwen2.5-Coder is the latest series of Code-Specific Qwen large language models (formerly known as CodeQwen).",
+    "model_specs": [
+      {
+        "model_format": "pytorch",
+        "model_size_in_billions": "1_5",
+        "quantizations": [
+          "4-bit",
+          "8-bit",
+          "none"
+        ],
+        "model_id": "Qwen/Qwen2.5-Coder-1.5B-Instruct"
+      },
+      {
+        "model_format": "pytorch",
+        "model_size_in_billions": 7,
+        "quantizations": [
+          "4-bit",
+          "8-bit",
+          "none"
+        ],
+        "model_id": "Qwen/Qwen2.5-Coder-7B-Instruct"
+      },
+      {
+        "model_format": "gptq",
+        "model_size_in_billions": "7",
+        "quantizations": [
+            "Int4",
+            "Int8"
+        ],
+        "model_id": "Qwen/Qwen2.5-Coder-7B-Instruct-GPTQ-{quantization}"
+      },
+      {
+        "model_format": "ggufv2",
+        "model_size_in_billions": "1_5",
+        "quantizations": [
+          "q2_k",
+          "q3_k_m",
+          "q4_0",
+          "q4_k_m",
+          "q5_0",
+          "q5_k_m",
+          "q6_k",
+          "q8_0"
+        ],
+        "model_id": "Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF",
+        "model_file_name_template": "qwen2.5-coder-1.5b-instruct-{quantization}.gguf"
+      },
+      {
+        "model_format": "ggufv2",
+        "model_size_in_billions": 7,
+        "quantizations": [
+          "q2_k",
+          "q3_k_m",
+          "q4_0",
+          "q4_k_m",
+          "q5_0",
+          "q5_k_m",
+          "q6_k",
+          "q8_0"
+        ],
+        "model_id": "Qwen/Qwen2.5-Coder-7B-Instruct-GGUF",
+        "model_file_name_template": "qwen2.5-coder-7b-instruct-{quantization}.gguf",
+        "model_file_name_split_template": "qwen2.5-coder-7b-instruct-{quantization}-{part}.gguf",
+        "quantization_parts": {
+          "q4_0": [
+            "00001-of-00002",
+            "00002-of-00002"
+          ],
+          "q4_k_m": [
+            "00001-of-00002",
+            "00002-of-00002"
+          ],
+          "q5_0": [
+            "00001-of-00002",
+            "00002-of-00002"
+          ],
+          "q5_k_m": [
+            "00001-of-00002",
+            "00002-of-00002"
+          ],
+          "q6_k": [
+            "00001-of-00002",
+            "00002-of-00002"
+          ],
+          "q8_0": [
+            "00001-of-00003",
+            "00002-of-00003",
+            "00003-of-00003"
+          ]
+        }
+      }
+    ],
+    "chat_template": "{%- if tools %}\n    {{- '<|im_start|>system\\n' }}\n    {%- if messages[0]['role'] == 'system' %}\n        {{- messages[0]['content'] }}\n    {%- else %}\n        {{- 'You are a helpful assistant.' }}\n    {%- endif %}\n    {{- \"\\n\\n# Tools\\n\\nYou may call one or more functions to assist with the user query.\\n\\nYou are provided with function signatures within <tools></tools> XML tags:\\n<tools>\" }}\n    {%- for tool in tools %}\n        {{- \"\\n\" }}\n        {{- tool | tojson }}\n    {%- endfor %}\n    {{- \"\\n</tools>\\n\\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\\n<tool_call>\\n{{\\\"name\\\": <function-name>, \\\"arguments\\\": <args-json-object>}}\\n</tool_call><|im_end|>\\n\" }}\n{%- else %}\n    {%- if messages[0]['role'] == 'system' %}\n        {{- '<|im_start|>system\\n' + messages[0]['content'] + '<|im_end|>\\n' }}\n    {%- else %}\n        {{- '<|im_start|>system\\nYou are a helpful assistant.<|im_end|>\\n' }}\n    {%- endif %}\n{%- endif %}\n{%- for message in messages %}\n    {%- if (message.role == \"user\") or (message.role == \"system\" and not loop.first) or (message.role == \"assistant\" and not message.tool_calls) %}\n        {{- '<|im_start|>' + message.role + '\\n' + message.content + '<|im_end|>' + '\\n' }}\n    {%- elif message.role == \"assistant\" %}\n        {{- '<|im_start|>' + message.role }}\n        {%- if message.content %}\n            {{- '\\n' + message.content }}\n        {%- endif %}\n        {%- for tool_call in message.tool_calls %}\n            {%- if tool_call.function is defined %}\n                {%- set tool_call = tool_call.function %}\n            {%- endif %}\n            {{- '\\n<tool_call>\\n{\"name\": \"' }}\n            {{- tool_call.name }}\n            {{- '\", \"arguments\": ' }}\n            {{- tool_call.arguments | tojson }}\n            {{- '}\\n</tool_call>' }}\n        {%- endfor %}\n        {{- '<|im_end|>\\n' }}\n    {%- elif message.role == \"tool\" %}\n        {%- if (loop.index0 == 0) or (messages[loop.index0 - 1].role != \"tool\") %}\n            {{- '<|im_start|>user' }}\n        {%- endif %}\n        {{- '\\n<tool_response>\\n' }}\n        {{- message.content }}\n        {{- '\\n</tool_response>' }}\n        {%- if loop.last or (messages[loop.index0 + 1].role != \"tool\") %}\n            {{- '<|im_end|>\\n' }}\n        {%- endif %}\n    {%- endif %}\n{%- endfor %}\n{%- if add_generation_prompt %}\n    {{- '<|im_start|>assistant\\n' }}\n{%- endif %}\n",
+    "stop_token_ids": [
+      151643,
+      151644,
+      151645
+    ],
+    "stop": [
+      "<|endoftext|>",
+      "<|im_start|>",
+      "<|im_end|>"
+    ]
   }
 ]

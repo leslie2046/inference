@@ -72,6 +72,14 @@
     "multilingual": true
   },
   {
+    "model_name": "whisper-large-v3-turbo",
+    "model_family": "whisper",
+    "model_id": "openai/whisper-large-v3-turbo",
+    "model_revision": "41f01f3fe87f28c78e2fbf8b568835947dd65ed9",
+    "model_ability": "audio-to-text",
+    "multilingual": true
+  },
+  {
     "model_name": "Belle-distilwhisper-large-v2-zh",
     "model_family": "whisper",
     "model_id": "BELLE-2/Belle-distilwhisper-large-v2-zh",
@@ -119,39 +127,39 @@
     "model_name": "ChatTTS",
     "model_family": "ChatTTS",
     "model_id": "2Noise/ChatTTS",
-    "model_revision": "ce5913842aebd78e4a01a02d47244b8d62ac4ee3",
+    "model_revision": "3b34118f6d25850440b8901cef3e71c6ef8619c8",
     "model_ability": "text-to-audio",
     "multilingual": true
   },
   {
     "model_name": "CosyVoice-300M",
     "model_family": "CosyVoice",
-    "model_id": "model-scope/CosyVoice-300M",
-    "model_revision": "ca4e036d2db2aa4731cc1747859a68044b6a4694",
+    "model_id": "FunAudioLLM/CosyVoice-300M",
+    "model_revision": "39c4e13d46bd4dfb840d214547623e5fcd2428e2",
     "model_ability": "audio-to-audio",
     "multilingual": true
   },
   {
     "model_name": "CosyVoice-300M-SFT",
     "model_family": "CosyVoice",
-    "model_id": "model-scope/CosyVoice-300M-SFT",
-    "model_revision": "ab918940c6c134b1fc1f069246e67bad6b66abcb",
+    "model_id": "FunAudioLLM/CosyVoice-300M-SFT",
+    "model_revision": "096a5cff8d497fabb3dec2756a200f3688457a1b",
     "model_ability": "text-to-audio",
     "multilingual": true
   },
   {
     "model_name": "CosyVoice-300M-Instruct",
     "model_family": "CosyVoice",
-    "model_id": "model-scope/CosyVoice-300M-Instruct",
-    "model_revision": "fb5f676733139f35670bed9b59a77d476b1aa898",
+    "model_id": "FunAudioLLM/CosyVoice-300M-Instruct",
+    "model_revision": "ba5265d9a3169c1fedce145122c9dd4bc24e062c",
     "model_ability": "text-to-audio",
     "multilingual": true
   },
   {
-    "model_name": "FishSpeech-1.2-SFT",
+    "model_name": "FishSpeech-1.4",
     "model_family": "FishAudio",
-    "model_id": "fishaudio/fish-speech-1.2-sft",
-    "model_revision": "180288e21ec5c50cfc564023a22f789e4b88a0e0",
+    "model_id": "fishaudio/fish-speech-1.4",
+    "model_revision": "3c49651b8e583b6b13f55e375432e0d57e1aa84d",
     "model_ability": "text-to-audio",
     "multilingual": true
   }
