@@ -50,3 +50,17 @@ curl -X 'POST'   'http://192.168.1.88:9997/v1/audio/transcriptions' \
     -F model="SenseVoiceSmall" \
     -F language="en" \
     -w "\n时间总计: %{time_total} 秒\n"
+
+curl -X 'POST'   'http://192.168.1.88:9997/v1/audio/transcriptions' \
+    -H 'accept: application/json' \
+    -H "Content-Type: multipart/form-data" \
+    -F file="@./bill_gates-TED.mp3" \
+    -F model="whisper-large-v3-turbo" \
+    -w "\n时间总计: %{time_total} 秒\n"
+curl -X 'POST'   'http://192.168.1.88:9997/v1/images/ocr' \
+    -H 'accept: application/json' \
+    -H "Content-Type: multipart/form-data" \
+    -F "image=@./assets_train_sample.jpg;type=application/octet-stream" \
+    -F model="GOT-OCR2_0" \
+    -F ocr_type="format" \
+    -w "\n时间总计: %{time_total} 秒\n"
