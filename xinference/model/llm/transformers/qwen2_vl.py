@@ -17,6 +17,7 @@ import sys
 import uuid
 from typing import Iterator, List, Optional, Union
 
+from ....device_utils import is_npu_available
 from ....model.utils import select_device
 from ....types import (
     ChatCompletion,
@@ -47,6 +48,8 @@ class Qwen2VLChatModel(PytorchChatModel):
         llm_family = model_family.model_family or model_family.model_name
         if "qwen2-vl-instruct".lower() in llm_family.lower():
             return True
+        if "qvq-72b-preview".lower() in llm_family.lower():
+            return True
         return False
 
     def load(self):
@@ -70,6 +73,14 @@ class Qwen2VLChatModel(PytorchChatModel):
                 device_map=device,
                 attn_implementation="flash_attention_2",
                 trust_remote_code=True,
+            ).eval()
+        elif is_npu_available():
+            # Ascend do not support bf16
+            self._model = Qwen2VLForConditionalGeneration.from_pretrained(
+                self.model_path,
+                device_map="auto",
+                trust_remote_code=True,
+                torch_dtype="float16",
             ).eval()
         else:
             self._model = Qwen2VLForConditionalGeneration.from_pretrained(
@@ -112,7 +123,7 @@ class Qwen2VLChatModel(PytorchChatModel):
             padding=True,
             return_tensors="pt",
         )
-        inputs = inputs.to("cuda")
+        inputs = inputs.to(self._device)
 
         # Inference: Generation of the output
         generated_ids = self._model.generate(

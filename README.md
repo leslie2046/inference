@@ -38,6 +38,7 @@ potential of cutting-edge AI models.
 
 ## 🔥 Hot Topics
 ### Framework Enhancements
+- VLLM enhancement: Shared KV cache across multiple replicas: [#2732](https://github.com/xorbitsai/inference/pull/2732)
 - Support Continuous batching for Transformers engine: [#1724](https://github.com/xorbitsai/inference/pull/1724)
 - Support MLX backend for Apple Silicon chips: [#1765](https://github.com/xorbitsai/inference/pull/1765)
 - Support specifying worker and GPU indexes for launching models: [#1195](https://github.com/xorbitsai/inference/pull/1195)
@@ -46,14 +47,14 @@ potential of cutting-edge AI models.
 - Support speech recognition model: [#929](https://github.com/xorbitsai/inference/pull/929)
 - Metrics support: [#906](https://github.com/xorbitsai/inference/pull/906)
 ### New Models
+- Built-in support for [Stable Diffusion 3.5](https://huggingface.co/collections/stabilityai/stable-diffusion-35-671785cca799084f71fa2838): [#2706](https://github.com/xorbitsai/inference/pull/2706)
+- Built-in support for [CosyVoice 2](https://huggingface.co/FunAudioLLM/CosyVoice2-0.5B): [#2684](https://github.com/xorbitsai/inference/pull/2684)
+- Built-in support for [Fish Speech V1.5](https://huggingface.co/fishaudio/fish-speech-1.5): [#2672](https://github.com/xorbitsai/inference/pull/2672)
+- Built-in support for [F5-TTS](https://github.com/SWivid/F5-TTS): [#2626](https://github.com/xorbitsai/inference/pull/2626)
+- Built-in support for [GLM Edge](https://github.com/THUDM/GLM-Edge): [#2582](https://github.com/xorbitsai/inference/pull/2582)
+- Built-in support for [QwQ-32B-Preview](https://qwenlm.github.io/blog/qwq-32b-preview/): [#2602](https://github.com/xorbitsai/inference/pull/2602)
 - Built-in support for [Qwen 2.5 Series](https://qwenlm.github.io/blog/qwen2.5/): [#2325](https://github.com/xorbitsai/inference/pull/2325)
-- Built-in support for [Fish Speech V1.4](https://huggingface.co/fishaudio/fish-speech-1.4): [#2295](https://github.com/xorbitsai/inference/pull/2295)
 - Built-in support for [DeepSeek-V2.5](https://huggingface.co/deepseek-ai/DeepSeek-V2.5): [#2292](https://github.com/xorbitsai/inference/pull/2292)
-- Built-in support for [Qwen2-Audio](https://github.com/QwenLM/Qwen2-Audio): [#2271](https://github.com/xorbitsai/inference/pull/2271)
-- Built-in support for [Qwen2-vl-instruct](https://github.com/QwenLM/Qwen2-VL): [#2205](https://github.com/xorbitsai/inference/pull/2205)
-- Built-in support for [MiniCPM3-4B](https://huggingface.co/openbmb/MiniCPM3-4B): [#2263](https://github.com/xorbitsai/inference/pull/2263)
-- Built-in support for [CogVideoX](https://github.com/THUDM/CogVideo): [#2049](https://github.com/xorbitsai/inference/pull/2049)
-- Built-in support for [flux.1-schnell & flux.1-dev](https://www.basedlabs.ai/tools/flux1): [#2007](https://github.com/xorbitsai/inference/pull/2007)
 ### Integrations
 - [Dify](https://docs.dify.ai/advanced/model-configuration/xinference): an LLMOps platform that enables developers (and even non-developers) to quickly build useful applications based on large language models, ensuring they are visual, operable, and improvable.
 - [FastGPT](https://github.com/labring/FastGPT): a knowledge-based platform built on the LLM, offers out-of-the-box data processing and model invocation capabilities, allows for workflow orchestration through Flow visualization.
@@ -179,6 +180,24 @@ Once Xinference is running, there are multiple ways you can try it: via the web 
 | [Github Issues](https://github.com/xorbitsai/inference/issues)                                | Reporting bugs and filing feature requests.        |
 | [Slack](https://join.slack.com/t/xorbitsio/shared_invite/zt-1o3z9ucdh-RbfhbPVpx7prOVdM1CAuxg) | Collaborating with other Xorbits users.            |
 | [Twitter](https://twitter.com/xorbitsio)                                                      | Staying up-to-date on new features.                |
+
+## Citation
+
+If this work is helpful, please kindly cite as:
+
+```bibtex
+@inproceedings{lu2024xinference,
+    title = "Xinference: Making Large Model Serving Easy",
+    author = "Lu, Weizheng and Xiong, Lingfeng and Zhang, Feng and Qin, Xuye and Chen, Yueguo",
+    booktitle = "Proceedings of the 2024 Conference on Empirical Methods in Natural Language Processing: System Demonstrations",
+    month = nov,
+    year = "2024",
+    address = "Miami, Florida, USA",
+    publisher = "Association for Computational Linguistics",
+    url = "https://aclanthology.org/2024.emnlp-demo.30",
+    pages = "291--300",
+}
+```
 
 ## Contributors
 

@@ -52,6 +52,7 @@ QWEN_TOOL_CALL_FAMILY = [
     "qwen2-instruct",
     "qwen2-moe-instruct",
     "qwen2.5-instruct",
+    "qwen2.5-coder-instruct",
 ]
 
 GLM4_TOOL_CALL_FAMILY = [
@@ -96,13 +97,18 @@ class ChatModelMixin:
         return rendered
 
     def get_full_context(
-        self, messages: List, chat_template: str, tokenizer=None, **kwargs
-    ) -> str:
+        self,
+        messages: List,
+        chat_template: str,
+        tokenizer=None,
+        tokenize=False,
+        **kwargs,
+    ):
         if tokenizer is not None:
             try:
                 full_context = tokenizer.apply_chat_template(
                     messages,
-                    tokenize=False,
+                    tokenize=tokenize,
                     chat_template=chat_template,
                     add_generation_prompt=True,
                     **kwargs,
@@ -117,6 +123,25 @@ class ChatModelMixin:
             # build from jinja
             # Compilation function uses a cache to avoid recompiling the same template
             return self._build_from_raw_template(messages, chat_template, **kwargs)
+
+    @staticmethod
+    def convert_messages_with_content_list_to_str_conversion(
+        messages: List[Dict],
+    ) -> List[Dict]:
+        """
+        Handles messages with content list conversion, in order to support Cline, see GH#2659 .
+        """
+        for message in messages:
+            texts = ""
+            msg_content = message.get("content")
+            if msg_content:
+                if isinstance(msg_content, str):
+                    texts = msg_content
+                elif isinstance(msg_content, list):
+                    texts = "\n".join(item.get("text", "") for item in msg_content)
+            if texts:
+                message["content"] = texts
+        return messages
 
     @staticmethod
     def get_specific_prompt(model_family: str, messages: List[ChatCompletionMessage]):
@@ -324,7 +349,10 @@ class ChatModelMixin:
         """
         try:
             if isinstance(c, dict):
-                return [(None, c["name"], c["arguments"])]
+                try:
+                    return [(None, c["name"], json.loads(c["arguments"]))]
+                except Exception:
+                    return [(None, c["name"], c["arguments"])]
         except KeyError:
             logger.error("Can't parse glm output: %s", c)
             return [(str(c), None, None)]
@@ -567,6 +595,25 @@ def _decode_image(_url):
             return Image.open(_url).convert("RGB")
         else:
             return Image.open(BytesIO(response.content)).convert("RGB")
+
+
+def _decode_image_without_rgb(_url):
+    if _url.startswith("data:"):
+        logging.info("Parse url by base64 decoder.")
+        # https://platform.openai.com/docs/guides/vision/uploading-base-64-encoded-images
+        # e.g. f"data:image/jpeg;base64,{base64_image}"
+        _type, data = _url.split(";")
+        _, ext = _type.split("/")
+        data = data[len("base64,") :]
+        data = base64.b64decode(data.encode("utf-8"))
+        return Image.open(BytesIO(data))
+    else:
+        try:
+            response = requests.get(_url)
+        except requests.exceptions.MissingSchema:
+            return Image.open(_url)
+        else:
+            return Image.open(BytesIO(response.content))
 
 
 @typing.no_type_check
