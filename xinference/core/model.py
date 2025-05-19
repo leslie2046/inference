@@ -35,6 +35,7 @@ from typing import (
     List,
     Optional,
     Union,
+    no_type_check,
 )
 
 import sse_starlette.sse
@@ -184,7 +185,7 @@ class ModelActor(xo.StatelessActor, CancelMixin):
                 )
 
         if hasattr(self._model, "stop") and callable(self._model.stop):
-            self._model.stop()
+            await asyncio.to_thread(self._model.stop)
 
         if isinstance(self._model, LLMVLLMModel):
             if self._transfer_ref is not None:
@@ -225,8 +226,13 @@ class ModelActor(xo.StatelessActor, CancelMixin):
         model_description: Optional["ModelDescription"] = None,
         request_limits: Optional[int] = None,
         xavier_config: Optional[Dict] = None,
+        n_worker: Optional[int] = 1,
+        shard: Optional[int] = 0,
+        driver_info: Optional[dict] = None,  # for model across workers
     ):
         super().__init__()
+
+        from ..model.llm.llama_cpp.core import XllamaCppModel
         from ..model.llm.lmdeploy.core import LMDeployModel
         from ..model.llm.sglang.core import SGLANGModel
         from ..model.llm.transformers.core import PytorchModel
@@ -247,7 +253,8 @@ class ModelActor(xo.StatelessActor, CancelMixin):
         self._lock = (
             None
             if isinstance(
-                self._model, (PytorchModel, VLLMModel, SGLANGModel, LMDeployModel)
+                self._model,
+                (PytorchModel, VLLMModel, SGLANGModel, LMDeployModel, XllamaCppModel),
             )
             else asyncio.locks.Lock()
         )
@@ -262,6 +269,10 @@ class ModelActor(xo.StatelessActor, CancelMixin):
             "quantization": self._model_description.get("quantization", "none"),
         }
         self._loop: Optional[asyncio.AbstractEventLoop] = None
+        # model across workers
+        self._n_worker = n_worker
+        self._shard = shard
+        self._driver_info = driver_info
 
         self._scheduler_ref = None
         self._text_to_image_scheduler_ref = None
@@ -273,6 +284,8 @@ class ModelActor(xo.StatelessActor, CancelMixin):
 
     async def __post_create__(self):
         self._loop = asyncio.get_running_loop()
+
+        logger.debug("Starting ModelActor at %s, uid: %s", self.address, self.uid)
 
         self._handle_pending_requests_task = asyncio.create_task(
             self._handle_pending_requests()
@@ -302,6 +315,7 @@ class ModelActor(xo.StatelessActor, CancelMixin):
     def decrease_serve_count(self):
         self._serve_count -= 1
 
+    @no_type_check
     async def start_transfer_for_vllm(self, rank_addresses: List[str]):
         from ..model.llm.vllm.core import VLLMModel
         from ..model.llm.vllm.xavier.transfer import TransferActor
@@ -452,7 +466,11 @@ class ModelActor(xo.StatelessActor, CancelMixin):
         while True:
             i += 1
             try:
-                self._model.load()
+                if hasattr(self._model, "set_loop"):
+                    self._model.set_loop(asyncio.get_running_loop())
+                await asyncio.to_thread(self._model.load)
+                if hasattr(self._model, "driver_info"):
+                    self._driver_info = self._model.driver_info
                 break
             except Exception as e:
                 if (
@@ -475,6 +493,26 @@ class ModelActor(xo.StatelessActor, CancelMixin):
             )
         logger.info(f"{self} loaded")
 
+    async def wait_for_load(self):
+        if hasattr(self._model, "wait_for_load"):
+            await asyncio.to_thread(self._model.wait_for_load)
+
+    def need_create_pools(self):
+        return getattr(self._model, "need_create_pools", False)
+
+    def set_pool_addresses(self, pool_addresses: List[str]):
+        if hasattr(self._model, "set_pool_addresses"):
+            self._model.set_pool_addresses(pool_addresses)
+
+    def get_pool_addresses(self) -> Optional[List[str]]:
+        if hasattr(self._model, "get_pool_addresses"):
+            return self._model.get_pool_addresses()
+        return None
+
+    def set_worker_addresses(self, shard: int, worker_addresses: List[str]):
+        if hasattr(self._model, "set_worker_addresses"):
+            self._model.set_worker_addresses(shard, worker_addresses)
+
     def model_uid(self):
         return (
             self._model.model_uid
@@ -485,6 +523,12 @@ class ModelActor(xo.StatelessActor, CancelMixin):
                 else None  # return None for UT
             )
         )
+
+    def get_driver_info(self):
+        # driver info is used for model across workers,
+        # the driver model actor(always the first worker)
+        # will hold driver information includes dist store etc.
+        return self._driver_info
 
     async def _handle_oom_error(self, ex):
         error_message = (
@@ -588,6 +632,8 @@ class ModelActor(xo.StatelessActor, CancelMixin):
                     return await _gen.__anext__()  # noqa: F821
                 except StopAsyncIteration:
                     return stop
+                except Exception as e:
+                    return e
 
             def _wrapper(_gen):
                 # Avoid issue: https://github.com/python/cpython/issues/112182
@@ -595,6 +641,8 @@ class ModelActor(xo.StatelessActor, CancelMixin):
                     return next(_gen)
                 except StopIteration:
                     return stop
+                except Exception as e:
+                    return e
 
             while True:
                 try:
@@ -655,6 +703,8 @@ class ModelActor(xo.StatelessActor, CancelMixin):
                             o = stream_out.get()
                             if o is stop:
                                 break
+                            elif isinstance(o, Exception):
+                                raise o
                             else:
                                 yield o
 
@@ -671,6 +721,8 @@ class ModelActor(xo.StatelessActor, CancelMixin):
                             o = await stream_out.get()
                             if o is stop:
                                 break
+                            elif isinstance(o, Exception):
+                                raise o
                             else:
                                 yield o
 
@@ -1185,17 +1237,49 @@ class ModelActor(xo.StatelessActor, CancelMixin):
         *args,
         **kwargs,
     ):
-        kwargs.pop("request_id", None)
-        if hasattr(self._model, "text_to_video"):
-            return await self._call_wrapper_json(
-                self._model.text_to_video,
-                prompt,
-                n,
-                *args,
-                **kwargs,
-            )
+        progressor = kwargs["progressor"] = await self._get_progressor(
+            kwargs.pop("request_id", None)
+        )
+        with progressor:
+            if hasattr(self._model, "text_to_video"):
+                return await self._call_wrapper_json(
+                    self._model.text_to_video,
+                    prompt,
+                    n,
+                    *args,
+                    **kwargs,
+                )
         raise AttributeError(
             f"Model {self._model.model_spec} is not for creating video."
+        )
+
+    @request_limit
+    @log_async(logger=logger)
+    async def image_to_video(
+        self,
+        image: "PIL.Image",
+        prompt: str,
+        negative_prompt: Optional[str] = None,
+        n: int = 1,
+        *args,
+        **kwargs,
+    ):
+        kwargs["negative_prompt"] = negative_prompt
+        progressor = kwargs["progressor"] = await self._get_progressor(
+            kwargs.pop("request_id", None)
+        )
+        with progressor:
+            if hasattr(self._model, "image_to_video"):
+                return await self._call_wrapper_json(
+                    self._model.image_to_video,
+                    image,
+                    prompt,
+                    n,
+                    *args,
+                    **kwargs,
+                )
+        raise AttributeError(
+            f"Model {self._model.model_spec} is not for creating video from image."
         )
 
     async def record_metrics(self, name, op, kwargs):

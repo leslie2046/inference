@@ -17,7 +17,7 @@ from collections import defaultdict
 from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 from ...constants import XINFERENCE_CACHE_DIR
-from ..core import CacheableModelSpec, ModelDescription
+from ..core import CacheableModelSpec, ModelDescription, VirtualEnvSettings
 from ..utils import valid_model_revision
 from .chattts import ChatTTSModel
 from .cosyvoice import CosyVoiceModel
@@ -25,6 +25,9 @@ from .f5tts import F5TTSModel
 from .f5tts_mlx import F5TTSMLXModel
 from .fish_speech import FishSpeechModel
 from .funasr import FunASRModel
+from .kokoro import KokoroModel
+from .megatts import MegaTTSModel
+from .melotts import MeloTTSModel
 from .whisper import WhisperModel
 from .whisper_mlx import WhisperMLXModel
 
@@ -48,10 +51,12 @@ class AudioModelFamilyV1(CacheableModelSpec):
     model_id: str
     model_revision: Optional[str]
     multilingual: bool
-    model_ability: Optional[str]
+    language: Optional[str]
+    model_ability: Optional[List[str]]
     default_model_config: Optional[Dict[str, Any]]
     default_transcription_config: Optional[Dict[str, Any]]
     engine: Optional[str]
+    virtualenv: Optional[VirtualEnvSettings]
 
 
 class AudioModelDescription(ModelDescription):
@@ -65,6 +70,10 @@ class AudioModelDescription(ModelDescription):
         super().__init__(address, devices, model_path=model_path)
         self._model_spec = model_spec
 
+    @property
+    def spec(self):
+        return self._model_spec
+
     def to_dict(self):
         return {
             "model_type": "audio",
@@ -73,6 +82,7 @@ class AudioModelDescription(ModelDescription):
             "model_name": self._model_spec.model_name,
             "model_family": self._model_spec.model_family,
             "model_revision": self._model_spec.model_revision,
+            "model_ability": self._model_spec.model_ability,
         }
 
     def to_version_info(self):
@@ -173,6 +183,9 @@ def create_audio_model_instance(
         FishSpeechModel,
         F5TTSModel,
         F5TTSMLXModel,
+        MeloTTSModel,
+        KokoroModel,
+        MegaTTSModel,
     ],
     AudioModelDescription,
 ]:
@@ -188,6 +201,9 @@ def create_audio_model_instance(
         FishSpeechModel,
         F5TTSModel,
         F5TTSMLXModel,
+        MeloTTSModel,
+        KokoroModel,
+        MegaTTSModel,
     ]
     if model_spec.model_family == "whisper":
         if not model_spec.engine:
@@ -206,6 +222,12 @@ def create_audio_model_instance(
         model = F5TTSModel(model_uid, model_path, model_spec, **kwargs)
     elif model_spec.model_family == "F5-TTS-MLX":
         model = F5TTSMLXModel(model_uid, model_path, model_spec, **kwargs)
+    elif model_spec.model_family == "MeloTTS":
+        model = MeloTTSModel(model_uid, model_path, model_spec, **kwargs)
+    elif model_spec.model_family == "Kokoro":
+        model = KokoroModel(model_uid, model_path, model_spec, **kwargs)
+    elif model_spec.model_family == "MegaTTS":
+        model = MegaTTSModel(model_uid, model_path, model_spec, **kwargs)
     else:
         raise Exception(f"Unsupported audio model family: {model_spec.model_family}")
     model_description = AudioModelDescription(

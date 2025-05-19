@@ -8,11 +8,12 @@ import { useNavigate } from 'react-router-dom'
 import { ApiContext } from '../../components/apiContext'
 import ErrorMessageSnackBar from '../../components/errorMessageSnackBar'
 import fetchWrapper from '../../components/fetchWrapper'
+import SuccessMessageSnackBar from '../../components/successMessageSnackBar'
 import Title from '../../components/Title'
 import { isValidBearerToken } from '../../components/utils'
+import { featureModels } from './data/data'
 import LaunchCustom from './launchCustom'
-import LaunchLLM from './launchLLM'
-import LaunchModelComponent from './LaunchModelComponent'
+import LaunchModelComponent from './LaunchModel'
 
 const LaunchModel = () => {
   const [value, setValue] = React.useState(
@@ -62,6 +63,7 @@ const LaunchModel = () => {
     <Box m="20px">
       <Title title={t('menu.launchModel')} />
       <ErrorMessageSnackBar />
+      <SuccessMessageSnackBar />
       <TabContext value={value}>
         <Box sx={{ borderBottom: 1, borderColor: 'divider' }}>
           <TabList value={value} onChange={handleTabChange} aria-label="tabs">
@@ -81,28 +83,57 @@ const LaunchModel = () => {
           </TabList>
         </Box>
         <TabPanel value="/launch_model/llm" sx={{ padding: 0 }}>
-          <LaunchLLM gpuAvailable={gpuAvailable} />
+          <LaunchModelComponent
+            modelType={'LLM'}
+            gpuAvailable={gpuAvailable}
+            featureModels={
+              featureModels.find((item) => item.type === 'llm').feature_models
+            }
+          />
         </TabPanel>
         <TabPanel value="/launch_model/embedding" sx={{ padding: 0 }}>
           <LaunchModelComponent
             modelType={'embedding'}
             gpuAvailable={gpuAvailable}
+            featureModels={
+              featureModels.find((item) => item.type === 'embedding')
+                .feature_models
+            }
           />
         </TabPanel>
         <TabPanel value="/launch_model/rerank" sx={{ padding: 0 }}>
           <LaunchModelComponent
             modelType={'rerank'}
             gpuAvailable={gpuAvailable}
+            featureModels={
+              featureModels.find((item) => item.type === 'rerank')
+                .feature_models
+            }
           />
         </TabPanel>
         <TabPanel value="/launch_model/image" sx={{ padding: 0 }}>
-          <LaunchModelComponent modelType={'image'} />
+          <LaunchModelComponent
+            modelType={'image'}
+            featureModels={
+              featureModels.find((item) => item.type === 'image').feature_models
+            }
+          />
         </TabPanel>
         <TabPanel value="/launch_model/audio" sx={{ padding: 0 }}>
-          <LaunchModelComponent modelType={'audio'} />
+          <LaunchModelComponent
+            modelType={'audio'}
+            featureModels={
+              featureModels.find((item) => item.type === 'audio').feature_models
+            }
+          />
         </TabPanel>
         <TabPanel value="/launch_model/video" sx={{ padding: 0 }}>
-          <LaunchModelComponent modelType={'video'} />
+          <LaunchModelComponent
+            modelType={'video'}
+            featureModels={
+              featureModels.find((item) => item.type === 'video').feature_models
+            }
+          />
         </TabPanel>
         <TabPanel value="/launch_model/custom/llm" sx={{ padding: 0 }}>
           <LaunchCustom gpuAvailable={gpuAvailable} />

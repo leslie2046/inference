@@ -24,7 +24,7 @@ import torch
 from ..._compat import ROOT_KEY, ErrorWrapper, ValidationError
 from ...device_utils import empty_cache
 from ...types import Embedding, EmbeddingData, EmbeddingUsage
-from ..core import CacheableModelSpec, ModelDescription
+from ..core import CacheableModelSpec, ModelDescription, VirtualEnvSettings
 from ..utils import get_cache_dir, is_model_cached
 
 logger = logging.getLogger(__name__)
@@ -57,6 +57,7 @@ class EmbeddingModelSpec(CacheableModelSpec):
     model_id: str
     model_revision: Optional[str]
     model_hub: str = "huggingface"
+    virtualenv: Optional[VirtualEnvSettings]
 
 
 class EmbeddingModelDescription(ModelDescription):
@@ -69,6 +70,10 @@ class EmbeddingModelDescription(ModelDescription):
     ):
         super().__init__(address, devices, model_path=model_path)
         self._model_spec = model_spec
+
+    @property
+    def spec(self):
+        return self._model_spec
 
     def to_dict(self):
         return {
@@ -268,7 +273,7 @@ class EmbeddingModel:
         **kwargs,
     ):
         sentences = self._fix_langchain_openai_inputs(sentences)
-
+        model_uid = kwargs.pop("model_uid", None)
         from sentence_transformers import SentenceTransformer
 
         kwargs.setdefault("normalize_embeddings", True)
@@ -546,8 +551,14 @@ class EmbeddingModel:
                 # when batching, the attention mask 1 means there is a token
                 # thus we just sum up it to get the total number of tokens
                 if "clip" in self._model_spec.model_name.lower():
-                    all_token_nums += features["input_ids"].numel()
-                    all_token_nums += features["pixel_values"].numel()
+                    if "input_ids" in features and hasattr(
+                        features["input_ids"], "numel"
+                    ):
+                        all_token_nums += features["input_ids"].numel()
+                    if "pixel_values" in features and hasattr(
+                        features["pixel_values"], "numel"
+                    ):
+                        all_token_nums += features["pixel_values"].numel()
                 else:
                     all_token_nums += features["attention_mask"].sum().item()
 
@@ -657,7 +668,7 @@ class EmbeddingModel:
                 self._model,
                 objs,
                 convert_to_numpy=False,
-                **self._kwargs,
+                **kwargs,
             )
         else:
             all_embeddings, all_token_nums = encode(
@@ -693,7 +704,8 @@ class EmbeddingModel:
                 if not is_bge_m3_flag_model and not kwargs.get("return_sparse")
                 else "dict"
             ),
-            model=self._model_uid,
+            model=model_uid,  # type: ignore
+            model_replica=self._model_uid,
             data=embedding_list,
             usage=usage,
         )

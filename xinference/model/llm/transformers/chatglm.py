@@ -84,7 +84,7 @@ class ChatglmPytorchChatModel(PytorchChatModel):
         return model, tokenizer
 
     @classmethod
-    def match(
+    def match_json(
         cls, llm_family: "LLMFamilyV1", llm_spec: "LLMSpecV1", quantization: str
     ) -> bool:
         if llm_spec.model_format != "pytorch":
@@ -383,7 +383,7 @@ class ChatglmPytorchChatModel(PytorchChatModel):
                 function_call = self._process_response_non_streaming(
                     response, tools, use_tool=True
                 )
-                return self._tool_calls_completion(
+                return self._post_process_completion(
                     self.model_family, self.model_uid, function_call
                 )
             else:
@@ -397,7 +397,7 @@ class ChatglmPytorchChatModel(PytorchChatModel):
                 prompt_tokens = len(inputs["input_ids"][0])
                 for chunk_text in self._stream_chat(inputs, tools, **kwargs):
                     if tools and isinstance(chunk_text, dict):
-                        yield self._tool_calls_completion_chunk(
+                        yield self._post_process_completion_chunk(
                             self.model_family, self.model_uid, chunk_text
                         )
                         return
@@ -462,6 +462,12 @@ class ChatglmPytorchChatModel(PytorchChatModel):
                     tools = list(tools) if tools is not None else None
                     tool_choice = r.generate_config.get("tool_choice", "none")
 
+                    full_context_kwargs = (
+                        self._get_chat_template_kwargs_from_generate_config(
+                            r.generate_config, self.reasoning_parser
+                        )
+                        or {}
+                    )
                     r.prompt = self._process_messages(
                         r.prompt, tools=tools, tool_choice=tool_choice
                     )
@@ -469,6 +475,7 @@ class ChatglmPytorchChatModel(PytorchChatModel):
                         r.prompt,
                         self.model_family.chat_template,  # type: ignore
                         tokenizer=self._tokenizer,
+                        **full_context_kwargs,
                     )
                     if tools:
                         r.tools = tools
@@ -484,7 +491,7 @@ class ChatglmPytorchChatModel(PytorchChatModel):
             function_call = self._process_response_non_streaming(
                 response, req.tools, use_tool=True
             )
-            req.completion[0] = self._tool_calls_completion(
+            req.completion[0] = self._post_process_completion(
                 self.model_family, self.model_uid, function_call
             )
             req.completion[0]["usage"] = usage
@@ -501,7 +508,7 @@ class ChatglmPytorchChatModel(PytorchChatModel):
 
         if "<bos_stream>" in req.completion:
             bos_pos = req.completion.index("<bos_stream>")
-            results.append(
+            results.extend(
                 self._get_first_chat_completion_chunk(req.completion[bos_pos + 1])
             )
 
@@ -516,7 +523,7 @@ class ChatglmPytorchChatModel(PytorchChatModel):
                             c for c in req.completion if not isinstance(c, str)
                         ][0]["id"]
                         results.append(
-                            self._tool_calls_completion_chunk(
+                            self._post_process_completion_chunk(
                                 self.model_family,
                                 self.model_uid,
                                 new_response,

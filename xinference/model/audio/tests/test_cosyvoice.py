@@ -18,14 +18,15 @@ import tempfile
 import pytest
 
 
-def test_cosyvoice_sft(setup):
+@pytest.mark.parametrize("model_name", ["CosyVoice-300M-SFT", "CosyVoice2-0.5B"])
+def test_cosyvoice_sft(setup, model_name):
     endpoint, _ = setup
     from ....client import Client
 
     client = Client(endpoint)
 
     model_uid = client.launch_model(
-        model_name="CosyVoice-300M-SFT", model_type="audio", download_hub="huggingface"
+        model_name=model_name, model_type="audio", download_hub="huggingface"
     )
     model = client.get_model(model_uid)
     input_string = "你好，我是通义生成式语音大模型，请问有什么可以帮您的吗？"
@@ -34,6 +35,28 @@ def test_cosyvoice_sft(setup):
     response = model.speech(input_string)
     assert type(response) is bytes
     assert len(response) > 0
+
+    # Test openai API
+    import openai
+
+    openai_client = openai.Client(api_key="not empty", base_url=f"{endpoint}/v1")
+    # ['中文女', '中文男', '日语男', '粤语女', '英文女', '英文男', '韩语女']
+    response = openai_client.audio.speech.create(
+        model=model_uid, input=input_string, voice="英文女"
+    )
+    with tempfile.NamedTemporaryFile(suffix=".mp3", delete=True) as f:
+        response.stream_to_file(f.name)
+        assert os.stat(f.name).st_size > 0
+
+    if "CosyVoice2" in model_name:
+        client.terminate_model(model_uid)
+        model_uid = client.launch_model(
+            model_name=model_name,
+            model_type="audio",
+            download_hub="modelscope",
+            use_flow_cache=True,
+        )
+        model = client.get_model(model_uid)
 
     # inference_sft
     response = model.speech(input_string, stream=True)
@@ -46,18 +69,6 @@ def test_cosyvoice_sft(setup):
             assert type(chunk) is bytes
             assert len(chunk) > 0
         assert i > 5
-
-    # Test openai API
-    import openai
-
-    client = openai.Client(api_key="not empty", base_url=f"{endpoint}/v1")
-    # ['中文女', '中文男', '日语男', '粤语女', '英文女', '英文男', '韩语女']
-    response = client.audio.speech.create(
-        model=model_uid, input=input_string, voice="英文女"
-    )
-    with tempfile.NamedTemporaryFile(suffix=".mp3", delete=True) as f:
-        response.stream_to_file(f.name)
-        assert os.stat(f.name).st_size > 0
 
 
 @pytest.mark.parametrize("model_name", ["CosyVoice-300M", "CosyVoice2-0.5B"])
@@ -74,7 +85,11 @@ def test_cosyvoice(setup, model_name):
 
     client = Client(endpoint)
 
-    model_uid = client.launch_model(model_name=model_name, model_type="audio")
+    model_uid = client.launch_model(
+        model_name=model_name,
+        model_type="audio",
+        download_hub="modelscope",
+    )
     model = client.get_model(model_uid)
     with open(zero_shot_prompt_file, "rb") as f:
         zero_shot_prompt = f.read()
@@ -116,6 +131,7 @@ def test_cosyvoice_instruct(setup, model_name):
     model_uid = client.launch_model(
         model_name=model_name,
         model_type="audio",
+        download_hub="modelscope",
     )
     model = client.get_model(model_uid)
 
