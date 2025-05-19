@@ -1,6 +1,6 @@
 services:
   xinference-worker:
-    image: xprobe/xinference:latest-cpu
+    image: xprobe/xinference:latest
     container_name: xinference-worker
     restart: always
     network_mode: host
@@ -10,6 +10,11 @@ services:
     volumes:
       - ${CACHE_PATH}:/data
     command: >
-      xinference-worker -e "${ENDPOINT}" -H "{HOST}" --log-level ${LOG_LEVEL}
+      xinference-worker -e "${ENDPOINT}" -H "${HOST}" --log-level ${LOG_LEVEL}
     stdin_open: true
     tty: true
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
