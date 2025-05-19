@@ -1,0 +1,19 @@
+services:
+  xinference-supervisor:
+    image: xprobe/xinference:latest
+    container_name: xinference-supervisor
+    network_mode: host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - XINFERENCE_HOME=/data
+      - XINFERENCE_MODEL_SRC=modelscope
+    volumes:
+      - /home/njue/.cache:/data
+    command: >
+      xinference-supervisor -H 192.168.1.88 --port 9997 --log-level DEBUG
+

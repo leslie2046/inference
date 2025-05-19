@@ -1,0 +1,21 @@
+services:
+  xinference-worker:
+    image: xprobe/xinference:latest-cpu
+    container_name: xinference-worker
+    restart: always
+    network_mode: host
+    environment:
+      - XINFERENCE_HOME=/data/models
+      - XINFERENCE_MODEL_SRC=modelscope
+    volumes:
+      - /home/njue/data:/data
+    tty: true
+    stdin_open: true
+    command: >
+      xinference-worker
+      -e http://192.168.1.88:9997
+      -H 192.168.1.77
+      --worker-port 9999
+      --log-level DEBUG
+      --metrics-exporter-host 192.168.1.77
+      --metrics-exporter-port 9998
