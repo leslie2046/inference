@@ -60,6 +60,12 @@ class TransformersEmbeddingSpecV1(BaseModel):
     model_revision: Optional[str]
     quantization: str
 
+    @validator("model_uri", pre=True)
+    def validate_model_uri(cls, v: Optional[str]) -> Optional[str]:
+        if v == "":
+            return None
+        return v
+
 
 class LlamaCppEmbeddingSpecV1(BaseModel):
     model_format: Literal["ggufv2"]
@@ -71,6 +77,12 @@ class LlamaCppEmbeddingSpecV1(BaseModel):
     model_file_name_template: str
     model_file_name_split_template: Optional[str]
     quantization_parts: Optional[Dict[str, List[str]]]
+
+    @validator("model_uri", pre=True)
+    def validate_model_uri(cls, v: Optional[str]) -> Optional[str]:
+        if v == "":
+            return None
+        return v
 
 
 EmbeddingSpecV1 = Annotated[

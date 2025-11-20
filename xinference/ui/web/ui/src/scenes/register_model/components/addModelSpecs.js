@@ -9,6 +9,10 @@ import {
   RadioGroup,
   TextField,
   Tooltip,
+  Select,
+  MenuItem,
+  InputLabel,
+  FormControl,
 } from '@mui/material'
 import React, { useEffect, useState } from 'react'
 import { useTranslation } from 'react-i18next'
@@ -84,6 +88,9 @@ const AddModelSpecs = ({
           model_format,
           quantization,
           model_file_name_template,
+          model_id: item.model_id || '',
+          model_hub: item.model_hub || 'huggingface',
+          model_source: item.model_id ? 'hub' : 'local',
         }
       })
       setCount(dataArr.length)
@@ -103,6 +110,9 @@ const AddModelSpecs = ({
         {
           id: count,
           ...formData,
+          model_id: '',
+          model_hub: 'huggingface',
+          model_source: 'local',
         },
       ])
       setCount(count + 1)
@@ -118,6 +128,9 @@ const AddModelSpecs = ({
         model_format: modelFormat,
         quantization,
         model_file_name_template,
+        model_id,
+        model_hub,
+        model_source,
       } = item
 
       let handleSize
@@ -143,11 +156,22 @@ const AddModelSpecs = ({
         model_format: modelFormat,
         quantization: handleQuantization,
         model_file_name_template,
+        model_id,
+        model_hub,
       }
     })
     setIsError(true)
     if (modelSizeAlertId.length === 0 && quantizationAlertId.length === 0) {
-      setIsError(false)
+      const hasEmptyField = specsArr.some((item) => {
+        if (item.model_source === 'local') {
+          return item.model_uri === ''
+        } else {
+          return item.model_id === ''
+        }
+      })
+      if (!hasEmptyField) {
+        setIsError(false)
+      }
     }
     onGetArr(arr, isError)
     isAdd && handleScrollBottom()
@@ -162,6 +186,9 @@ const AddModelSpecs = ({
       model_size_in_billions: 7,
       model_format: 'pytorch',
       quantization: '',
+      model_id: '',
+      model_hub: 'huggingface',
+      model_source: 'local',
     }
     setSpecsArr([...specsArr, item])
     setIsAdd(true)
@@ -340,21 +367,65 @@ const AddModelSpecs = ({
             </RadioGroup>
             <Box padding="15px"></Box>
 
-            <TextField
-              error={item.model_uri !== '' ? false : true}
-              style={{ minWidth: '60%' }}
-              label={t('registerModel.modelPath')}
-              size="small"
-              value={
-                item.model_format !== 'ggufv2'
-                  ? item.model_uri
-                  : item.model_uri + '/' + item.model_file_name_template
-              }
-              onChange={(e) => {
-                handleUpdateSpecsArr(index, 'model_uri', e.target.value)
-              }}
-              helperText={t('registerModel.provideModelDirectoryOrFilePath')}
-            />
+            <FormControl fullWidth size="small">
+              <InputLabel>{t('registerModel.modelSource')}</InputLabel>
+              <Select
+                value={item.model_source}
+                label={t('registerModel.modelSource')}
+                onChange={(e) =>
+                  handleUpdateSpecsArr(index, 'model_source', e.target.value)
+                }
+              >
+                <MenuItem value="local">{t('registerModel.localPath')}</MenuItem>
+                <MenuItem value="hub">{t('registerModel.modelHub')}</MenuItem>
+              </Select>
+            </FormControl>
+            <Box padding="15px"></Box>
+
+            {item.model_source === 'local' ? (
+              <TextField
+                error={item.model_uri !== '' ? false : true}
+                style={{ minWidth: '60%' }}
+                label={t('registerModel.modelPath')}
+                size="small"
+                value={
+                  item.model_format !== 'ggufv2'
+                    ? item.model_uri
+                    : item.model_uri + '/' + item.model_file_name_template
+                }
+                onChange={(e) => {
+                  handleUpdateSpecsArr(index, 'model_uri', e.target.value)
+                }}
+                helperText={t('registerModel.provideModelDirectoryOrFilePath')}
+              />
+            ) : (
+              <Box display="flex" gap={2}>
+                <TextField
+                  error={item.model_id !== '' ? false : true}
+                  style={{ flex: 1 }}
+                  label={t('registerModel.modelId')}
+                  size="small"
+                  value={item.model_id}
+                  onChange={(e) => {
+                    handleUpdateSpecsArr(index, 'model_id', e.target.value)
+                  }}
+                  helperText={t('registerModel.provideModelId')}
+                />
+                <FormControl style={{ minWidth: '120px' }} size="small">
+                  <InputLabel>{t('registerModel.modelHub')}</InputLabel>
+                  <Select
+                    value={item.model_hub}
+                    label={t('registerModel.modelHub')}
+                    onChange={(e) =>
+                      handleUpdateSpecsArr(index, 'model_hub', e.target.value)
+                    }
+                  >
+                    <MenuItem value="huggingface">Hugging Face</MenuItem>
+                    <MenuItem value="modelscope">ModelScope</MenuItem>
+                  </Select>
+                </FormControl>
+              </Box>
+            )}
             <Box padding="15px"></Box>
 
             {modelType === 'LLM' && (
@@ -383,9 +454,9 @@ const AddModelSpecs = ({
                   style={{ minWidth: '60%' }}
                   label={
                     item.model_format === 'gptq' ||
-                    item.model_format === 'awq' ||
-                    item.model_format === 'fp8' ||
-                    item.model_format === 'mlx'
+                      item.model_format === 'awq' ||
+                      item.model_format === 'fp8' ||
+                      item.model_format === 'mlx'
                       ? t('registerModel.quantization')
                       : t('registerModel.quantizationOptional')
                   }
@@ -401,12 +472,12 @@ const AddModelSpecs = ({
                   }}
                   helperText={
                     item.model_format === 'gptq' ||
-                    item.model_format === 'awq' ||
-                    item.model_format === 'fp8' ||
-                    item.model_format === 'mlx'
+                      item.model_format === 'awq' ||
+                      item.model_format === 'fp8' ||
+                      item.model_format === 'mlx'
                       ? t(
-                          'registerModel.carefulQuantizationForModelRegistration'
-                        )
+                        'registerModel.carefulQuantizationForModelRegistration'
+                      )
                       : ''
                   }
                 />
