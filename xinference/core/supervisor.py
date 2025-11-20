@@ -924,10 +924,10 @@ class SupervisorActor(xo.StatelessActor):
 
             # check if model already registered
             try:
-                model = await self.get_model_registration(
+                model_reg = await self.get_model_registration(
                     model_type, model_spec.model_name
                 )
-                if model is not None:
+                if model_reg is not None:
                     raise ValueError(
                         f"Model {model_spec.model_name} already registered"
                     )
@@ -939,6 +939,38 @@ class SupervisorActor(xo.StatelessActor):
             except Exception:
                 logger.error("Get model registration failed.", exc_info=True)
                 raise
+
+            # validate model
+            try:
+                model_spec.validate_model()
+            except ValueError as e:
+                raise e
+
+            # validate model version
+            if not model_spec.model_specs:
+                raise ValueError("Model specs cannot be empty.")
+            if (
+                len(model_spec.model_specs) > 1
+                and model_spec.model_family is not None
+                and model_spec.model_family != model_spec.model_name
+            ):
+                raise ValueError(
+                    "Model family cannot be set when there are multiple model specs."
+                )
+
+            if not model_spec.model_specs[0].model_uri:
+                if not model_spec.model_specs[0].model_id:
+                    raise ValueError("Either model_uri or model_id must be provided.")
+            else:
+                # check if model path exists
+                if not os.path.exists(model_spec.model_specs[0].model_uri):
+                    raise ValueError(
+                        f"Model path {model_spec.model_specs[0].model_uri} does not exist."
+                    )
+                if not os.path.isdir(model_spec.model_specs[0].model_uri):
+                    raise ValueError(
+                        f"Model path {model_spec.model_specs[0].model_uri} is not a directory."
+                    )
 
             target_ip_worker_ref = (
                 self._get_worker_ref_by_ip(worker_ip) if worker_ip is not None else None

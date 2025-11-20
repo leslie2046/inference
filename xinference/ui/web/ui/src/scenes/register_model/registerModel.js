@@ -175,6 +175,8 @@ const RegisterModelComponent = ({ modelType, customData }) => {
             model_format,
             quantizations,
             model_file_name_template,
+            model_id,
+            model_hub,
           } = item
           return {
             model_uri,
@@ -182,6 +184,8 @@ const RegisterModelComponent = ({ modelType, customData }) => {
             model_format,
             quantizations,
             model_file_name_template,
+            model_id,
+            model_hub,
           }
         })
         const llmData = {
@@ -360,8 +364,7 @@ const RegisterModelComponent = ({ modelType, customData }) => {
       if (!response.ok) {
         const errorData = await response.json() // Assuming the server returns error details in JSON format
         setErrorMsg(
-          `Server error: ${response.status} - ${
-            errorData.detail || 'Unknown error'
+          `Server error: ${response.status} - ${errorData.detail || 'Unknown error'
           }`
         )
       } else {
@@ -394,8 +397,7 @@ const RegisterModelComponent = ({ modelType, customData }) => {
       if (!response.ok) {
         const errorData = await response.json() // Assuming the server returns error details in JSON format
         setErrorMsg(
-          `Server error: ${response.status} - ${
-            errorData.detail || 'Unknown error'
+          `Server error: ${response.status} - ${errorData.detail || 'Unknown error'
           }`
         )
       } else {
@@ -418,7 +420,7 @@ const RegisterModelComponent = ({ modelType, customData }) => {
         getBuiltInPromptStyles().catch((error) => {
           setErrorMsg(
             error.message ||
-              'An unexpected error occurred when getting builtin prompt styles.'
+            'An unexpected error occurred when getting builtin prompt styles.'
           )
           console.error('Error: ', error)
         })
@@ -427,7 +429,7 @@ const RegisterModelComponent = ({ modelType, customData }) => {
         getBuiltinFamilies().catch((error) => {
           setErrorMsg(
             error.message ||
-              'An unexpected error occurred when getting builtin prompt styles.'
+            'An unexpected error occurred when getting builtin prompt styles.'
           )
           console.error('Error: ', error)
         })
@@ -609,8 +611,8 @@ const RegisterModelComponent = ({ modelType, customData }) => {
       const updatedAbilities =
         ability === 'chat'
           ? currentAbilities.filter(
-              (item) => !chatRelatedAbilities.includes(item)
-            )
+            (item) => !chatRelatedAbilities.includes(item)
+          )
           : currentAbilities.filter((item) => item !== ability)
 
       if (ability === 'tools') {
@@ -753,8 +755,7 @@ const RegisterModelComponent = ({ modelType, customData }) => {
   const handleEdit = () => {
     fetchWrapper
       .delete(
-        `/v1/model_registrations/${
-          registerModelType === 'llm' ? 'LLM' : registerModelType
+        `/v1/model_registrations/${registerModelType === 'llm' ? 'LLM' : registerModelType
         }/${model_name}`
       )
       .then(() => handleClick())
@@ -1120,8 +1121,8 @@ const RegisterModelComponent = ({ modelType, customData }) => {
                         ? '#d32f2f'
                         : 'inherit'
                       : formData.language.length === 0
-                      ? '#d32f2f'
-                      : 'inherit',
+                        ? '#d32f2f'
+                        : 'inherit',
                 }}
               >
                 {t('registerModel.modelLanguages')}
@@ -1439,8 +1440,8 @@ const RegisterModelComponent = ({ modelType, customData }) => {
                         {testErrorInfo !== ''
                           ? testErrorInfo
                           : testRes
-                          ? testRes
-                          : t('registerModel.noTestResults')}
+                            ? testRes
+                            : t('registerModel.noTestResults')}
                       </div>
                     </div>
                   </div>

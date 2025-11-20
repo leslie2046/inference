@@ -76,6 +76,12 @@ class LlamaCppLLMSpecV2(BaseModel):
                 return int(v)
         return v
 
+    @validator("model_uri", pre=True)
+    def validate_model_uri(cls, v: Optional[str]) -> Optional[str]:
+        if v == "":
+            return None
+        return v
+
 
 class PytorchLLMSpecV2(BaseModel):
     model_format: Literal["pytorch", "gptq", "awq", "fp8", "bnb"]
@@ -100,6 +106,12 @@ class PytorchLLMSpecV2(BaseModel):
                 return int(v)
         return v
 
+    @validator("model_uri", pre=True)
+    def validate_model_uri(cls, v: Optional[str]) -> Optional[str]:
+        if v == "":
+            return None
+        return v
+
 
 class MLXLLMSpecV2(BaseModel):
     model_format: Literal["mlx"]
@@ -122,6 +134,12 @@ class MLXLLMSpecV2(BaseModel):
                 return v
             else:
                 return int(v)
+        return v
+
+    @validator("model_uri", pre=True)
+    def validate_model_uri(cls, v: Optional[str]) -> Optional[str]:
+        if v == "":
+            return None
         return v
 
 

@@ -46,6 +46,12 @@ class RerankSpecV1(BaseModel):
     model_uri: Optional[str] = None
     quantization: str = "none"
 
+    @validator("model_uri", pre=True)
+    def validate_model_uri(cls, v: Optional[str]) -> Optional[str]:
+        if v == "":
+            return None
+        return v
+
 
 class RerankModelFamilyV2(BaseModel, ModelInstanceInfoMixin):
     version: Literal[2]
