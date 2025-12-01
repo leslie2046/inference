@@ -23,7 +23,14 @@ from typing import Annotated, Dict, List, Literal, Optional, Tuple, Union
 
 from xoscar import extensible
 
-from ..._compat import ROOT_KEY, BaseModel, ErrorWrapper, Field, ValidationError
+from ..._compat import (
+    ROOT_KEY,
+    BaseModel,
+    ErrorWrapper,
+    Field,
+    ValidationError,
+    validator,
+)
 from ...device_utils import empty_cache
 from ...types import Embedding
 from ...utils import make_hashable
