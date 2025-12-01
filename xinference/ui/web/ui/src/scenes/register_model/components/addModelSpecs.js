@@ -44,12 +44,33 @@ const modelFormatData = [
       { value: 'ggufv2', label: 'GGUF' },
     ],
   },
+  {
+    type: 'image',
+    options: [
+      { value: 'pytorch', label: 'PyTorch' },
+    ],
+  },
+  {
+    type: 'audio',
+    options: [
+      { value: 'pytorch', label: 'PyTorch' },
+    ],
+  },
+  {
+    type: 'flexible',
+    options: [
+      { value: 'pytorch', label: 'PyTorch' },
+    ],
+  },
 ]
 
 const modelUriDefault = {
   LLM: '/path/to/llama',
   embedding: '/path/to/embedding',
   rerank: '/path/to/rerank',
+  image: '/path/to/image',
+  audio: '/path/to/audio',
+  flexible: '/path/to/flexible',
 }
 
 const AddModelSpecs = ({

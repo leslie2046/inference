@@ -7,7 +7,6 @@
     "contactUs": "Contact Us",
     "documentation": "Documentation"
   },
-
   "model": {
     "languageModels": "Language Models",
     "embeddingModels": "Embedding Models",
@@ -18,7 +17,6 @@
     "customModels": "Custom Models",
     "flexibleModels": "Flexible Models"
   },
-
   "launchModel": {
     "modelAbility": "Model Ability",
     "generate": "Text Generation",
@@ -158,7 +156,6 @@
     "replica": "Replica",
     "close": "Close"
   },
-
   "runningModels": {
     "name": "Name",
     "address": "Address",
@@ -174,7 +171,6 @@
     "copyFailed": "Copy failed",
     "viewDetails": "View Details"
   },
-
   "registerModel": {
     "modelName": "Model Name",
     "modelDescription": "Model Description (Optional)",
@@ -221,6 +217,11 @@
     "packUp": "Pack up",
     "unfold": "Unfold",
     "copyAll": "Copy all",
+    "localPath": "Local Path",
+    "modelSource": "Model Source",
+    "modelHub": "Model Hub",
+    "modelId": "Model ID",
+    "provideModelId": "Provide the model ID from the model hub.",
     "alphanumericWithHyphensUnderscores": "Alphanumeric characters with properly placed hyphens and underscores. Must not match any built-in model names.",
     "chooseBuiltInOrCustomModel": "You can choose from the built-in models or input your own.",
     "chooseOnlyBuiltInModel": "You can only choose from the built-in models.",
@@ -234,7 +235,6 @@
     "stopControlStringForChatModels": "string type, used to control the stopping of chat models",
     "enterJsonFormattedDictionary": "Please enter the JSON-formatted dictionary."
   },
-
   "clusterInfo": {
     "supervisor": "Supervisor",
     "workers": "Workers",
@@ -262,7 +262,6 @@
     "gpuMemTotal": "GPU Mem Total",
     "worker": "Worker"
   },
-
   "components": {
     "suggestsCommonParameters": "Suggests common parameters; others allowed.",
     "warning": "Warning",
