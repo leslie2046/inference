@@ -1,21 +1,22 @@
+import React, { useEffect, useState } from 'react'
+import { useTranslation } from 'react-i18next'
+
 import AddIcon from '@mui/icons-material/Add'
 import DeleteIcon from '@mui/icons-material/Delete'
 import {
   Alert,
   Box,
   Button,
+  FormControl,
   FormControlLabel,
+  InputLabel,
+  MenuItem,
   Radio,
   RadioGroup,
+  Select,
   TextField,
   Tooltip,
-  Select,
-  MenuItem,
-  InputLabel,
-  FormControl,
 } from '@mui/material'
-import React, { useEffect, useState } from 'react'
-import { useTranslation } from 'react-i18next'
 
 const modelFormatData = [
   {
@@ -130,7 +131,6 @@ const AddModelSpecs = ({
         model_file_name_template,
         model_id,
         model_hub,
-        model_source,
       } = item
 
       let handleSize
