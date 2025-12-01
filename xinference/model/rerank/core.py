@@ -17,7 +17,7 @@ from abc import abstractmethod
 from collections import defaultdict
 from typing import Annotated, Dict, List, Literal, Optional, Tuple, Union
 
-from ..._compat import BaseModel, Field
+from ..._compat import BaseModel, Field, validator
 from ...types import Rerank
 from ..core import VirtualEnvSettings
 from ..utils import ModelInstanceInfoMixin
