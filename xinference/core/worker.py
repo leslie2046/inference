@@ -1147,6 +1147,13 @@ class WorkerActor(xo.StatelessActor):
             for f in get_user_defined_reranks():
                 if f.model_name == model_name:
                     return f
+        elif model_type == "flexible":
+            from ..model.flexible.custom import get_flexible_models
+
+            # Check user-defined flexible models (no built-in flexible models)
+            for f in get_flexible_models():
+                if f.model_name == model_name:
+                    return f
         return None
 
     @log_async(logger=logger)
