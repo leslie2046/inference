@@ -1,6 +1,3 @@
-import React, { useEffect, useState } from 'react'
-import { useTranslation } from 'react-i18next'
-
 import AddIcon from '@mui/icons-material/Add'
 import DeleteIcon from '@mui/icons-material/Delete'
 import {
@@ -17,6 +14,8 @@ import {
   TextField,
   Tooltip,
 } from '@mui/material'
+import React, { useEffect, useState } from 'react'
+import { useTranslation } from 'react-i18next'
 
 const modelFormatData = [
   {
@@ -44,33 +43,12 @@ const modelFormatData = [
       { value: 'ggufv2', label: 'GGUF' },
     ],
   },
-  {
-    type: 'image',
-    options: [
-      { value: 'pytorch', label: 'PyTorch' },
-    ],
-  },
-  {
-    type: 'audio',
-    options: [
-      { value: 'pytorch', label: 'PyTorch' },
-    ],
-  },
-  {
-    type: 'flexible',
-    options: [
-      { value: 'pytorch', label: 'PyTorch' },
-    ],
-  },
 ]
 
 const modelUriDefault = {
   LLM: '/path/to/llama',
   embedding: '/path/to/embedding',
   rerank: '/path/to/rerank',
-  image: '/path/to/image',
-  audio: '/path/to/audio',
-  flexible: '/path/to/flexible',
 }
 
 const AddModelSpecs = ({
@@ -397,7 +375,9 @@ const AddModelSpecs = ({
                   handleUpdateSpecsArr(index, 'model_source', e.target.value)
                 }
               >
-                <MenuItem value="local">{t('registerModel.localPath')}</MenuItem>
+                <MenuItem value="local">
+                  {t('registerModel.localPath')}
+                </MenuItem>
                 <MenuItem value="hub">{t('registerModel.modelHub')}</MenuItem>
               </Select>
             </FormControl>
@@ -475,9 +455,9 @@ const AddModelSpecs = ({
                   style={{ minWidth: '60%' }}
                   label={
                     item.model_format === 'gptq' ||
-                      item.model_format === 'awq' ||
-                      item.model_format === 'fp8' ||
-                      item.model_format === 'mlx'
+                    item.model_format === 'awq' ||
+                    item.model_format === 'fp8' ||
+                    item.model_format === 'mlx'
                       ? t('registerModel.quantization')
                       : t('registerModel.quantizationOptional')
                   }
@@ -493,12 +473,12 @@ const AddModelSpecs = ({
                   }}
                   helperText={
                     item.model_format === 'gptq' ||
-                      item.model_format === 'awq' ||
-                      item.model_format === 'fp8' ||
-                      item.model_format === 'mlx'
+                    item.model_format === 'awq' ||
+                    item.model_format === 'fp8' ||
+                    item.model_format === 'mlx'
                       ? t(
-                        'registerModel.carefulQuantizationForModelRegistration'
-                      )
+                          'registerModel.carefulQuantizationForModelRegistration'
+                        )
                       : ''
                   }
                 />
