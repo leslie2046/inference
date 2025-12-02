@@ -1230,6 +1230,8 @@ class RESTfulAPI(CancelMixin):
         enable_virtual_env = payload.get("enable_virtual_env", None)
         virtual_env_packages = payload.get("virtual_env_packages", None)
         envs = payload.get("envs", None)
+        model_id = payload.get("model_id", None)
+        model_source = payload.get("model_source", None)
 
         exclude_keys = {
             "model_uid",
@@ -1250,6 +1252,8 @@ class RESTfulAPI(CancelMixin):
             "enable_virtual_env",
             "virtual_env_packages",
             "envs",
+            "model_id",
+            "model_source",
         }
 
         kwargs = {
@@ -1302,6 +1306,8 @@ class RESTfulAPI(CancelMixin):
                 enable_virtual_env=enable_virtual_env,
                 virtual_env_packages=virtual_env_packages,
                 envs=envs,
+                model_id=model_id,
+                model_source=model_source,
                 **kwargs,
             )
         except ValueError as ve:

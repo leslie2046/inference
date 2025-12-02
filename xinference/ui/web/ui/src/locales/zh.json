@@ -93,6 +93,8 @@
     "GPUIdx.optional": "(可选) GPU 索引，指定模型所在的 GPU 索引",
     "GPUIdx": "GPU 索引，指定模型所在的 GPU 索引",
     "downloadHub.optional": "(可选) 下载中心",
+    "modelId.optional": "(可选) 模型ID，覆盖默认的模型ID",
+    "modelSource.optional": "(可选) 模型来源，覆盖默认的模型来源",
     "modelPath.optional": "(可选) 模型路径，对于 PyTorch，提供模型目录；对于 GGML/GGUF，提供模型文件路径。",
     "GGUFQuantization.optional": "(可选) GGUF量化格式，对Transformer部分进行量化。",
     "GGUFModelPath.optional": "(可选) GGUF模型路径，应为以 .gguf 结尾的文件。",

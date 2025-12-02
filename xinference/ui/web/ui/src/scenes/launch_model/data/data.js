@@ -14,6 +14,8 @@ export const llmAllDataKey = [
   'worker_ip',
   'gpu_idx',
   'download_hub',
+  'model_id',
+  'model_source',
   'model_path',
   'reasoning_content',
   'gguf_quantization',

@@ -634,6 +634,19 @@ export default function getModelFormConfig({
         visible: true,
       },
       {
+        name: 'model_id',
+        label: t('launchModel.modelId.optional'),
+        type: 'input',
+        visible: true,
+      },
+      {
+        name: 'model_source',
+        label: t('launchModel.modelSource.optional'),
+        type: 'select',
+        options: ['none', 'huggingface', 'modelscope', 'openmind_hub', 'csghub'],
+        visible: true,
+      },
+      {
         name: 'model_path',
         label: t('launchModel.modelPath.optional'),
         type: 'input',
@@ -796,6 +809,19 @@ export default function getModelFormConfig({
         label: t('launchModel.downloadHub.optional'),
         type: 'select',
         options: downloadHubOptions,
+        visible: true,
+      },
+      {
+        name: 'model_id',
+        label: t('launchModel.modelId.optional'),
+        type: 'input',
+        visible: true,
+      },
+      {
+        name: 'model_source',
+        label: t('launchModel.modelSource.optional'),
+        type: 'select',
+        options: ['none', 'huggingface', 'modelscope', 'openmind_hub', 'csghub'],
         visible: true,
       },
       {
@@ -1080,6 +1106,19 @@ export default function getModelFormConfig({
         name: 'worker_ip',
         label: t('launchModel.workerIp.optional'),
         type: 'input',
+        visible: true,
+      },
+      {
+        name: 'model_id',
+        label: t('launchModel.modelId.optional'),
+        type: 'input',
+        visible: true,
+      },
+      {
+        name: 'model_source',
+        label: t('launchModel.modelSource.optional'),
+        type: 'select',
+        options: ['none', 'huggingface', 'modelscope', 'openmind_hub', 'csghub'],
         visible: true,
       },
       {

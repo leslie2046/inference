@@ -134,9 +134,20 @@ def create_flexible_model_instance(
     model_uid: str,
     model_name: str,
     model_path: Optional[str] = None,
+    model_id: Optional[str] = None,
+    model_source: Optional[str] = None,
     **kwargs,
 ) -> FlexibleModel:
     model_spec = match_flexible_model(model_name)
+    if model_spec is None:
+        raise ValueError(f"Flexible model {model_name} not found")
+    
+    # Override model_id and model_hub if provided
+    if model_id is not None:
+        model_spec.model_id = model_id
+    if model_source is not None:
+        model_spec.model_hub = model_source
+    
     if not model_path:
         model_path = model_spec.model_uri
     launcher_name = model_spec.launcher

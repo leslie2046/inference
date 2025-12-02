@@ -93,6 +93,8 @@
     "GPUIdx.optional": "(Optional) GPU Idx, Specify the GPU index where the model is located",
     "GPUIdx": "GPU Idx, Specify the GPU index where the model is located",
     "downloadHub.optional": "(Optional) Download_hub",
+    "modelId.optional": "(Optional) Model ID, override the default model ID",
+    "modelSource.optional": "(Optional) Model source, override the default model source",
     "modelPath.optional": "(Optional) Model Path, For PyTorch, provide the model directory. For GGML/GGUF, provide the model file path.",
     "GGUFQuantization.optional": "(Optional) GGUF quantization format, quantizing the Transformer part.",
     "GGUFModelPath.optional": "(Optional) GGUF model path, should be a file ending with .gguf.",

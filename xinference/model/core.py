@@ -30,6 +30,8 @@ def create_model_instance(
         Literal["huggingface", "modelscope", "openmind_hub", "csghub"]
     ] = None,
     model_path: Optional[str] = None,
+    model_id: Optional[str] = None,
+    model_source: Optional[str] = None,
     **kwargs,
 ) -> Any:
     from .audio.core import create_audio_model_instance
@@ -74,6 +76,8 @@ def create_model_instance(
             peft_model_config,
             download_hub,
             model_path,
+            model_id=model_id,
+            model_source=model_source,
             **kwargs,
         )
     elif model_type == "rerank":
@@ -95,6 +99,8 @@ def create_model_instance(
             model_name,
             download_hub,
             model_path,
+            model_id=model_id,
+            model_source=model_source,
             **kwargs,
         )
     elif model_type == "video":
@@ -109,7 +115,7 @@ def create_model_instance(
     elif model_type == "flexible":
         kwargs.pop("trust_remote_code", None)
         return create_flexible_model_instance(
-            model_uid, model_name, model_path, **kwargs
+            model_uid, model_name, model_path, model_id=model_id, model_source=model_source, **kwargs
         )
     else:
         raise ValueError(f"Unsupported model type: {model_type}.")

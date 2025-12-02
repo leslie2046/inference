@@ -739,30 +739,49 @@ class SupervisorActor(xo.StatelessActor):
                 raise e
 
             # validate model version
-            if not model_spec.model_specs:
-                raise ValueError("Model specs cannot be empty.")
-            if (
-                len(model_spec.model_specs) > 1
-                and model_spec.model_family is not None
-                and model_spec.model_family != model_spec.model_name
-            ):
-                raise ValueError(
-                    "Model family cannot be set when there are multiple model specs."
-                )
+            # For models with model_specs (LLM, embedding, rerank)
+            if hasattr(model_spec, 'model_specs') and model_spec.model_specs is not None:
+                if not model_spec.model_specs:
+                    raise ValueError("Model specs cannot be empty.")
+                if (
+                    len(model_spec.model_specs) > 1
+                    and model_spec.model_family is not None
+                    and model_spec.model_family != model_spec.model_name
+                ):
+                    raise ValueError(
+                        "Model family cannot be set when there are multiple model specs."
+                    )
 
-            if not model_spec.model_specs[0].model_uri:
-                if not model_spec.model_specs[0].model_id:
-                    raise ValueError("Either model_uri or model_id must be provided.")
+                if not model_spec.model_specs[0].model_uri:
+                    if not model_spec.model_specs[0].model_id:
+                        raise ValueError("Either model_uri or model_id must be provided.")
+                else:
+                    # check if model path exists
+                    if not os.path.exists(model_spec.model_specs[0].model_uri):
+                        raise ValueError(
+                            f"Model path {model_spec.model_specs[0].model_uri} does not exist."
+                        )
+                    if not os.path.isdir(model_spec.model_specs[0].model_uri):
+                        raise ValueError(
+                            f"Model path {model_spec.model_specs[0].model_uri} is not a directory."
+                        )
+            # For models without model_specs (image, audio, flexible)
             else:
-                # check if model path exists
-                if not os.path.exists(model_spec.model_specs[0].model_uri):
-                    raise ValueError(
-                        f"Model path {model_spec.model_specs[0].model_uri} does not exist."
-                    )
-                if not os.path.isdir(model_spec.model_specs[0].model_uri):
-                    raise ValueError(
-                        f"Model path {model_spec.model_specs[0].model_uri} is not a directory."
-                    )
+                if not hasattr(model_spec, 'model_uri') or not hasattr(model_spec, 'model_id'):
+                    # Some models might not have these attributes, skip validation
+                    pass
+                elif not model_spec.model_uri and not model_spec.model_id:
+                    raise ValueError("Either model_uri or model_id must be provided.")
+                elif model_spec.model_uri:
+                    # check if model path exists
+                    if not os.path.exists(model_spec.model_uri):
+                        raise ValueError(
+                            f"Model path {model_spec.model_uri} does not exist."
+                        )
+                    if not os.path.isdir(model_spec.model_uri):
+                        raise ValueError(
+                            f"Model path {model_spec.model_uri} is not a directory."
+                        )
 
             target_ip_worker_ref = (
                 self._get_worker_ref_by_ip(worker_ip) if worker_ip is not None else None
@@ -955,6 +974,8 @@ class SupervisorActor(xo.StatelessActor):
         enable_virtual_env: Optional[bool] = None,
         virtual_env_packages: Optional[List[str]] = None,
         envs: Optional[Dict[str, str]] = None,
+        model_id: Optional[str] = None,
+        model_source: Optional[str] = None,
         **kwargs,
     ) -> str:
         if self.is_local_deployment() and n_worker > 1:  # type: ignore
@@ -986,6 +1007,8 @@ class SupervisorActor(xo.StatelessActor):
                 enable_virtual_env=enable_virtual_env,
                 virtual_env_packages=virtual_env_packages,
                 envs=envs,
+                model_id=model_id,
+                model_source=model_source,
                 **kwargs,
             )
 
@@ -1145,6 +1168,8 @@ class SupervisorActor(xo.StatelessActor):
                     enable_virtual_env=enable_virtual_env,
                     virtual_env_packages=virtual_env_packages,
                     envs=envs,
+                    model_id=model_id,
+                    model_source=model_source,
                     xavier_config=xavier_config,
                     **kwargs,
                 )
@@ -1354,6 +1379,8 @@ class SupervisorActor(xo.StatelessActor):
         enable_virtual_env: Optional[bool] = None,
         virtual_env_packages: Optional[List[str]] = None,
         envs: Optional[Dict[str, str]] = None,
+        model_id: Optional[str] = None,
+        model_source: Optional[str] = None,
         **kwargs,
     ):
         available_workers = []
@@ -1425,6 +1452,8 @@ class SupervisorActor(xo.StatelessActor):
                             enable_virtual_env=enable_virtual_env,
                             virtual_env_packages=virtual_env_packages,
                             envs=envs,
+                            model_id=model_id,
+                            model_source=model_source,
                             shard=i_worker,
                             n_worker=n_worker,
                             driver_info=driver_info,

@@ -140,6 +140,9 @@ const RegisterModelComponent = ({ modelType, customData }) => {
   const [isStopTokenIdsAlert, setIsStopTokenIdsAlert] = useState(false)
   const [familyOptions, setFamilyOptions] = useState([])
   const [isEditableFamily, setIsEditableFamily] = useState(true)
+  const [modelSource, setModelSource] = useState('local')
+  const [modelId, setModelId] = useState('')
+  const [modelHub, setModelHub] = useState('huggingface')
   const { t } = useTranslation()
 
   useEffect(() => {
@@ -275,7 +278,7 @@ const RegisterModelComponent = ({ modelType, customData }) => {
           setFormData(rerankData)
           setContrastObj(rerankData)
         } else if (modelType === 'image') {
-          const { version, model_name, model_uri, model_family, controlnet } =
+          const { version, model_name, model_uri, model_id, model_hub, model_family, controlnet } =
             data
           const virtualenv = data.virtualenv ?? { packages: [] }
           const controlnetArr = controlnet.map((item) => {
@@ -289,7 +292,9 @@ const RegisterModelComponent = ({ modelType, customData }) => {
           const imageData = {
             version,
             model_name,
-            model_uri,
+            model_uri: model_uri || '',
+            model_id: model_id || '',
+            model_hub: model_hub || 'huggingface',
             model_family,
             controlnet: controlnetArr,
             virtualenv,
@@ -297,11 +302,16 @@ const RegisterModelComponent = ({ modelType, customData }) => {
           setFormData(imageData)
           setContrastObj(imageData)
           setControlnetArr(controlnetArr)
+          setModelSource((model_id && model_id.trim() !== '') ? 'hub' : 'local')
+          setModelId(model_id || '')
+          setModelHub(model_hub || 'huggingface')
         } else if (modelType === 'audio') {
           const {
             version,
             model_name,
             model_uri,
+            model_id,
+            model_hub,
             multilingual,
             model_ability = [],
             model_family,
@@ -310,7 +320,9 @@ const RegisterModelComponent = ({ modelType, customData }) => {
           const audioData = {
             version,
             model_name,
-            model_uri,
+            model_uri: model_uri || '',
+            model_id: model_id || '',
+            model_hub: model_hub || 'huggingface',
             multilingual,
             model_ability,
             model_family,
@@ -318,11 +330,16 @@ const RegisterModelComponent = ({ modelType, customData }) => {
           }
           setFormData(audioData)
           setContrastObj(audioData)
+          setModelSource((model_id && model_id.trim() !== '') ? 'hub' : 'local')
+          setModelId(model_id || '')
+          setModelHub(model_hub || 'huggingface')
         } else if (modelType === 'flexible') {
           const {
             version,
             model_name,
             model_uri,
+            model_id,
+            model_hub,
             model_description,
             launcher,
             launcher_args,
@@ -331,7 +348,9 @@ const RegisterModelComponent = ({ modelType, customData }) => {
           const flexibleData = {
             version,
             model_name,
-            model_uri,
+            model_uri: model_uri || '',
+            model_id: model_id || '',
+            model_hub: model_hub || 'huggingface',
             model_description,
             launcher,
             launcher_args,
@@ -339,6 +358,9 @@ const RegisterModelComponent = ({ modelType, customData }) => {
           }
           setFormData(flexibleData)
           setContrastObj(flexibleData)
+          setModelSource((model_id && model_id.trim() !== '') ? 'hub' : 'local')
+          setModelId(model_id || '')
+          setModelHub(model_hub || 'huggingface')
         }
       }
     }
@@ -457,10 +479,25 @@ const RegisterModelComponent = ({ modelType, customData }) => {
   }
 
   const handleClick = async () => {
+    // Validate model_source for image, audio, and flexible models
+    if (modelType === 'image' || modelType === 'audio' || modelType === 'flexible') {
+      if (modelSource === 'local' && (!formData.model_uri || formData.model_uri.trim() === '')) {
+        setErrorMsg('Please fill in model path')
+        return
+      }
+      if (modelSource === 'hub' && (!modelId || modelId.trim() === '')) {
+        setErrorMsg('Please fill in model ID')
+        return
+      }
+    }
+
     for (let key in formData) {
       const type = Object.prototype.toString.call(formData[key]).slice(8, -1)
       if (
         key !== 'model_description' &&
+        key !== 'model_id' &&
+        key !== 'model_hub' &&
+        key !== 'model_uri' &&
         ((type === 'Array' &&
           key !== 'controlnet' &&
           key !== 'stop_token_ids' &&
@@ -484,10 +521,25 @@ const RegisterModelComponent = ({ modelType, customData }) => {
       return
     }
 
+    // Prepare final form data
+    let finalFormData = { ...formData }
+    if (modelType === 'image' || modelType === 'audio' || modelType === 'flexible') {
+      if (modelSource === 'local') {
+        // Remove model_id and model_hub when using local path
+        delete finalFormData.model_id
+        delete finalFormData.model_hub
+      } else {
+        // Remove model_uri when using hub
+        delete finalFormData.model_uri
+        finalFormData.model_id = modelId
+        finalFormData.model_hub = modelHub
+      }
+    }
+
     try {
       fetchWrapper
         .post(`/v1/model_registrations/${modelType}`, {
-          model: JSON.stringify(formData, customReplacer),
+          model: JSON.stringify(finalFormData, customReplacer),
           persist: true,
         })
         .then(() => {
@@ -1093,19 +1145,93 @@ const RegisterModelComponent = ({ modelType, customData }) => {
           )}
 
           {/* path */}
-          {customData.model_uri && (
+          {(customData.model_uri || 
+            (modelType === 'image' || modelType === 'audio' || modelType === 'flexible')) && (
             <>
-              <TextField
-                label={t('registerModel.modelPath')}
-                error={formData.model_uri ? false : true}
-                value={formData.model_uri}
-                size="small"
-                helperText={t('registerModel.provideModelDirectoryPath')}
-                onChange={(event) =>
-                  setFormData({ ...formData, model_uri: event.target.value })
-                }
-              />
-              <Box padding="15px"></Box>
+              {(modelType === 'image' || modelType === 'audio' || modelType === 'flexible') ? (
+                <>
+                  <FormControl fullWidth size="small">
+                    <InputLabel>{t('registerModel.modelSource')}</InputLabel>
+                    <Select
+                      value={modelSource}
+                      label={t('registerModel.modelSource')}
+                      onChange={(e) => {
+                        const newSource = e.target.value
+                        setModelSource(newSource)
+                        if (newSource === 'local') {
+                          setFormData({ ...formData, model_id: '', model_hub: '', model_uri: formData.model_uri || '' })
+                        } else {
+                          setFormData({ ...formData, model_uri: '', model_id: modelId, model_hub: modelHub })
+                        }
+                      }}
+                    >
+                      <MenuItem value="local">{t('registerModel.localPath')}</MenuItem>
+                      <MenuItem value="hub">{t('registerModel.modelHub')}</MenuItem>
+                    </Select>
+                  </FormControl>
+                  <Box padding="15px"></Box>
+                  {modelSource === 'local' ? (
+                    <TextField
+                      label={t('registerModel.modelPath')}
+                      error={formData.model_uri ? false : true}
+                      value={formData.model_uri || ''}
+                      size="small"
+                      helperText={t('registerModel.provideModelDirectoryPath')}
+                      onChange={(event) =>
+                        setFormData({ ...formData, model_uri: event.target.value, model_id: '', model_hub: '' })
+                      }
+                    />
+                  ) : (
+                    <Box display="flex" gap={2}>
+                      <TextField
+                        error={modelId !== '' ? false : true}
+                        style={{ flex: 1 }}
+                        label={t('registerModel.modelId')}
+                        size="small"
+                        value={modelId}
+                        onChange={(e) => {
+                          const newId = e.target.value
+                          setModelId(newId)
+                          setFormData({ ...formData, model_id: newId, model_uri: '' })
+                        }}
+                        helperText={t('registerModel.provideModelId')}
+                      />
+                      <FormControl style={{ minWidth: '120px' }} size="small">
+                        <InputLabel>{t('registerModel.modelHub')}</InputLabel>
+                        <Select
+                          value={modelHub}
+                          label={t('registerModel.modelHub')}
+                          onChange={(e) => {
+                            const newHub = e.target.value
+                            setModelHub(newHub)
+                            setFormData({ ...formData, model_hub: newHub, model_uri: '' })
+                          }}
+                        >
+                          <MenuItem value="huggingface">Hugging Face</MenuItem>
+                          <MenuItem value="modelscope">ModelScope</MenuItem>
+                          <MenuItem value="openmind_hub">OpenMind Hub</MenuItem>
+                          <MenuItem value="csghub">CSGHub</MenuItem>
+                        </Select>
+                      </FormControl>
+                    </Box>
+                  )}
+                  <Box padding="15px"></Box>
+                </>
+              ) : (
+                <>
+                  <TextField
+                    label={t('registerModel.modelPath')}
+                    error={formData.model_uri ? false : true}
+                    value={formData.model_uri}
+                    size="small"
+                    helperText={t('registerModel.provideModelDirectoryPath')}
+                    onChange={(event) =>
+                      setFormData({ ...formData, model_uri: event.target.value })
+                    }
+                  />
+                  <Box padding="15px"></Box>
+                </>
+              )}
             </>
           )}
 

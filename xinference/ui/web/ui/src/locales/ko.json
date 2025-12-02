@@ -93,6 +93,8 @@
     "GPUIdx.optional": "(선택) GPU 인덱스, 모델이 위치한 GPU 인덱스 지정",
     "GPUIdx": "GPU 인덱스, 모델이 위치한 GPU 인덱스 지정",
     "downloadHub.optional": "(선택) 다운로드 허브",
+    "modelId.optional": "(선택) 모델 ID, 기본 모델 ID 재정의",
+    "modelSource.optional": "(선택) 모델 소스, 기본 모델 소스 재정의",
     "modelPath.optional": "(선택) 모델 경로, PyTorch의 경우 모델 디렉토리, GGML/GGUF의 경우 모델 파일 경로 지정",
     "GGUFQuantization.optional": "(선택) GGUF 양자화 형식, Transformer 부분 양자화",
     "GGUFModelPath.optional": "(선택) GGUF 모델 경로, .gguf로 끝나는 파일 지정",

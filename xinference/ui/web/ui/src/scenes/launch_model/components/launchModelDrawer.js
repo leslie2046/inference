@@ -731,6 +731,9 @@ const LaunchModelDrawer = ({
     if (result.download_hub === 'none') {
       delete result.download_hub
     }
+    if (result.model_source === 'none') {
+      delete result.model_source
+    }
     if (result.gguf_quantization === 'none') {
       delete result.gguf_quantization
     }

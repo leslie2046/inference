@@ -205,6 +205,8 @@ def create_image_model_instance(
     gguf_model_path: Optional[str] = None,
     lightning_version: Optional[str] = None,
     lightning_model_path: Optional[str] = None,
+    model_id: Optional[str] = None,
+    model_source: Optional[str] = None,
     **kwargs,
 ) -> Union[
     DiffusionModel, MLXDiffusionModel, GotOCR2Model, DeepSeekOCRModel, HunyuanOCRModel
@@ -212,6 +214,12 @@ def create_image_model_instance(
     from .cache_manager import ImageCacheManager
 
     model_spec = match_diffusion(model_name, download_hub)
+    
+    # Override model_id and model_hub if provided
+    if model_id is not None:
+        model_spec.model_id = model_id
+    if model_source is not None:
+        model_spec.model_hub = model_source
     if model_spec.model_ability and "ocr" in model_spec.model_ability:
         return create_ocr_model_instance(
             model_uid=model_uid,

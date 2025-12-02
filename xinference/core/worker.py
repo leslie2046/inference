@@ -1309,6 +1309,8 @@ class WorkerActor(xo.StatelessActor):
         enable_virtual_env: Optional[bool] = None,
         virtual_env_packages: Optional[List[str]] = None,
         envs: Optional[Dict[str, str]] = None,
+        model_id: Optional[str] = None,
+        model_source: Optional[str] = None,
         **kwargs,
     ):
         # !!! Note that The following code must be placed at the very beginning of this function,
@@ -1451,6 +1453,8 @@ class WorkerActor(xo.StatelessActor):
                             peft_model_config,
                             download_hub,
                             model_path,
+                            model_id=model_id,
+                            model_source=model_source,
                             **model_kwargs,
                         )
                     model.model_family.address = subpool_address
