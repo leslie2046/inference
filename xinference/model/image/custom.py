@@ -28,6 +28,14 @@ class CustomImageModelFamilyV2(ImageModelFamilyV2):
     model_uri: Optional[str]
     controlnet: Optional[List["CustomImageModelFamilyV2"]]
 
+    def validate_model(self):
+        """Validate the image model configuration."""
+        # Check that at least model_id or model_uri is provided
+        if not self.model_id and not self.model_uri:
+            raise ValueError(
+                f"Either model_id or model_uri must be provided for model {self.model_name}"
+            )
+
 
 UD_IMAGES: List[CustomImageModelFamilyV2] = []
 

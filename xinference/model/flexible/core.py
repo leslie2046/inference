@@ -59,6 +59,22 @@ class FlexibleModelSpec(CacheableModelSpec, ModelInstanceInfoMixin):
             "launcher_args": self.launcher_args,
         }
 
+    def validate_model(self):
+        """Validate the flexible model configuration."""
+        # Check that launcher is provided
+        if not self.launcher:
+            raise ValueError(
+                f"You must specify `launcher` when registering flexible models."
+            )
+        # Check that launcher_args can be parsed if provided
+        if self.launcher_args:
+            try:
+                self.parser_args()
+            except Exception as e:
+                raise ValueError(
+                    f"Invalid launcher args {self.launcher_args}: {str(e)}"
+                )
+
 
 def generate_flexible_model_description(
     model_spec: FlexibleModelSpec,

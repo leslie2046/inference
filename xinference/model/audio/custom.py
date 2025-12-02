@@ -68,6 +68,19 @@ class CustomAudioModelFamilyV2(AudioModelFamilyV2):
         assert isinstance(audio_spec.model_family, str)
         return audio_spec
 
+    def validate_model(self):
+        """Validate the audio model configuration."""
+        # Check that model_family is provided
+        if not self.model_family:
+            raise ValueError(
+                f"You must specify `model_family` when registering custom Audio models."
+            )
+        # Check that at least model_id or model_uri is provided
+        if not self.model_id and not self.model_uri:
+            raise ValueError(
+                f"Either model_id or model_uri must be provided for model {self.model_name}"
+            )
+
 
 UD_AUDIOS: List[CustomAudioModelFamilyV2] = []
 
