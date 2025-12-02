@@ -166,9 +166,32 @@ def create_flexible_model_instance(
     
     if not model_path:
         model_path = model_spec.model_uri
+    
+    # If model_path is still None, try to download the model using CacheManager
+    if not model_path:
+        if model_spec.model_id:
+            logger.info(f"Model path not found, trying to download model {model_spec.model_name} from {model_spec.model_hub}...")
+            from ..cache_manager import CacheManager
+            cache_manager = CacheManager(model_spec)
+            model_path = cache_manager.cache()
+            if model_path:
+                logger.info(f"Model downloaded to {model_path}")
+                # Update model_uri in model_spec so that launcher can use it
+                model_spec.model_uri = model_path
+            else:
+                logger.error(f"Failed to download model {model_spec.model_name}")
+        else:
+            logger.warning(f"Model {model_spec.model_name} has no model_uri and no model_id, cannot download.")
+
     launcher_name = model_spec.launcher
     launcher_args = model_spec.parser_args()
     kwargs.update(launcher_args)
+
+    # Pass model_path explicitly if possible, but launcher usually reads from spec
+    # Some launchers might look at kwargs, so we update it just in case, 
+    # though modelscope_launcher reads from spec.
+    if model_path:
+        kwargs['model_path'] = model_path
 
     model = get_launcher(launcher_name)(
         model_uid=model_uid, model_spec=model_spec, **kwargs
