@@ -15,7 +15,7 @@ import logging
 import os
 from abc import abstractmethod
 from collections import defaultdict
-from typing import Annotated, Dict, List, Literal, Optional, Tuple, Union
+from typing import Annotated, Any, Dict, List, Literal, Optional, Tuple, Union
 
 from ..._compat import BaseModel, Field
 from ...types import Rerank
@@ -131,6 +131,7 @@ class RerankModel:
         self._model = None
         self._counter = 0
         self._kwargs = kwargs
+        self._empty_cache_task: Optional[Any] = None
         if model_family.type == "unknown":
             model_family.type = self._auto_detect_type(model_path)
 

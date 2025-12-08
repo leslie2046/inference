@@ -13,13 +13,14 @@
 # limitations under the License.
 
 import abc
+import asyncio
 import gc
 import inspect
 import logging
 import os
 from abc import abstractmethod
 from collections import defaultdict
-from typing import Annotated, Dict, List, Literal, Optional, Tuple, Union
+from typing import Annotated, Any, Dict, List, Literal, Optional, Tuple, Union
 
 from xoscar import extensible
 
@@ -160,6 +161,7 @@ class EmbeddingModel(abc.ABC):
         self._quantization = quantization
         self._model_name = self.model_family.model_name
         self._kwargs = kwargs
+        self._empty_cache_task: Optional[Any] = None
 
     @classmethod
     @abstractmethod
@@ -410,7 +412,14 @@ class EmbeddingModel(abc.ABC):
                 all_token_nums,
             )
             gc.collect()
-            empty_cache()
+            if self._empty_cache_task is None or self._empty_cache_task.done():
+                try:
+                    loop = asyncio.get_running_loop()
+                    self._empty_cache_task = loop.run_in_executor(None, empty_cache)
+                except RuntimeError:
+                    # In case there is no running loop (e.g. not running in async context),
+                    # run synchronously.
+                    empty_cache()
 
 
 def create_embedding_model_instance(

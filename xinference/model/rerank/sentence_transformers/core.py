@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import asyncio
 import gc
 import logging
 import threading
@@ -325,7 +326,14 @@ class SentenceTransformerRerankModel(RerankModel):
         if self._counter % RERANK_EMPTY_CACHE_COUNT == 0:
             logger.debug("Empty rerank cache.")
             gc.collect()
-            empty_cache()
+            if self._empty_cache_task is None or self._empty_cache_task.done():
+                try:
+                    loop = asyncio.get_running_loop()
+                    self._empty_cache_task = loop.run_in_executor(None, empty_cache)
+                except RuntimeError:
+                    # In case there is no running loop (e.g. not running in async context),
+                    # run synchronously.
+                    empty_cache()
 
         return Rerank(id=str(uuid.uuid1()), results=docs, meta=metadata)
 
