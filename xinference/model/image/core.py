@@ -25,6 +25,7 @@ from .ocr.deepseek_ocr import DeepSeekOCRModel
 from .ocr.got_ocr2 import GotOCR2Model
 from .ocr.hunyuan_ocr import HunyuanOCRModel
 from .ocr.paddleocr_vl import PaddleOCRVLModel
+from .ocr.paddleocr_vl_vllm import PaddleOCRVLVLLMModel
 from .stable_diffusion.core import DiffusionModel
 from .stable_diffusion.mlx import MLXDiffusionModel
 
@@ -162,12 +163,21 @@ def create_ocr_model_instance(
     model_spec: ImageModelFamilyV2,
     model_path: Optional[str] = None,
     **kwargs,
-) -> Union[DeepSeekOCRModel, GotOCR2Model, HunyuanOCRModel, PaddleOCRVLModel]:
+) -> Union[
+    DeepSeekOCRModel,
+    GotOCR2Model,
+    HunyuanOCRModel,
+    PaddleOCRVLModel,
+    PaddleOCRVLVLLMModel,
+]:
     from .cache_manager import ImageCacheManager
 
     if not model_path:
         cache_manager = ImageCacheManager(model_spec)
         model_path = cache_manager.cache()
+
+    # Get model engine from kwargs (default to transformers)
+    model_engine = kwargs.get("model_engine", "transformers").lower()
 
     # Choose OCR model based on model_name
     if model_spec.model_name == "DeepSeek-OCR":
@@ -185,12 +195,26 @@ def create_ocr_model_instance(
             **kwargs,
         )
     elif model_spec.model_name == "PaddleOCR-VL":
-        return PaddleOCRVLModel(
-            model_uid,
-            model_path,
-            model_spec=model_spec,
-            **kwargs,
-        )
+        from .ocr.ocr_family import OCR_ENGINES, check_engine_by_model_name_and_engine
+
+        if model_spec.model_name in OCR_ENGINES:
+            model_engine = model_engine or "Transformers"
+            ocr_class = check_engine_by_model_name_and_engine(
+                model_engine, model_spec.model_name
+            )
+            return ocr_class(
+                model_uid,
+                model_path,
+                model_spec=model_spec,
+                **kwargs,
+            )
+        else:
+            return PaddleOCRVLModel(
+                model_uid,
+                model_path,
+                model_spec=model_spec,
+                **kwargs,
+            )
     else:
         # Default to GOT-OCR2 for other OCR models
         return GotOCR2Model(
@@ -221,6 +245,7 @@ def create_image_model_instance(
     DeepSeekOCRModel,
     HunyuanOCRModel,
     PaddleOCRVLModel,
+    PaddleOCRVLVLLMModel,
 ]:
     from .cache_manager import ImageCacheManager
 

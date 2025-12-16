@@ -268,16 +268,15 @@ export default function getModelFormConfig({
       },
       {
         name: 'custom',
-        label: `${t('launchModel.additionalParametersForInferenceEngine')}${
-          formData.model_engine ? ': ' + formData.model_engine : ''
-        }`,
+        label: `${t('launchModel.additionalParametersForInferenceEngine')}${formData.model_engine ? ': ' + formData.model_engine : ''
+          }`,
         type: 'dynamicField',
         mode: 'key-value',
         keyPlaceholder: 'key',
         valuePlaceholder: 'value',
         keyOptions:
           additionalParameterTipList[
-            formData.model_engine?.toLocaleLowerCase()
+          formData.model_engine?.toLocaleLowerCase()
           ],
         visible: true,
       },
@@ -424,9 +423,8 @@ export default function getModelFormConfig({
       },
       {
         name: 'custom',
-        label: `${t('launchModel.additionalParametersForInferenceEngine')}${
-          formData.model_engine ? ': ' + formData.model_engine : ''
-        }`,
+        label: `${t('launchModel.additionalParametersForInferenceEngine')}${formData.model_engine ? ': ' + formData.model_engine : ''
+          }`,
         type: 'dynamicField',
         mode: 'key-value',
         keyPlaceholder: 'key',
@@ -584,6 +582,13 @@ export default function getModelFormConfig({
       },
     ],
     image: [
+      {
+        name: 'model_engine',
+        label: t('launchModel.modelEngine'),
+        type: 'select',
+        options: engineItems,
+        visible: engineItems.length > 0,
+      },
       {
         name: 'model_uid',
         label: t('launchModel.modelUID.optional'),

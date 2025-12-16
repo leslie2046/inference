@@ -684,8 +684,25 @@ def get_engine_params_by_name(
 
         return engine_params
 
+    elif model_type == "image":
+        from .image.core import BUILTIN_IMAGE_MODELS
+        from .image.ocr.ocr_family import OCR_ENGINES, OCR_SUPPORTED_ENGINES
+
+        if model_name not in OCR_ENGINES:
+            return None
+
+        available_engines = deepcopy(OCR_ENGINES[model_name])
+        for engine, params in available_engines.items():
+            _append_available_engine(engine, params, "ocr_class")
+
+        image_family_list = BUILTIN_IMAGE_MODELS.get(model_name, [])
+        image_family = image_family_list[0] if image_family_list else None
+        _collect_supported_engines(image_family, OCR_SUPPORTED_ENGINES, "image")
+
+        return engine_params
+
     raise ValueError(
-        f"Cannot support model_engine for {model_type}, only available for LLM, embedding, rerank"
+        f"Cannot support model_engine for {model_type}, only available for LLM, embedding, rerank, image"
     )
 
 

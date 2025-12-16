@@ -39,7 +39,7 @@ import Progress from './progress'
 import SelectField from './selectField'
 
 const enginesWithNWorker = ['SGLang', 'vLLM', 'MLX']
-const modelEngineType = ['LLM', 'embedding', 'rerank']
+const modelEngineType = ['LLM', 'embedding', 'rerank', 'image']
 
 const LaunchModelDrawer = ({
   modelData,
