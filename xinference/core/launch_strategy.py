@@ -50,13 +50,12 @@ class IdleFirstLaunchStrategy(LaunchStrategy):
     Ignores memory; falls back to least-loaded worker if no GPU allocation snapshot is available.
     """
 
-    def __init__(self, worker_status: Dict[str, "WorkerStatus"]):
-        self._worker_status = worker_status
+    def __init__(self):
         self._fallback_load: Dict[str, int] = {}
 
     def _select_least_loaded_gpu(
         self, worker_candidates: List[Dict], n_gpu: int
-    ) -> Optional[Tuple[xo.ActorRefType, List[int]]]:
+    ) -> Optional[Tuple[xo.ActorRefType, List[int], Tuple]]:
         best = None
         for candidate in worker_candidates:
             ref = candidate["ref"]
@@ -87,14 +86,16 @@ class IdleFirstLaunchStrategy(LaunchStrategy):
                 continue
             loads.sort(key=lambda x: (x[0], x[1]))
             selected = loads[:n_gpu]
-            score = tuple([sum(load for load, _ in selected), ref.address])
+            sum_load = sum(load for load, _ in selected)
+            # Use sum_gpu_load and total_count as primary scores, ref.address as tie-breaker for stability.
+            score = (sum_load, candidate.get("count", 0), ref.address)
             if best is None or score < best["score"]:
                 best = {
                     "ref": ref,
                     "gpu_idx": [dev for _, dev in selected],
                     "score": score,
                 }
-        return (best["ref"], best["gpu_idx"]) if best else None
+        return (best["ref"], best["gpu_idx"], best["score"]) if best else None
 
     def _reserve_slot(
         self, worker_candidates: List[Dict], ref: xo.ActorRefType, dev: int
@@ -114,13 +115,11 @@ class IdleFirstLaunchStrategy(LaunchStrategy):
     def select_worker(
         self, worker_candidates: List[Dict], n_gpu: Optional[int] = None
     ) -> Tuple[xo.ActorRefType, Optional[List[int]]]:
-        random.shuffle(worker_candidates)
-
         # Use allocation snapshot to pick the least-loaded GPU slot.
         requested_gpu = n_gpu if isinstance(n_gpu, int) and n_gpu > 0 else 1
         gpu_choice = self._select_least_loaded_gpu(worker_candidates, requested_gpu)
         if gpu_choice is not None:
-            ref, gpu_idx = gpu_choice
+            ref, gpu_idx, _ = gpu_choice
             # Update local snapshot to reflect the reservation.
             for dev in gpu_idx:
                 self._reserve_slot(worker_candidates, ref, dev)
@@ -130,8 +129,6 @@ class IdleFirstLaunchStrategy(LaunchStrategy):
         for candidate in worker_candidates:
             self._fallback_load.setdefault(candidate["ref"].address, 0)
         worker_candidates.sort(key=lambda x: (x["count"], x["ref"].address))
-        min_count = worker_candidates[0]["count"]
-        least_loaded = [c for c in worker_candidates if c["count"] == min_count]
-        chosen = random.choice(least_loaded)
+        chosen = worker_candidates[0]
         self._fallback_load[chosen["ref"].address] += 1
         return chosen["ref"], None

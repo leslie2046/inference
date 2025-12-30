@@ -1149,7 +1149,7 @@ class SupervisorActor(xo.StatelessActor):
                     strategy_name = (XINFERENCE_LAUNCH_STRATEGY or "").lower()
                     normalized = strategy_name.replace("-", "_")
                     if normalized in ("idlefirst", "idle_first_launch_strategy"):
-                        strategy = IdleFirstLaunchStrategy(self._worker_status)
+                        strategy = IdleFirstLaunchStrategy()
                     else:
                         logger.debug(
                             "Launch strategy %s not recognized, fallback to load-first",

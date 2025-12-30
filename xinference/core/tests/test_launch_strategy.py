@@ -40,7 +40,7 @@ def test_assign_replica_gpu_slicing():
 
 def test_idle_first_prefers_empty_gpu(monkeypatch):
     random.seed(42)
-    strategy = IdleFirstLaunchStrategy(worker_status={})
+    strategy = IdleFirstLaunchStrategy()
     worker = DummyRef("w1:1000")
     worker_candidates = [
         {
@@ -60,7 +60,7 @@ def test_idle_first_prefers_empty_gpu(monkeypatch):
 
 def test_idle_first_balances_with_reserve(monkeypatch):
     random.seed(0)
-    strategy = IdleFirstLaunchStrategy(worker_status={})
+    strategy = IdleFirstLaunchStrategy()
     worker = DummyRef("w1:1000")
     candidates = [
         {
@@ -82,7 +82,7 @@ def test_idle_first_balances_with_reserve(monkeypatch):
 
 def test_idle_first_fallback_to_count_when_no_alloc():
     random.seed(0)
-    strategy = IdleFirstLaunchStrategy(worker_status={})
+    strategy = IdleFirstLaunchStrategy()
     w1 = DummyRef("w1:1000")
     w2 = DummyRef("w2:1000")
     candidates = [
@@ -96,7 +96,7 @@ def test_idle_first_fallback_to_count_when_no_alloc():
 
 def test_multi_worker_multi_gpu_even_distribution():
     random.seed(123)
-    strategy = IdleFirstLaunchStrategy(worker_status={})
+    strategy = IdleFirstLaunchStrategy()
     w1 = DummyRef("w1:1000")
     w2 = DummyRef("w2:1000")
     candidates = [
@@ -138,7 +138,7 @@ def test_multi_worker_multi_gpu_even_distribution():
 
 def test_cpu_fallback_no_gpu_alloc():
     random.seed(0)
-    strategy = IdleFirstLaunchStrategy(worker_status={})
+    strategy = IdleFirstLaunchStrategy()
     w1 = DummyRef("w1:1000")
     w2 = DummyRef("w2:1000")
     # Simulate no GPU allocation info (e.g., CPU-only workers)
@@ -153,7 +153,7 @@ def test_cpu_fallback_no_gpu_alloc():
 
 def test_idle_first_multi_gpu_single_worker():
     random.seed(0)
-    strategy = IdleFirstLaunchStrategy(worker_status={})
+    strategy = IdleFirstLaunchStrategy()
     worker = DummyRef("w1:1000")
     candidates = [
         {
@@ -173,7 +173,7 @@ def test_idle_first_multi_gpu_single_worker():
 
 def test_idle_first_multi_gpu_two_workers():
     random.seed(0)
-    strategy = IdleFirstLaunchStrategy(worker_status={})
+    strategy = IdleFirstLaunchStrategy()
     w1 = DummyRef("w1:1000")
     w2 = DummyRef("w2:1000")
     candidates = [
