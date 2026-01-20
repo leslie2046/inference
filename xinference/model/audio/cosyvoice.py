@@ -40,6 +40,7 @@ class CosyVoiceModel:
         self._model = None
         self._kwargs = kwargs
         self._is_cosyvoice2 = False
+        self._is_cosyvoice3 = False
 
     @property
     def model_ability(self):
@@ -56,22 +57,36 @@ class CosyVoiceModel:
         sys.path.insert(0, thirdparty_dir)
 
         kwargs = {}
-        if "CosyVoice2" in self._model_spec.model_name:
+        if (
+            "CosyVoice3" in self._model_spec.model_name
+            or "Fun-CosyVoice3" in self._model_spec.model_name
+        ):
+            from cosyvoice.cli.cosyvoice import AutoModel as CosyVoice
+
+            self._is_cosyvoice3 = True
+            self._is_cosyvoice2 = True  # CosyVoice3 uses same API as CosyVoice2
+        elif "CosyVoice2" in self._model_spec.model_name:
             from cosyvoice.cli.cosyvoice import CosyVoice2 as CosyVoice
 
             self._is_cosyvoice2 = True
+            self._is_cosyvoice3 = False
         else:
             from cosyvoice.cli.cosyvoice import CosyVoice
 
             self._is_cosyvoice2 = False
+            self._is_cosyvoice3 = False
 
         # Unify this configuration name as 'compile' to be compatible with the name 'load_jit'.
         load_jit = self._kwargs.get("load_jit", False) or self._kwargs.get(
             "compile", False
         )
-        logger.info("Loading CosyVoice model, compile=%s...", load_jit)
+        logger.info(
+            "Loading CosyVoice model, compile=%s, is_cosyvoice3=%s...",
+            load_jit,
+            self._is_cosyvoice3,
+        )
         self._model = CosyVoice(self._model_path, load_jit=load_jit, **kwargs)
-        if self._is_cosyvoice2:
+        if self._is_cosyvoice2 and not self._is_cosyvoice3:
             spk2info_file = os.path.join(thirdparty_dir, "cosyvoice/bin/spk2info.pt")
             self._model.frontend.spk2info = torch.load(
                 spk2info_file, map_location=self._device
@@ -184,8 +199,8 @@ class CosyVoiceModel:
             assert (
                 prompt_text is None
             ), "CosyVoice Instruct model does not support prompt_text"
-        elif self._is_cosyvoice2:
-            pass
+        elif self._is_cosyvoice2 or self._is_cosyvoice3:
+            pass  # CosyVoice2 and CosyVoice3 support all modes
         else:
             # inference_zero_shot
             # inference_cross_lingual
