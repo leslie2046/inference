@@ -1791,7 +1791,18 @@ class SupervisorActor(xo.StatelessActor):
         running_model_info = {parse_replica_model_uid(k)[0]: v for k, v in ret.items()}
         # add replica count
         for k, v in running_model_info.items():
-            v["replica"] = self._model_uid_to_replica_info[k].replica
+            replica_info = self._model_uid_to_replica_info.get(k)
+            if replica_info is not None:
+                v["replica"] = replica_info.replica
+            else:
+                # Worker has model info but supervisor doesn't have replica info,
+                # this could happen due to state inconsistency (e.g., after restart).
+                # Use default replica count of 1.
+                logger.warning(
+                    f"Model {k} found in worker but not in supervisor's replica info, "
+                    "using default replica count of 1"
+                )
+                v["replica"] = 1
         return running_model_info
 
     def is_local_deployment(self) -> bool:
