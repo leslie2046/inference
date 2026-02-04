@@ -404,6 +404,60 @@
   },
   {
     "version": 2,
+    "model_name": "Qwen3-ASR-1.7B",
+    "model_family": "qwen3_asr",
+    "model_ability": [
+      "audio2text"
+    ],
+    "multilingual": true,
+    "default_model_config": {
+      "forced_aligner": "Qwen/Qwen3-ForcedAligner-0.6B"
+    },
+    "virtualenv": {
+      "packages": [
+        "qwen-asr",
+        "#system_torch#",
+        "#system_numpy#"
+      ]
+    },
+    "model_src": {
+      "huggingface": {
+        "model_id": "Qwen/Qwen3-ASR-1.7B",
+        "model_revision": "main"
+      }
+    },
+    "updated_at": 1770134400,
+    "featured": false
+  },
+  {
+    "version": 2,
+    "model_name": "Qwen3-ASR-0.6B",
+    "model_family": "qwen3_asr",
+    "model_ability": [
+      "audio2text"
+    ],
+    "multilingual": true,
+    "default_model_config": {
+      "forced_aligner": "Qwen/Qwen3-ForcedAligner-0.6B"
+    },
+    "virtualenv": {
+      "packages": [
+        "qwen-asr",
+        "#system_torch#",
+        "#system_numpy#"
+      ]
+    },
+    "model_src": {
+      "huggingface": {
+        "model_id": "Qwen/Qwen3-ASR-0.6B",
+        "model_revision": "main"
+      }
+    },
+    "updated_at": 1770134400,
+    "featured": false
+  },
+  {
+    "version": 2,
     "model_name": "SenseVoiceSmall",
     "model_family": "funasr",
     "model_ability": [
