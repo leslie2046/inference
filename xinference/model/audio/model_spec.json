@@ -424,6 +424,10 @@
       "huggingface": {
         "model_id": "Qwen/Qwen3-ASR-1.7B",
         "model_revision": "main"
+      },
+      "modelscope": {
+        "model_id": "Qwen/Qwen3-ASR-1.7B",
+        "model_revision": "master"
       }
     },
     "updated_at": 1770134400,
@@ -451,6 +455,10 @@
       "huggingface": {
         "model_id": "Qwen/Qwen3-ASR-0.6B",
         "model_revision": "main"
+      },
+      "modelscope": {
+        "model_id": "Qwen/Qwen3-ASR-0.6B",
+        "model_revision": "master"
       }
     },
     "updated_at": 1770134400,
