@@ -1914,7 +1914,7 @@ class WorkerActor(xo.StatelessActor):
         status = dict()
         try:
             # asyncio.timeout is only available in Python >= 3.11
-            async with timeout(2):
+            async with timeout(30):
                 status = await asyncio.to_thread(gather_node_info)
         except asyncio.CancelledError:
             raise
