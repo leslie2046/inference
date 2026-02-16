@@ -1,0 +1,71 @@
+FROM continuumio/miniconda3:23.10.0-1
+
+# =========================================================
+# 1. 环境设置 & 系统依赖 (变更频率：极低)
+# =========================================================
+ARG NODE_VERSION=22.17.0
+ENV NVM_DIR=/usr/local/nvm \
+    NODE_VERSION=${NODE_VERSION} \
+    PATH=/usr/local/nvm/versions/node/${NODE_VERSION}/bin:$PATH \
+    PIP_INDEX=https://pypi.tuna.tsinghua.edu.cn/simple
+
+# 安装系统工具 + 构建工具 + FFmpeg (Conda方式)
+# 将 FFmpeg 的安装移到这里，因为它跟你的 Python 代码无关，不需要每次都重装
+RUN apt-get -y update \
+  && apt install -y --no-install-recommends build-essential curl procps git libgl1 \
+  && apt-get -yq clean \
+  && rm -rf /var/lib/apt/lists/* \
+  # 安装 FFmpeg 环境
+  && /opt/conda/bin/conda create -n ffmpeg-env -c conda-forge 'ffmpeg<7' -y \
+  && ln -s /opt/conda/envs/ffmpeg-env/bin/ffmpeg /usr/local/bin/ffmpeg \
+  && ln -s /opt/conda/envs/ffmpeg-env/bin/ffprobe /usr/local/bin/ffprobe \
+  && /opt/conda/bin/conda clean --all -y
+
+# =========================================================
+# 2. Node.js 环境 (变更频率：低)
+# =========================================================
+# 安装 NVM 和 Node
+RUN mkdir -p $NVM_DIR \
+  && curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash \
+  && . $NVM_DIR/nvm.sh \
+  && nvm install $NODE_VERSION \
+  && nvm alias default $NODE_VERSION \
+  && nvm use default
+
+# =========================================================
+# 3. Python 基础与重型依赖 (变更频率：低)
+# =========================================================
+# 先升级 pip 并安装 PyTorch (这是最耗时的步骤，且很少变动，单独一层)
+RUN python -m pip install --no-cache-dir --upgrade -i "$PIP_INDEX" pip setuptools wheel "packaging>=24.2" && \
+    pip install --no-cache-dir torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+
+# =========================================================
+# 4. Python 第三方依赖 (变更频率：中)
+# =========================================================
+# 关键优化点：只拷贝 requirements 目录，而不是整个代码库
+# 这样只要 requirements 文件没变，这一层就会直接使用缓存
+COPY xinference/deploy/docker/requirements_cpu /tmp/requirements_cpu
+
+RUN pip install --no-cache-dir -i "$PIP_INDEX" --upgrade-strategy only-if-needed -r /tmp/requirements_cpu/requirements_cpu-base.txt && \
+    pip install --no-cache-dir -i "$PIP_INDEX" --no-build-isolation gptqmodel && \
+    pip install --no-cache-dir -i "$PIP_INDEX" --upgrade-strategy only-if-needed -r /tmp/requirements_cpu/requirements_cpu-ml.txt && \
+    pip install --no-cache-dir -i "$PIP_INDEX" --upgrade-strategy only-if-needed -r /tmp/requirements_cpu/requirements_cpu-models.txt && \
+    pip install --no-cache-dir -i "$PIP_INDEX" "xllamacpp>=0.2.0"
+
+# =========================================================
+# 5. 项目源码与构建 (变更频率：高)
+# =========================================================
+# 最后才拷贝代码，确保修改代码不会导致上面所有步骤重跑
+WORKDIR /opt/inference
+COPY . /opt/inference
+
+# 构建前端并安装本项目
+RUN python setup.py build_web && \
+    # 如果 build_web 修改了 git 追踪的文件，这里 restore 是对的，但如果是在 Docker 里其实不 restore 也没关系，除非 pip install 依赖干净的树
+    git restore . && \
+    pip install --no-cache-dir -i "$PIP_INDEX" --no-deps "." && \
+    # 最后清理缓存
+    pip cache purge
+
+ENTRYPOINT []
+CMD ["/bin/bash"]
