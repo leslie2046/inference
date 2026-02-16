@@ -16,8 +16,11 @@ import logging
 import tempfile
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
-from ...device_utils import get_available_device, get_device_preferred_dtype
-from ...device_utils import is_device_available
+from ...device_utils import (
+    get_available_device,
+    get_device_preferred_dtype,
+    is_device_available,
+)
 
 if TYPE_CHECKING:
     from .core import AudioModelFamilyV2
@@ -120,11 +123,7 @@ class Qwen3ASRModel:
                 "Prompt for Qwen3-ASR transcriptions will be ignored: %s", prompt
             )
 
-        kw = (
-            self._model_spec.default_transcription_config.copy()
-            if getattr(self._model_spec, "default_transcription_config", None)
-            else {}
-        )
+        kw = dict(getattr(self._model_spec, "default_transcription_config", None) or {})
         kw.update(kwargs)
 
         with tempfile.NamedTemporaryFile(buffering=0) as f:

@@ -1069,22 +1069,38 @@ class VLLMModel(LLM):
         )
 
     async def _get_tokenizer(self, lora_request: Any) -> Any:
+        import inspect
+
         try:
             # vLLM 0.11.0+ get_tokenizer doesn't accept lora_request parameter
             if (
                 VLLM_VERSION >= version.parse("0.11.0")
                 or VLLM_VERSION.base_version >= "0.11.0"
             ):
-                return await self._engine.get_tokenizer()  # type: ignore
+                result = self._engine.get_tokenizer()  # type: ignore
+                # In vLLM v1 (>= 0.15.0), get_tokenizer may return tokenizer directly
+                # instead of a coroutine. Check if we need to await.
+                if inspect.iscoroutine(result):
+                    return await result
+                return result
             else:
-                return await self._engine.get_tokenizer(lora_request)  # type: ignore
+                result = self._engine.get_tokenizer(lora_request)  # type: ignore
+                if inspect.iscoroutine(result):
+                    return await result
+                return result
         except AttributeError:
             # Fallback to get_tokenizer_async for older versions
             try:
-                return await self._engine.get_tokenizer_async(lora_request)  # type: ignore
+                result = self._engine.get_tokenizer_async(lora_request)  # type: ignore
+                if inspect.iscoroutine(result):
+                    return await result
+                return result
             except (AttributeError, TypeError):
                 # If all else fails, try without parameters
-                return await self._engine.get_tokenizer()  # type: ignore
+                result = self._engine.get_tokenizer()  # type: ignore
+                if inspect.iscoroutine(result):
+                    return await result
+                return result
 
     def _tokenize(self, tokenizer: Any, prompt: str, config: dict) -> List[int]:
         truncate_prompt_tokens = config.get("truncate_prompt_tokens")
@@ -1844,6 +1860,53 @@ class VLLMMultiModel(VLLMModel, ChatModelMixin):
             prompt_token_ids=token_ids, multi_modal_data=multi_modal_data
         )
 
+    def _handle_base64_images(self, messages, temp_files):
+        import base64
+        import re
+        import tempfile
+
+        # Regex to match data URI scheme
+        data_uri_pattern = re.compile(
+            r"data:([a-zA-Z0-9]+/[a-zA-Z0-9-.+]+);base64,(.*)"
+        )
+
+        for msg in messages:
+            if isinstance(msg, dict) and isinstance(msg.get("content"), list):
+                for content in msg["content"]:
+                    if isinstance(content, dict):
+                        # check image_url
+                        if "image_url" in content and isinstance(
+                            content["image_url"], dict
+                        ):
+                            url = content["image_url"].get("url", "")
+                            if isinstance(url, str) and url.startswith("data:"):
+                                match = data_uri_pattern.match(url)
+                                if match:
+                                    mime_type, b64_data = match.groups()
+                                    try:
+                                        # Create temp file
+                                        suffix = ".bin"
+                                        if "pdf" in mime_type:
+                                            suffix = ".pdf"
+                                        elif "png" in mime_type:
+                                            suffix = ".png"
+                                        elif "jpeg" in mime_type or "jpg" in mime_type:
+                                            suffix = ".jpg"
+
+                                        with tempfile.NamedTemporaryFile(
+                                            delete=False, suffix=suffix
+                                        ) as tmp:
+                                            tmp.write(base64.b64decode(b64_data))
+                                            content["image_url"]["url"] = tmp.name
+                                            temp_files.append(tmp.name)
+                                            logger.debug(
+                                                f"Decoded base64 content to temp file: {tmp.name}"
+                                            )
+                                    except Exception as e:
+                                        logger.error(
+                                            f"Failed to decode base64 file: {e}"
+                                        )
+
     @vllm_check
     async def async_chat(
         self,
@@ -1861,6 +1924,14 @@ class VLLMMultiModel(VLLMModel, ChatModelMixin):
                 process_mm_info,
                 process_vision_info,
             )
+
+            # Pre-process messages to handle base64 data URIs BEFORE transform
+            temp_files: List[str] = []
+            if (
+                "vision" in self.model_family.model_ability
+                or "omni" in self.model_family.model_ability
+            ):
+                self._handle_base64_images(messages, temp_files)
 
             messages = self._transform_messages(messages)
 
