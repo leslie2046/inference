@@ -30,7 +30,7 @@ ENV LD_LIBRARY_PATH $LD_LIBRARY_PATH:/usr/local/lib/python3.10/dist-packages/nvi
 ENV FLASH_ATTENTION_SKIP_CUDA_BUILD TRUE
 
 ARG PIP_INDEX=https://pypi.org/simple
-RUN pip install --upgrade -i "$PIP_INDEX" pip setuptools wheel&& \
+RUN pip install --upgrade -i "$PIP_INDEX" pip setuptools wheel && \
     pip install -i "$PIP_INDEX" "diskcache>=5.6.1" "jinja2>=2.11.3" && \
     pip install -i "$PIP_INDEX" --upgrade-strategy only-if-needed -r /opt/inference/xinference/deploy/docker/requirements_12.4/requirements-base.txt && \
     pip install -i "$PIP_INDEX" --upgrade-strategy only-if-needed -r /opt/inference/xinference/deploy/docker/requirements_12.4/requirements-ml.txt && \
@@ -40,10 +40,8 @@ RUN pip install --upgrade -i "$PIP_INDEX" pip setuptools wheel&& \
     pip install WeTextProcessing==1.0.4.1 --no-deps && \
     pip install -i "$PIP_INDEX" wetext && \
     pip install importlib_resources && \
-    pip install -i "$PIP_INDEX" sgl-kernel==0.1.8 && \
-    pip install torch==2.7.1 && \
-    pip uninstall flashinfer -y && \
-    pip install flashinfer-python==0.2.9rc2 && \
+    pip uninstall flashinfer flashinfer-python -y && \
+    pip install flashinfer-python --index-url https://flashinfer.ai/whl/flashinfer-python/ && \
     pip install https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.3.18/flash_attn-2.7.4+cu124torch2.7-cp310-cp310-linux_x86_64.whl && \
     cd /opt/inference && \
     python3 setup.py build_web && \
@@ -51,7 +49,6 @@ RUN pip install --upgrade -i "$PIP_INDEX" pip setuptools wheel&& \
     pip install -i "$PIP_INDEX" --no-deps "." && \
     pip uninstall xllamacpp -y && \
     pip install "xllamacpp>=0.2.0" --index-url https://xorbitsai.github.io/xllamacpp/whl/cu124 && \
-    # clean packages
     pip cache purge
 
 # Install Miniforge3 (only for FFmpeg, do not replace system Python)
