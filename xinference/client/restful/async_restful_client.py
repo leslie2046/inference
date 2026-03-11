@@ -369,7 +369,7 @@ class AsyncRESTfulImageModelHandle(AsyncRESTfulModelHandle):
 
     async def image_edit(
         self,
-        image: Union[Union[str, bytes], List[Union[str, bytes]]],
+        images: Union[Union[str, bytes], List[Union[str, bytes]]],
         prompt: str,
         mask: Optional[Union[str, bytes]] = None,
         n: int = 1,
@@ -382,7 +382,7 @@ class AsyncRESTfulImageModelHandle(AsyncRESTfulModelHandle):
 
         Parameters
         ----------
-        image: `Union[Union[str, bytes], List[Union[str, bytes]]]`
+        images: `Union[Union[str, bytes], List[Union[str, bytes]]]`
             The input image(s) to edit. Can be:
             - Single image: file path, URL, or binary image data
             - Multiple images: list of file paths, URLs, or binary image data
@@ -416,13 +416,13 @@ class AsyncRESTfulImageModelHandle(AsyncRESTfulModelHandle):
         --------
         # Single image editing
         result = await model.image_edit(
-            image="path/to/image.png",
+            images="path/to/image.png",
             prompt="make this image look like a painting"
         )
 
         # Multiple image editing with reference images
         result = await model.image_edit(
-            image=["primary_image.png", "reference1.jpg", "reference2.png"],
+            images=["primary_image.png", "reference1.jpg", "reference2.png"],
             prompt="edit the main image using the style from reference images"
         )
         """
@@ -451,18 +451,18 @@ class AsyncRESTfulImageModelHandle(AsyncRESTfulModelHandle):
                 data.add_field(key, str(value))
 
         # Handle single image or multiple images
-        if isinstance(image, list):
+        if isinstance(images, list):
             # Validate image list is not empty
-            if len(image) == 0:
+            if len(images) == 0:
                 raise ValueError("Image list cannot be empty")
-            # Multiple images - send as image[] array
-            for i, img in enumerate(image):
+            # Multiple images - send as images[] array
+            for i, img in enumerate(images):
                 if isinstance(img, str):
                     # File path - read file content
                     with open(img, "rb") as f:
                         content = f.read()
                     data.add_field(
-                        f"image[]",
+                        f"images[]",
                         content,
                         filename=f"image_{i}.png",
                         content_type="image/png",
@@ -470,24 +470,24 @@ class AsyncRESTfulImageModelHandle(AsyncRESTfulModelHandle):
                 else:
                     # Binary data
                     data.add_field(
-                        f"image[]",
+                        f"images[]",
                         img,
                         filename=f"image_{i}.png",
                         content_type="image/png",
                     )
         else:
             # Single image
-            if isinstance(image, str):
+            if isinstance(images, str):
                 # File path - read file content
-                with open(image, "rb") as f:
+                with open(images, "rb") as f:
                     content = f.read()
                 data.add_field(
-                    "image", content, filename="image.png", content_type="image/png"
+                    "images", content, filename="image.png", content_type="image/png"
                 )
             else:
                 # Binary data
                 data.add_field(
-                    "image", image, filename="image.png", content_type="image/png"
+                    "images", images, filename="image.png", content_type="image/png"
                 )
 
         if mask is not None:
@@ -537,9 +537,9 @@ class AsyncRESTfulImageModelHandle(AsyncRESTfulModelHandle):
         image: `Union[str, bytes]`
             an image batch to be inpainted (which parts of the image to
             be masked out with `mask_image` and repainted according to `prompt`). For both numpy array and pytorch
-            tensor, the expected value range is between `[0, 1]` If it's a tensor or a list or tensors, the
+            tensor, the expected value range is between `[0, 1]`. If it's a tensor or a list or tensors, the
             expected shape should be `(B, C, H, W)` or `(C, H, W)`. If it is a numpy array or a list of arrays, the
-            expected shape should be `(B, H, W, C)` or `(H, W, C)` It can also accept image latents as `image`, but
+            expected shape should be `(B, H, W, C)` or `(H, W, C)`. It can also accept image latents as `image`, but
             if passing latents directly it is not encoded again.
         mask_image: `Union[str, bytes]`
             representing an image batch to mask `image`. White pixels in the mask

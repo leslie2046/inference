@@ -1491,7 +1491,7 @@ class SupervisorActor(xo.StatelessActor):
                     # wait for load complete
                     for worker_ref in worker_refs:
                         await worker_ref.wait_for_load(rep_model_uid)
-            except:
+            except Exception:
                 # terminate_model will remove the replica info.
                 await self.terminate_model(model_uid, suppress_exception=True)
                 await self._status_guard_ref.update_instance_info(
@@ -1923,6 +1923,17 @@ class SupervisorActor(xo.StatelessActor):
             worker_status = self._worker_status[worker_address]
             worker_status.update_time = time.time()
             worker_status.status = status
+
+        # Feed worker metrics to OTEL (no-op if OTEL is disabled)
+        if status:
+            try:
+                from .otel import get_cluster_metrics_collector
+
+                collector = get_cluster_metrics_collector()
+                if collector is not None:
+                    collector.update(worker_address, status)
+            except Exception:
+                pass
 
     async def list_deletable_models(
         self, model_version: str, worker_ip: Optional[str] = None
