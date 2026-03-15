@@ -1,1 +1,1 @@
-docker buildx build   --memory=8g --build-arg http_proxy=http://192.168.0.188:21026   --build-arg https_proxy=http://192.168.0.188:21026   -t leslie2046/xinference:v2.2.0-cu124   -f xinference/deploy/docker/Dockerfile.cu124 .
+docker buildx build   --memory=8g --build-arg http_proxy=http://192.168.0.188:21026   --build-arg https_proxy=http://192.168.0.188:21026   -t leslie2046/xinference:v2.2.2-cu124   -f xinference/deploy/docker/Dockerfile.cu124 .
