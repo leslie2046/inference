@@ -366,8 +366,8 @@ class ClusterMetricsCollector:
         meter.create_observable_gauge(
             name="xinference.worker.gpu.utilization",
             callbacks=[self._gpu_utilization_cb],
-            description="Worker GPU utilization (0.0 - 1.0)",
-            unit="1",
+            description="Worker GPU utilization percentage (0 - 100)",
+            unit="%",
         )
         meter.create_observable_gauge(
             name="xinference.worker.gpu.memory.used",
