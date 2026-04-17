@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 import itertools
 import random
 
@@ -340,3 +341,60 @@ async def test_terminate_model_replica_updates_active_replica_set():
         "demo-model",
         {"replica": 2, "status": "READY"},
     )
+
+
+@pytest.mark.asyncio
+async def test_list_virtual_envs_queries_workers_in_parallel():
+    from xinference.core.supervisor import SupervisorActor
+
+    class ParallelProbeWorker:
+        def __init__(
+            self,
+            own_started: asyncio.Event,
+            peer_started: asyncio.Event,
+            env: dict[str, str],
+        ):
+            self._own_started = own_started
+            self._peer_started = peer_started
+            self._env = env
+
+        async def list_virtual_envs(self, model_name, model_engine):
+            self._own_started.set()
+            await asyncio.wait_for(self._peer_started.wait(), timeout=0.1)
+            return [self._env]
+
+    class DummySupervisor:
+        list_virtual_envs = SupervisorActor.list_virtual_envs
+
+        def __init__(self, workers):
+            self._worker_address_to_worker = workers
+
+        def _get_worker_ref_by_ip(self, ip):
+            return None
+
+        def is_local_deployment(self):
+            return False
+
+    worker1_started = asyncio.Event()
+    worker2_started = asyncio.Event()
+    supervisor = DummySupervisor(
+        {
+            "w1:1000": ParallelProbeWorker(
+                worker1_started,
+                worker2_started,
+                {"model_name": "b-model", "worker_ip": "w1"},
+            ),
+            "w2:1000": ParallelProbeWorker(
+                worker2_started,
+                worker1_started,
+                {"model_name": "a-model", "worker_ip": "w2"},
+            ),
+        }
+    )
+
+    result = await supervisor.list_virtual_envs()
+
+    assert result == [
+        {"model_name": "a-model", "worker_ip": "w2"},
+        {"model_name": "b-model", "worker_ip": "w1"},
+    ]

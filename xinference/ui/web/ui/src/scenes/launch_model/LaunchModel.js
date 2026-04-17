@@ -29,7 +29,7 @@ import ModelCard from './modelCard'
 const ENABLE_PAGINATION = false
 
 const LaunchModelComponent = forwardRef(({ modelType, gpuAvailable }, ref) => {
-  const { isCallingApi, setIsCallingApi, endPoint } = useContext(ApiContext)
+  const { isCallingApi, setIsCallingApi } = useContext(ApiContext)
   const { isUpdatingModel } = useContext(ApiContext)
   const { setErrorMsg } = useContext(ApiContext)
   const [cookie] = useCookies(['token'])
@@ -131,7 +131,7 @@ const LaunchModelComponent = forwardRef(({ modelType, gpuAvailable }, ref) => {
     return Array.from(uniqueAbilities)
   }
 
-  const update = () => {
+  const update = async () => {
     if (
       isCallingApi ||
       isUpdatingModel ||
@@ -141,37 +141,39 @@ const LaunchModelComponent = forwardRef(({ modelType, gpuAvailable }, ref) => {
 
     try {
       setIsCallingApi(true)
+      setVirtualEnvs([])
 
-      // Fetch both model registrations and virtual environments in parallel
-      Promise.all([
-        fetchWrapper.get(`/v1/model_registrations/${modelType}?detailed=true`),
-        fetchWrapper.get('/v1/virtualenvs').catch(() => ({ list: [] })), // Fallback for virtual env API
-      ])
-        .then(([modelData, virtualEnvData]) => {
-          const builtinRegistrations = modelData.filter((v) => v.is_builtin)
-          setModelAbilityData({
-            ...modelAbilityData,
-            options: getUniqueModelAbilities(builtinRegistrations),
-          })
-          setRegistrationData(builtinRegistrations)
+      const virtualEnvPromise = fetchWrapper
+        .get('/v1/virtualenvs')
+        .then((virtualEnvData) => {
           setVirtualEnvs(virtualEnvData.list || [])
-          const collectionData = JSON.parse(
-            localStorage.getItem('collectionArr')
-          )
-          setCollectionArr(collectionData)
+        })
+        .catch(() => {
+          setVirtualEnvs([])
+        })
 
-          // Reset pagination status
-          setCurrentPage(1)
-          setHasMore(true)
-        })
-        .catch((error) => {
-          console.error('Error:', error)
-          if (error.response.status !== 403 && error.response.status !== 401) {
-            setErrorMsg(error.message)
-          }
-        })
+      const modelData = await fetchWrapper.get(
+        `/v1/model_registrations/${modelType}?detailed=true`
+      )
+      const builtinRegistrations = modelData.filter((v) => v.is_builtin)
+      setModelAbilityData((prev) => ({
+        ...prev,
+        options: getUniqueModelAbilities(builtinRegistrations),
+      }))
+      setRegistrationData(builtinRegistrations)
+      const collectionData = JSON.parse(localStorage.getItem('collectionArr'))
+      setCollectionArr(collectionData)
+
+      // Reset pagination status
+      setCurrentPage(1)
+      setHasMore(true)
+
+      void virtualEnvPromise
     } catch (error) {
       console.error('Error:', error)
+      if (error.response?.status !== 403 && error.response?.status !== 401) {
+        setErrorMsg(error.message)
+      }
     } finally {
       setIsCallingApi(false)
     }

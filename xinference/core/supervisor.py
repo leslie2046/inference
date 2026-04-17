@@ -33,6 +33,7 @@ from typing import (
     Tuple,
     Type,
     Union,
+    cast,
 )
 
 import xoscar as xo
@@ -2533,13 +2534,20 @@ class SupervisorActor(xo.StatelessActor):
             return sorted(virtual_envs, key=lambda x: x["model_name"])
 
         # Otherwise, query all workers
+        workers = list(self._worker_address_to_worker.values())
+        results = await asyncio.gather(
+            *[worker.list_virtual_envs(model_name, model_engine) for worker in workers],
+            return_exceptions=True,
+        )
+
         virtual_envs = []
-        for worker_address, worker in self._worker_address_to_worker.items():
-            try:
-                envs = await worker.list_virtual_envs(model_name, model_engine)
-                virtual_envs.extend(envs)
-            except Exception as e:
-                logger.warning(f"Failed to list virtual environments on worker: {e}")
+        for result in results:
+            if isinstance(result, BaseException):
+                logger.warning(
+                    "Failed to list virtual environments on worker: %s", result
+                )
+                continue
+            virtual_envs.extend(cast(List[Dict[str, Any]], result))
 
         return sorted(virtual_envs, key=lambda x: x["model_name"])
 
