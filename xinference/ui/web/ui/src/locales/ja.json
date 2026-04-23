@@ -76,8 +76,9 @@
     "noPackagesInstalled": "설치된 패키지가 없습니다",
     "lastConfig": "最終設定",
     "configCache": "設定キャッシュ",
+    "newCache": "新規キャッシュ",
     "noConfigCache": "設定キャッシュはありません。",
-    "loadCache": "読み込む",
+    "loadCache": "使用する",
     "deleteCache": "キャッシュを削除",
     "lastUpdated": "最終更新",
     "defaultConfig": "デフォルト設定",
@@ -162,9 +163,12 @@
     "workerAddress": "ワーカーアドレス",
     "status": "ステータス",
     "createdTime": "作成日時",
+    "actions": "操作",
     "noReplicaInfo": "レプリカ情報はありません",
     "errors": "エラー",
     "replica": "レプリカ",
+    "remove": "削除",
+    "removeConfirm": "モデル {{modelUid}} のレプリカ {{replicaId}} を削除しますか？",
     "close": "閉じる"
   },
   "runningModels": {
@@ -180,7 +184,13 @@
     "copy": "コピー",
     "copied": "コピーしました！",
     "copyFailed": "コピーに失敗しました",
-    "viewDetails": "詳細を表示"
+    "viewDetails": "詳細を表示",
+    "terminateModel": "モデルを終了",
+    "terminateInProgress": "終了処理中…",
+    "terminateConfirmTitle": "このモデルを終了しますか？",
+    "terminateConfirmBody": "このモデルには {{replica}} 個のレプリカがあります。クラスターが混雑している場合やレプリカが多い場合、終了に数分かかることがあります。所要時間は最も遅いワーカーに依存します。終了を繰り返しクリックしないでください。",
+    "terminateConfirmOk": "終了",
+    "terminateErrorHint": "リクエストが失敗したか、モデルが既に削除されている可能性があります。実行中のモデル一覧を更新して確認してください。"
   },
   "registerModel": {
     "modelName": "モデル名",
