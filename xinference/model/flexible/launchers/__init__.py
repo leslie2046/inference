@@ -14,5 +14,6 @@
 
 from .image_process_launcher import launcher as image_process
 from .modelscope_launcher import launcher as modelscope
+from .paddlenlp_launcher import launcher as paddlenlp
 from .transformers_launcher import launcher as transformers
 from .yolo_launcher import launcher as yolo

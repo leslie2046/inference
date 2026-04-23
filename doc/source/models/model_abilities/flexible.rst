@@ -21,6 +21,7 @@ It includes built-in support for loading and running the following types of mode
 
 - HuggingFace Pipelines for tasks such as classification using models hosted on HuggingFace.
 - ModelScope Pipelines for tasks such as classification using models from ModelScope.
+- PaddleNLP Taskflow for local text classification models exported by PaddleNLP.
 - YOLO for image detection and related computer vision tasks.
 
 A wide range of traditional machine learning models can be used with Xinference.
@@ -295,6 +296,73 @@ Inference the model:
        'class': 0,
        'confidence': 0.66505,
        'box': {'x1': 0.28522, 'y1': 548.60931, 'x2': 81.25904, 'y2': 871.59076}}]]
+
+PaddleNLP Text Classification
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Xinference flexible models can also launch PaddleNLP text classification models through
+`Taskflow <https://github.com/PaddlePaddle/PaddleNLP/blob/develop/paddlenlp/taskflow/text_classification.py>`_.
+
+This launcher is intended for local model directories exported or saved by PaddleNLP text classification workflows,
+for example the directories described in
+`PaddleNLP text classification application <https://github.com/PaddlePaddle/PaddleNLP/tree/develop/slm/applications/text_classification>`_.
+
+The corresponding custom model JSON file is as follows:
+
+.. code-block:: json
+
+    {
+        "model_name": "paddlenlp-text-classifier",
+        "model_id": null,
+        "model_revision": null,
+        "model_hub": null,
+        "model_description": "PaddleNLP text classification model exported for Taskflow inference.",
+        "model_uri": "/path/to/paddlenlp-text-classification-model",
+        "launcher": "xinference.model.flexible.launchers.paddlenlp",
+        "launcher_args": "{\"task\": \"text_classification\", \"mode\": \"finetune\", \"problem_type\": \"multi_class\", \"is_static_model\": true}",
+        "virtualenv": {
+            "packages": [
+                "paddlenlp",
+                "paddlepaddle"
+            ],
+            "inherit_pip_config": true,
+            "index_url": null,
+            "extra_index_url": null,
+            "find_links": null,
+            "trusted_host": null,
+            "no_build_isolation": null
+        },
+        "is_builtin": false
+    }
+
+The ``model_hub`` field is not used by this launcher when ``model_uri`` points to a local PaddleNLP export directory.
+
+After the model is successfully loaded, we can perform inference using the following method.
+
+.. tabs::
+
+  .. code-tab:: python Xinference Python Client
+
+    from xinference.client import Client
+
+    client = Client("http://<XINFERENCE_HOST>:<XINFERENCE_PORT>")
+
+    model = client.get_model("paddlenlp-text-classifier")
+
+    model.infer(["黑苦荞茶的功效与作用及食用方法", "幼儿挑食的生理原因是"])
+
+  .. code-tab:: json output
+
+    [
+      {
+        "predictions": [{"label": "功效作用", "score": 0.9683999621710758}],
+        "text": "黑苦荞茶的功效与作用及食用方法"
+      },
+      {
+        "predictions": [{"label": "病因分析", "score": 0.5204789523701855}],
+        "text": "幼儿挑食的生理原因是"
+      }
+    ]
 
 Writing a Custom Flexible Model
 ==================================
