@@ -349,7 +349,12 @@ class RESTfulAPI(CancelMixin):
             )
 
         config = Config(
-            app=self._app, host=self._host, port=self._port, log_config=logging_conf
+            app=self._app,
+            host=self._host,
+            port=self._port,
+            log_config=logging_conf,
+            proxy_headers=True,
+            forwarded_allow_ips="*",
         )
         server = Server(config)
         server.run()
@@ -592,6 +597,12 @@ class RESTfulAPI(CancelMixin):
         except Exception as e:
             logger.error(str(e), exc_info=True)
             raise HTTPException(status_code=500, detail=str(e))
+
+        # Clear negative cache so that get_model for this uid is not blocked
+        # by a stale "Model not found" entry.
+        from xinference.api.utils import invalidate_model_not_found_cache
+
+        invalidate_model_not_found_cache(model_uid)
 
         return JSONResponse(content={"model_uid": model_uid})
 
@@ -2001,7 +2012,7 @@ class RESTfulAPI(CancelMixin):
 
         messages = body.messages and list(body.messages) or None
 
-        if not messages or messages[-1].get("role") not in ["user", "system", "tool"]:
+        if not messages:
             raise HTTPException(
                 status_code=400, detail="Invalid input. Please specify the prompt."
             )
