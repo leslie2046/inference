@@ -2062,20 +2062,33 @@ class RESTfulAPI(CancelMixin):
             await self._report_error_event(model_uid, str(e))
             raise HTTPException(status_code=500, detail=str(e))
 
-        from ..model.llm.utils import TOOL_CALL_FAMILY
+        from ..model.llm.utils import (
+            DEEPSEEK_TOOL_CALL_FAMILY,
+            GEMMA_TOOL_CALL_FAMILY,
+            GLM4_TOOL_CALL_FAMILY,
+            LLAMA3_TOOL_CALL_FAMILY,
+            QWEN_TOOL_CALL_FAMILY,
+        )
 
         model_family = desc.get("model_family", "")
 
-        if model_family not in TOOL_CALL_FAMILY:
+        total_call_family = (
+            DEEPSEEK_TOOL_CALL_FAMILY
+            | GEMMA_TOOL_CALL_FAMILY
+            | GLM4_TOOL_CALL_FAMILY
+            | LLAMA3_TOOL_CALL_FAMILY
+            | QWEN_TOOL_CALL_FAMILY
+        )
+        if model_family not in total_call_family:
             if body.tools:
                 raise HTTPException(
                     status_code=400,
-                    detail=f"Only {TOOL_CALL_FAMILY} support tool calls",
+                    detail=f"Only {total_call_family} support tool calls",
                 )
             if has_tool_message:
                 raise HTTPException(
                     status_code=400,
-                    detail=f"Only {TOOL_CALL_FAMILY} support tool messages",
+                    detail=f"Only {total_call_family} support tool messages",
                 )
 
         if "skip_special_tokens" in raw_kwargs and await model.is_vllm_backend():

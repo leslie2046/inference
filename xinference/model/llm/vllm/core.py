@@ -2041,7 +2041,6 @@ class VLLMMultiModel(VLLMModel, ChatModelMixin):
             prompt = self.get_full_context(
                 messages, chat_template, tokenizer=tokenizer, **full_context_kwargs
             )
-
         else:
             prompt, images = self.get_specific_prompt(model_family, messages)
         inputs = {"prompt": prompt, "multi_modal_data": {}, "mm_processor_kwargs": {}}
