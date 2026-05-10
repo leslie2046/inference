@@ -18,6 +18,7 @@ import inspect
 import json
 import os
 import queue
+import sys
 import time
 import types
 import uuid
@@ -97,22 +98,69 @@ def request_limit(fn):
         if 1 + self._serve_count <= self._request_limits:
             self._serve_count += 1
         else:
+            await self.record_metrics(
+                "model_request_total",
+                "add",
+                {"labels": {**self._metrics_labels, "stream": "unknown"}, "value": 1},
+            )
+            await self.record_metrics(
+                "model_request_errors_total",
+                "add",
+                {"labels": self._metrics_labels, "value": 1},
+            )
             raise RuntimeError(
                 f"Rate limit reached for the model. Request limit {self._request_limits} for the model: {self.model_uid()}"
             )
+        await self.record_metrics(
+            "model_serve_count",
+            "set",
+            {"labels": self._metrics_labels, "value": self._serve_count},
+        )
+        start_time = time.time()
         ret = None
+        _error = False
         try:
             ret = await fn(self, *args, **kwargs)
+        except Exception:
+            _error = True
+            raise
         finally:
-            if ret is not None and (
+            duration = time.time() - start_time
+            _is_stream = ret is not None and (
                 inspect.isasyncgen(ret) or inspect.isgenerator(ret)
-            ):
+            )
+            stream_label = "true" if _is_stream else "false"
+            await self.record_metrics(
+                "model_request_total",
+                "add",
+                {
+                    "labels": {**self._metrics_labels, "stream": stream_label},
+                    "value": 1,
+                },
+            )
+            if _is_stream:
                 # stream case, let client call model_ref to decrease self._serve_count
                 pass
             else:
                 self._serve_count -= 1
+                await self.record_metrics(
+                    "model_serve_count",
+                    "set",
+                    {"labels": self._metrics_labels, "value": self._serve_count},
+                )
                 logger.debug(
                     f"After request {fn.__name__}, current serve request count: {self._serve_count} for the model {self.model_uid()}"
+                )
+            await self.record_metrics(
+                "model_request_duration_seconds",
+                "observe",
+                {"labels": self._metrics_labels, "value": duration},
+            )
+            if _error:
+                await self.record_metrics(
+                    "model_request_errors_total",
+                    "add",
+                    {"labels": self._metrics_labels, "value": 1},
                 )
         return ret
 
@@ -203,6 +251,7 @@ class ModelActor(xo.StatelessActor, CancelMixin):
         n_worker: Optional[int] = 1,
         shard: Optional[int] = 0,
         driver_info: Optional[dict] = None,  # for model across workers
+        model_engine: Optional[str] = None,
     ):
         super().__init__()
 
@@ -227,9 +276,14 @@ class ModelActor(xo.StatelessActor, CancelMixin):
         self._metrics_labels = {
             "type": self._model_description.get("model_type", "unknown"),
             "model": self.model_uid(),
+            "model_name": self._model_description.get("model_name", "unknown"),
+            "engine": model_engine or "unknown",
             "node": self._worker_address,
             "format": self._model_description.get("model_format", "unknown"),
             "quantization": self._model_description.get("quantization", "none"),
+            "gpu_index": ",".join(
+                str(a) for a in (self._model_description.get("accelerators") or [])
+            ),
         }
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         # model across workers
@@ -249,6 +303,14 @@ class ModelActor(xo.StatelessActor, CancelMixin):
 
         self._handle_pending_requests_task = asyncio.create_task(
             self._handle_pending_requests()
+        )
+
+        # Report static request limit gauge
+        limit_val = self._request_limits if self._request_limits != float("inf") else -1
+        await self.record_metrics(
+            "model_request_limit_gauge",
+            "set",
+            {"labels": self._metrics_labels, "value": limit_val},
         )
 
     def __repr__(self) -> str:
@@ -307,14 +369,13 @@ class ModelActor(xo.StatelessActor, CancelMixin):
                 )
             )
         if completion_tokens > 0:
-            generate_throughput = completion_tokens / duration
             coros.append(
                 self.record_metrics(
-                    "generate_throughput",
-                    "set",
+                    "generate_tokens_total",
+                    "add",
                     {
                         "labels": self._metrics_labels,
-                        "value": generate_throughput,
+                        "value": completion_tokens,
                     },
                 )
             )
@@ -442,7 +503,37 @@ class ModelActor(xo.StatelessActor, CancelMixin):
         await worker_ref.update_model_status(
             self._replica_model_uid, last_error=error_message
         )
-        os._exit(1)
+        # §4.1: Graceful cleanup instead of os._exit(1).
+        # 1) Stop model to release underlying resources (with timeout guard)
+        try:
+            await asyncio.wait_for(self.stop(), timeout=30)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Model stop() timed out after 30s for %s, proceeding with cleanup",
+                self.model_uid(),
+            )
+        except Exception:
+            logger.warning(
+                "Model stop() failed for %s, proceeding with cleanup",
+                self.model_uid(),
+                exc_info=True,
+            )
+        # 2) Delete model reference to allow GC to reclaim GPU memory
+        try:
+            del self._model
+        except AttributeError:
+            pass
+        # 3) Release PyTorch GPU cache
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+        # 4) Use sys.exit(1) instead of os._exit(1) so that Python cleanup hooks
+        #    run and xoscar can detect the sub-process exit, triggering recover_sub_pool.
+        sys.exit(1)
 
     def _to_generator(self, output_type: str, gen: types.GeneratorType):
         start_time = time.time()
@@ -470,9 +561,12 @@ class ModelActor(xo.StatelessActor, CancelMixin):
         finally:
             if self._loop is not None and time_to_first_token is not None:
                 coro = self.record_metrics(
-                    "time_to_first_token",
-                    "set",
-                    {"labels": self._metrics_labels, "value": time_to_first_token},
+                    "time_to_first_token_seconds",
+                    "observe",
+                    {
+                        "labels": {**self._metrics_labels, "stream": "true"},
+                        "value": time_to_first_token / 1000,
+                    },
                 )
                 asyncio.run_coroutine_threadsafe(coro, loop=self._loop)
             if self._loop is not None and final_usage is not None:
@@ -509,9 +603,12 @@ class ModelActor(xo.StatelessActor, CancelMixin):
             if time_to_first_token is not None:
                 coros.append(
                     self.record_metrics(
-                        "time_to_first_token",
-                        "set",
-                        {"labels": self._metrics_labels, "value": time_to_first_token},
+                        "time_to_first_token_seconds",
+                        "observe",
+                        {
+                            "labels": {**self._metrics_labels, "stream": "true"},
+                            "value": time_to_first_token / 1000,
+                        },
                     )
                 )
             if final_usage is not None:
@@ -522,7 +619,10 @@ class ModelActor(xo.StatelessActor, CancelMixin):
                         prompt_tokens=final_usage["prompt_tokens"],
                     )
                 )
-            await asyncio.gather(*coros)
+            try:
+                await asyncio.gather(*coros)
+            except Exception:
+                logger.exception("Failed to record metrics in _to_async_gen finally")
 
     async def _handle_pending_requests(self):
         logger.info("Start requests handler.")
@@ -710,6 +810,14 @@ class ModelActor(xo.StatelessActor, CancelMixin):
                     time.time() - start_time,
                     completion_tokens,
                     prompt_tokens,
+                )
+                await self.record_metrics(
+                    "time_to_first_token_seconds",
+                    "observe",
+                    {
+                        "labels": {**self._metrics_labels, "stream": "false"},
+                        "value": time.time() - start_time,
+                    },
                 )
 
     async def abort_request(

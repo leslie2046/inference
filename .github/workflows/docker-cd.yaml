@@ -13,9 +13,21 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  check-release-permission:
+    name: Check release tag permission
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/check-release-permission
+
   build:
+    needs: check-release-permission
     timeout-minutes: 240
     runs-on: self-hosted
+    permissions:
+      contents: read
     strategy:
       matrix:
         python-version: [ "3.10" ]
