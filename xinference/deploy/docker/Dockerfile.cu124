@@ -3,11 +3,11 @@ FROM vllm/vllm-openai:v0.6.0
 COPY . /opt/inference
 WORKDIR /opt/inference
 
-ENV NVM_DIR /usr/local/nvm
-ENV NODE_VERSION 14.21.1
+ENV NVM_DIR=/usr/local/nvm
+ENV NODE_VERSION=14.21.1
 
 RUN apt-get -y update \
-    && apt install -y wget curl procps git libgl1 \
+    && apt install -y wget curl procps git libgl1 libfst-dev cmake libssl-dev \
     # upgrade libstdc++ and libc for llama-cpp-python
     && printf "\ndeb https://mirrors.tuna.tsinghua.edu.cn/ubuntu/ jammy main restricted universe multiverse" >> /etc/apt/sources.list \
     && apt-get -y update \
@@ -25,12 +25,21 @@ RUN wget https://developer.download.nvidia.com/compute/cuda/12.4.0/local_install
     ./cuda_12.4.0_550.54.14_linux.run --silent --toolkit --override && \
     rm -f cuda_12.4.0_550.54.14_linux.run
 
-ENV PATH $NVM_DIR/versions/node/v$NODE_VERSION/bin:$PATH
-ENV LD_LIBRARY_PATH $LD_LIBRARY_PATH:/usr/local/lib/python3.10/dist-packages/nvidia/cublas/lib
-ENV FLASH_ATTENTION_SKIP_CUDA_BUILD TRUE
+ENV PATH=$NVM_DIR/versions/node/v$NODE_VERSION/bin:$PATH
+ENV LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib/python3.10/dist-packages/nvidia/cublas/lib
+ENV FLASH_ATTENTION_SKIP_CUDA_BUILD=TRUE
 
 ARG PIP_INDEX=https://pypi.org/simple
-RUN pip install --upgrade -i "$PIP_INDEX" pip setuptools wheel && \
+RUN pip install --upgrade -i "$PIP_INDEX" pip "setuptools<82" wheel && \
+    apt-get -y update && \
+    ( wget -O openfst-1.7.2.tar.gz http://www.openslr.org/resources/2/openfst-1.7.2.tar.gz \
+      || wget -O openfst-1.7.2.tar.gz https://www.openfst.org/twiki/pub/FST/FstDownload/openfst-1.7.2.tar.gz ) && \
+    tar zxvf openfst-1.7.2.tar.gz && cd openfst-1.7.2 && \
+    ./configure --enable-shared --enable-static && make -j$(nproc) && make install && ldconfig && \
+    CPLUS_INCLUDE_PATH=/usr/local/include LIBRARY_PATH=/usr/local/lib LD_LIBRARY_PATH=/usr/local/lib:$LD_LIBRARY_PATH \
+    pip install -i "$PIP_INDEX" pynini==2.1.6.post1 && \
+    apt install -y wget curl procps git libgl1 rsync sqlite libpcre3 libpcre3-dev dmidecode libssl-dev perl make build-essential zlib1g-dev && \
+    apt-get -yq clean && \
     pip install -i "$PIP_INDEX" "diskcache>=5.6.1" "jinja2>=2.11.3" && \
     pip install -i "$PIP_INDEX" --upgrade-strategy only-if-needed -r /opt/inference/xinference/deploy/docker/requirements_12.4/requirements-base.txt && \
     pip install -i "$PIP_INDEX" --upgrade-strategy only-if-needed -r /opt/inference/xinference/deploy/docker/requirements_12.4/requirements-ml.txt && \
@@ -56,16 +65,20 @@ RUN pip install --upgrade -i "$PIP_INDEX" pip setuptools wheel && \
 
 # Install Miniforge3 (only for FFmpeg, do not replace system Python)
 RUN apt-get install -y wget && \
-    wget -O Miniforge3.sh "https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-$(uname)-$(uname -m).sh" && \
+    wget -O Miniforge3.sh "https://github.com/conda-forge/miniforge/releases/download/4.12.0-0/Miniforge3-4.12.0-0-Linux-x86_64.sh" && \
     bash Miniforge3.sh -b -p /opt/conda && \
     rm Miniforge3.sh
 
-RUN /opt/conda/bin/conda create -n ffmpeg-env -c conda-forge 'ffmpeg<7' -y && \
+RUN /opt/conda/bin/conda create --solver classic -n ffmpeg-env -c conda-forge 'ffmpeg<7' -y && \
     ln -s /opt/conda/envs/ffmpeg-env/bin/ffmpeg /usr/local/bin/ffmpeg && \
     ln -s /opt/conda/envs/ffmpeg-env/bin/ffprobe /usr/local/bin/ffprobe && \
     /opt/conda/bin/conda clean --all -y
 
 ENV LD_LIBRARY_PATH=/opt/conda/envs/ffmpeg-env/lib:$LD_LIBRARY_PATH
+
+RUN pip install triton==3.4.0 && \
+    pip install torchcodec==0.10.0 && \
+    pip cache purge
 
 # Overwrite the entrypoint of vllm's base image
 ENTRYPOINT []
