@@ -91,6 +91,14 @@ XINFERENCE_LAUNCH_STRATEGY
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
 GPU allocation strategy for replicas. Default is ``IDLE_FIRST_LAUNCH_STRATEGY``.
 
+XINFERENCE_MAX_CONCURRENT_LAUNCHES
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Maximum number of model launches that can proceed concurrently on a single
+worker node. When more replicas are launched than this limit, excess launches
+queue and proceed as slots free up. This prevents resource exhaustion (fork
+storms, disk IO saturation, GPU memory contention) that can cause heartbeat
+timeouts. Default value is 5.
+
 XINFERENCE_ENABLE_VIRTUAL_ENV
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Enable model virtual environments globally.
@@ -115,3 +123,12 @@ XINFERENCE_QWEN3_RERANK_TEMPLATE
 ~~~~~~~~~~~~~~~~~~~~~~~
 Enable template for Qwen3 rerank model family (0.6B, 4B, 8B,etc) globally.
 Default value is 1.
+
+XINFERENCE_LAUNCH_HISTORY_DB_PATH
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Path to the SQLite database that stores the model launch configuration history
+shown in the "Launch Model" drawer of the Web UI. This store is shared across
+all clients so the history is available from any browser or machine, and it is
+independent of the authentication database. When authentication is enabled, each
+record keeps the creator's username (``created_by``).
+Default value is ``<XINFERENCE_HOME>/launch_history.db``.

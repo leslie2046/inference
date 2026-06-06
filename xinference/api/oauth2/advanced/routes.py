@@ -21,13 +21,47 @@ from typing import TYPE_CHECKING, Optional
 from fastapi import HTTPException, Query, Request, Security
 
 from ...responses import JSONResponse
-from ..advanced.auth_service import AdvancedAuthService
+from ..advanced.auth_service import AdvancedAuthService, _get_client_ip
 from ..advanced.crypto import get_password_hash
 
 if TYPE_CHECKING:
     from ...restful_api import RESTfulAPI
 
 logger = logging.getLogger(__name__)
+
+
+def _refresh_key_gauges(auth: AdvancedAuthService) -> None:
+    """Update Prometheus gauges for active/expired key counts."""
+    try:
+        from datetime import datetime
+
+        from ....core import metrics as _metrics
+
+        _active_gauge = getattr(_metrics, "api_keys_active_total", None)
+        _expired_gauge = getattr(_metrics, "api_keys_expired_total", None)
+        if _active_gauge is None or _expired_gauge is None:
+            return
+
+        keys = auth.db.list_api_keys()
+        active = 0
+        expired = 0
+        now = datetime.utcnow()
+        for k in keys:
+            if not k.get("enabled", 1):
+                continue
+            expires_at = k.get("expires_at")
+            if expires_at:
+                try:
+                    if datetime.fromisoformat(expires_at) < now:
+                        expired += 1
+                        continue
+                except ValueError:
+                    pass
+            active += 1
+        _active_gauge.set({}, active)
+        _expired_gauge.set({}, expired)
+    except Exception:
+        pass
 
 
 def get_advanced_auth(request: Request) -> AdvancedAuthService:
@@ -49,11 +83,46 @@ def _get_current_user_from_token(request: Request, auth: AdvancedAuthService):
 
 
 async def advanced_login(request: Request) -> JSONResponse:
+    try:
+        from .audit import record_audit_event
+    except ImportError:
+        record_audit_event = None  # type: ignore[assignment]
+
     auth: AdvancedAuthService = get_advanced_auth(request)
     body = await request.json()
     username = body.get("username", "")
     password = body.get("password", "")
-    result = auth.login(username, password)
+    client_ip = _get_client_ip(request)
+    try:
+        result = auth.login(username, password)
+    except Exception:
+        if record_audit_event is not None:
+            record_audit_event(
+                user=username,
+                api_key_name="",
+                api_key_prefix="",
+                model_id="",
+                model_type="",
+                endpoint="/token",
+                status="login_failed",
+                client_ip=client_ip,
+                category="auth",
+                auth_type="none",
+            )
+        raise
+    if record_audit_event is not None:
+        record_audit_event(
+            user=username,
+            api_key_name="",
+            api_key_prefix="",
+            model_id="",
+            model_type="",
+            endpoint="/token",
+            status="success",
+            client_ip=client_ip,
+            category="auth",
+            auth_type="none",
+        )
     return JSONResponse(content=result)
 
 
@@ -209,12 +278,14 @@ async def create_api_key(request: Request) -> JSONResponse:
     result = auth.create_api_key_for_user(
         user_id=owner_id,
         name=body.get("name"),
+        description=body.get("description"),
         expires_at=body.get("expires_at"),
         model_permissions=body.get("model_permissions"),
         rate_limit_max_failures=body.get("rate_limit_max_failures"),
         rate_limit_window_seconds=body.get("rate_limit_window_seconds"),
         rate_limit_ban_seconds=body.get("rate_limit_ban_seconds"),
     )
+    _refresh_key_gauges(auth)
     return JSONResponse(content=result, status_code=201)
 
 
@@ -237,6 +308,7 @@ async def list_api_keys(
                 "user_id": k["user_id"],
                 "key_prefix": k["key_prefix"],
                 "name": k.get("name"),
+                "description": k.get("description"),
                 "enabled": bool(k.get("enabled", 1)),
                 "expires_at": k.get("expires_at"),
                 "model_permissions": k.get("model_permissions", []),
@@ -262,6 +334,7 @@ async def get_api_key(key_id: int, request: Request) -> JSONResponse:
             "user_id": key["user_id"],
             "key_prefix": key["key_prefix"],
             "name": key.get("name"),
+            "description": key.get("description"),
             "enabled": bool(key.get("enabled", 1)),
             "expires_at": key.get("expires_at"),
             "model_permissions": key.get("model_permissions", []),
@@ -280,6 +353,7 @@ async def update_api_key(key_id: int, request: Request) -> JSONResponse:
     update_fields = {}
     for field in (
         "name",
+        "description",
         "enabled",
         "expires_at",
         "rate_limit_max_failures",
@@ -295,6 +369,7 @@ async def update_api_key(key_id: int, request: Request) -> JSONResponse:
         auth.db.set_api_key_model_permissions(key_id, body["model_permissions"])
 
     auth.cache.reload()
+    _refresh_key_gauges(auth)
     return JSONResponse(content={"ok": True})
 
 
@@ -305,6 +380,7 @@ async def delete_api_key(key_id: int, request: Request) -> JSONResponse:
         raise HTTPException(status_code=404, detail="API key not found")
     auth.db.delete_api_key(key_id)
     auth.cache.remove(key["key_hash"])
+    _refresh_key_gauges(auth)
     return JSONResponse(content={"ok": True})
 
 
@@ -364,6 +440,11 @@ async def update_user_permissions(user_id: int, request: Request) -> JSONRespons
 def register_advanced_auth_routes(api: "RESTfulAPI") -> None:
     router = api._router
     auth_service: AdvancedAuthService = api._app.state.advanced_auth
+
+    # Store rate_limiter on app state for security routes
+    _rl = getattr(auth_service, "_rate_limiter", None)
+    if _rl is not None:
+        api._app.state.rate_limiter = _rl
 
     router.add_api_route("/token", advanced_login, methods=["POST"])
     router.add_api_route("/v1/auth/refresh", advanced_refresh, methods=["POST"])
@@ -470,3 +551,11 @@ def register_advanced_auth_routes(api: "RESTfulAPI") -> None:
         methods=["PUT"],
         dependencies=[Security(auth_service, scopes=["users:manage"])],
     )
+
+    # Register security/rate-limit admin routes
+    try:
+        from .security_routes import register_security_routes
+
+        register_security_routes(api)
+    except ImportError:
+        pass

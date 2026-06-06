@@ -17,7 +17,7 @@ import secrets
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import OAuth2PasswordBearer, SecurityScopes
 from jose import JWTError, jwt
 from typing_extensions import Annotated
@@ -37,6 +37,33 @@ from .database import Database
 
 logger = logging.getLogger(__name__)
 
+
+_TRUSTED_PROXY_SET: Optional[set] = None
+
+
+def _get_trusted_proxies() -> set:
+    global _TRUSTED_PROXY_SET
+    if _TRUSTED_PROXY_SET is None:
+        from ....constants import XINFERENCE_TRUSTED_PROXIES
+
+        raw = XINFERENCE_TRUSTED_PROXIES
+        _TRUSTED_PROXY_SET = (
+            {p.strip() for p in raw.split(",") if p.strip()} if raw else set()
+        )
+    return _TRUSTED_PROXY_SET
+
+
+def _get_client_ip(request: Request) -> str:
+    peer_ip = request.client.host if request.client else ""
+    trusted = _get_trusted_proxies()
+    if trusted and peer_ip in trusted:
+        if "x-forwarded-for" in request.headers:
+            return request.headers["x-forwarded-for"].split(",")[0].strip()
+        if "x-real-ip" in request.headers:
+            return request.headers["x-real-ip"].strip()
+    return peer_ip
+
+
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token", auto_error=False)
 
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
@@ -51,6 +78,13 @@ class AdvancedAuthService:
         self._encryption_key = derive_encryption_key(encryption_key)
         self._cache = ApiKeyCache(self._db)
         self._init_admin()
+
+        try:
+            from .rate_limiter import RateLimiter
+
+            self._rate_limiter: Optional["RateLimiter"] = RateLimiter()
+        except ImportError:
+            self._rate_limiter = None
 
     @property
     def db(self) -> Database:
@@ -215,6 +249,7 @@ class AdvancedAuthService:
         self,
         user_id: int,
         name: Optional[str] = None,
+        description: Optional[str] = None,
         expires_at: Optional[str] = None,
         model_permissions: Optional[List[Dict[str, Optional[str]]]] = None,
         rate_limit_max_failures: Optional[int] = None,
@@ -237,6 +272,7 @@ class AdvancedAuthService:
             key_encrypted=key_encrypted,
             key_prefix=key_prefix,
             name=name,
+            description=description,
             expires_at=expires_at,
             model_permissions=model_permissions,
             rate_limit_max_failures=rate_limit_max_failures,
@@ -263,11 +299,25 @@ class AdvancedAuthService:
 
     # --- FastAPI dependency (callable) ---
 
-    def __call__(
+    async def __call__(
         self,
+        request: Request,
         security_scopes: SecurityScopes,
         token: Annotated[Optional[str], Depends(oauth2_scheme)] = None,
     ):
+        try:
+            from .audit import (
+                classify_endpoint,
+                record_audit_event,
+                resolve_model_info,
+                should_skip_audit,
+            )
+        except ImportError:
+            classify_endpoint = None  # type: ignore[assignment]
+            record_audit_event = None  # type: ignore[assignment]
+            resolve_model_info = None  # type: ignore[assignment]
+            should_skip_audit = None  # type: ignore[assignment]
+
         if security_scopes.scopes:
             authenticate_value = f'Bearer scope="{security_scopes.scope_str}"'
         else:
@@ -278,26 +328,196 @@ class AdvancedAuthService:
             headers={"WWW-Authenticate": authenticate_value},
         )
 
+        # Get client IP for rate limiting, respecting reverse proxy headers
+        client_ip = _get_client_ip(request)
+
+        endpoint = request.url.path
+        _skip_audit = (
+            should_skip_audit(endpoint) if should_skip_audit is not None else True
+        )
+
+        # Extract model from request body for audit (POST endpoints like /v1/chat/completions)
+        _request_model = ""
+        if not _skip_audit and request.method == "POST":
+            content_type = request.headers.get("content-type", "")
+            content_length = request.headers.get("content-length")
+            if "application/json" in content_type:
+                try:
+                    if content_length is None or int(content_length) <= 1024 * 1024:
+                        body_bytes = await request.body()
+                        import json as _json
+
+                        _request_model = _json.loads(body_bytes).get("model", "")
+                except Exception:
+                    pass
+
+        # Resolve model_name and model_type from cache
+        if resolve_model_info is not None:
+            _model_name, _model_type = resolve_model_info(_request_model)
+        else:
+            _model_name, _model_type = "", ""
+
+        def _audit(
+            status_val: str,
+            user: str = "",
+            key_name: str = "",
+            key_prefix: str = "",
+            auth_type: str = "",
+        ):
+            if _skip_audit or record_audit_event is None:
+                return
+            record_audit_event(
+                user=user,
+                api_key_name=key_name,
+                api_key_prefix=key_prefix,
+                model_id=_request_model,
+                model_name=_model_name,
+                model_type=_model_type,
+                endpoint=endpoint,
+                status=status_val,
+                client_ip=client_ip,
+                auth_type=auth_type,
+            )
+
+        # Check IP ban
+        if (
+            client_ip
+            and self._rate_limiter
+            and self._rate_limiter.is_ip_banned(client_ip)
+        ):
+            _audit("ip_banned")
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Too many failed attempts. IP temporarily banned.",
+            )
+
         if not token:
+            _audit("no_credentials")
             raise credentials_exception
 
-        api_key_entry = self.validate_api_key(token)
+        # Look up key in cache (including disabled/expired) for proper (IP, Key) ban handling
+        _key_hash = sha256_hex(token)
+        api_key_entry = self._cache.get(_key_hash)
         if api_key_entry:
+            user_obj = self._db.get_user_by_id(api_key_entry.user_id)
+            _username = user_obj["username"] if user_obj else ""
+
+            if not api_key_entry.is_valid():
+                _status = (
+                    "key_expired"
+                    if (
+                        api_key_entry.expires_at
+                        and datetime.utcnow() > api_key_entry.expires_at
+                    )
+                    else "key_disabled"
+                )
+                _audit(
+                    _status,
+                    user=_username,
+                    key_name=api_key_entry.name or "",
+                    key_prefix=api_key_entry.key_prefix,
+                    auth_type="api_key",
+                )
+                if client_ip and self._rate_limiter:
+                    try:
+                        from .rate_limiter import RateLimitConfig
+
+                        key_data = self._db.get_api_key_by_id(api_key_entry.key_id)
+                        per_key_config = None
+                        if key_data and key_data.get("rate_limit_max_failures"):
+                            per_key_config = RateLimitConfig(
+                                max_failures=key_data["rate_limit_max_failures"],
+                                window_seconds=key_data.get("rate_limit_window_seconds")
+                                or 300,
+                                ban_seconds=key_data.get("rate_limit_ban_seconds")
+                                or 300,
+                            )
+                        self._rate_limiter.record_key_failure(
+                            client_ip, api_key_entry.key_id, per_key_config
+                        )
+                    except ImportError:
+                        pass
+                if _status == "key_expired":
+                    raise HTTPException(
+                        status_code=status.HTTP_401_UNAUTHORIZED,
+                        detail="API key has expired",
+                        headers={"WWW-Authenticate": authenticate_value},
+                    )
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="API key is disabled",
+                    headers={"WWW-Authenticate": authenticate_value},
+                )
+
+            # Check (IP, Key) ban
+            if (
+                client_ip
+                and self._rate_limiter
+                and self._rate_limiter.is_key_banned(client_ip, api_key_entry.key_id)
+            ):
+                _audit(
+                    "key_banned",
+                    user=_username,
+                    key_name=api_key_entry.name or "",
+                    key_prefix=api_key_entry.key_prefix,
+                    auth_type="api_key",
+                )
+                raise HTTPException(
+                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                    detail="Too many failed attempts for this key.",
+                )
+
             _API_KEY_ALLOWED_SCOPES = {"models:read", "models:list"}
             for scope in security_scopes.scopes:
                 if scope not in _API_KEY_ALLOWED_SCOPES:
+                    _audit(
+                        "insufficient_scope",
+                        user=_username,
+                        key_name=api_key_entry.name or "",
+                        key_prefix=api_key_entry.key_prefix,
+                        auth_type="api_key",
+                    )
                     raise HTTPException(
                         status_code=status.HTTP_403_FORBIDDEN,
                         detail="API keys can only access model query and inference endpoints",
                         headers={"WWW-Authenticate": authenticate_value},
                     )
-            user = self._db.get_user_by_id(api_key_entry.user_id)
-            if not user:
+            if not user_obj:
+                _audit(
+                    "invalid_key",
+                    key_prefix=api_key_entry.key_prefix,
+                    auth_type="api_key",
+                )
                 raise credentials_exception
-            return user
+            # Success — reset counters
+            if client_ip and self._rate_limiter:
+                self._rate_limiter.reset_key(client_ip, api_key_entry.key_id)
+            # Record success for non-inference endpoints (inference success is recorded by audit_middleware)
+            _category = (
+                classify_endpoint(endpoint) if classify_endpoint is not None else ""
+            )
+            if _category != "inference":
+                _audit(
+                    "success",
+                    user=_username,
+                    key_name=api_key_entry.name or "",
+                    key_prefix=api_key_entry.key_prefix,
+                    auth_type="api_key",
+                )
+            return user_obj
+
+        # Token not found in API key cache — check prefix
+        if token.startswith(("sk-", "xf-")):
+            _audit("invalid_key", key_prefix=token[:7], auth_type="api_key")
+            if client_ip and self._rate_limiter:
+                self._rate_limiter.record_invalid_key(client_ip)
+            raise credentials_exception
 
         payload = self.verify_access_token(token)
         if not payload:
+            _audit("invalid_token", auth_type="jwt")
+            if client_ip and self._rate_limiter:
+                self._rate_limiter.record_invalid_key(client_ip)
             raise credentials_exception
 
         username: Optional[str] = payload.get("sub")
@@ -309,22 +529,34 @@ class AdvancedAuthService:
         elif username:
             user = self._db.get_user_by_username(username)
         else:
+            _audit("invalid_token", auth_type="jwt")
             raise credentials_exception
         if not user:
+            _audit("invalid_token", user=username or "", auth_type="jwt")
             raise credentials_exception
         if not user["enabled"]:
+            _audit("user_disabled", user=username or "", auth_type="jwt")
             raise credentials_exception
 
         if "admin" in token_scopes:
+            _category = (
+                classify_endpoint(endpoint) if classify_endpoint is not None else ""
+            )
+            if _category != "inference":
+                _audit("success", user=username or "", auth_type="jwt")
             return user
 
         for scope in security_scopes.scopes:
             if scope not in token_scopes:
+                _audit("insufficient_scope", user=username or "", auth_type="jwt")
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
                     detail="Not enough permissions",
                     headers={"WWW-Authenticate": authenticate_value},
                 )
+        _category = classify_endpoint(endpoint) if classify_endpoint is not None else ""
+        if _category != "inference":
+            _audit("success", user=username or "", auth_type="jwt")
         return user
 
     def validate_model_access(

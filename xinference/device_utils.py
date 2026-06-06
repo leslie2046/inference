@@ -178,6 +178,7 @@ def is_gcu_available() -> bool:
 
 
 def _get_info_by_pynvml(gpu_id: int) -> Dict[str, float]:
+    import pynvml
     from pynvml import (
         nvmlDeviceGetHandleByIndex,
         nvmlDeviceGetMemoryInfo,
@@ -187,7 +188,14 @@ def _get_info_by_pynvml(gpu_id: int) -> Dict[str, float]:
 
     handler = nvmlDeviceGetHandleByIndex(gpu_id)
     gpu_name = nvmlDeviceGetName(handler)
-    mem_info = nvmlDeviceGetMemoryInfo(handler)
+    # NVIDIA GB10 / DGX Spark uses a unified-memory layout and does not expose the
+    # legacy v1 NVML memory-info namespace, so nvmlDeviceGetMemoryInfo() returns
+    # NVML_ERROR_NOT_SUPPORTED there. Prefer the v2 call when it is available and
+    # fall back to v1 on Hopper/Ada and on older pynvml builds without the symbol.
+    try:
+        mem_info = pynvml.nvmlDeviceGetMemoryInfo_v2(handler)
+    except (pynvml.NVMLError, AttributeError):
+        mem_info = nvmlDeviceGetMemoryInfo(handler)
     utilization = nvmlDeviceGetUtilizationRates(handler)
     return {
         "name": gpu_name,
@@ -613,3 +621,52 @@ def get_gpu_info() -> Dict:
     if spec is None:
         return {}
     return spec.get_gpu_info_fn()
+
+
+def get_per_process_gpu_memory() -> Dict[int, Dict[int, int]]:
+    """Query per-process GPU memory usage via pynvml.
+
+    Returns: {pid: {gpu_index: memory_bytes}}
+    """
+    result: Dict[int, Dict[int, int]] = {}
+    try:
+        from pynvml import (
+            NVMLError,
+            nvmlDeviceGetComputeRunningProcesses,
+            nvmlDeviceGetCount,
+            nvmlDeviceGetHandleByIndex,
+            nvmlInit,
+            nvmlShutdown,
+        )
+    except ImportError:
+        return result
+
+    try:
+        nvmlInit()
+    except Exception:
+        return result
+
+    try:
+        device_count = nvmlDeviceGetCount()
+        for i in range(device_count):
+            try:
+                handle = nvmlDeviceGetHandleByIndex(i)
+                processes = nvmlDeviceGetComputeRunningProcesses(handle)
+            except NVMLError:
+                continue
+            for proc in processes:
+                mem = getattr(proc, "usedGpuMemory", None)
+                if mem is None:
+                    continue
+                if proc.pid not in result:
+                    result[proc.pid] = {}
+                result[proc.pid][i] = mem
+    except NVMLError:
+        pass
+    finally:
+        try:
+            nvmlShutdown()
+        except Exception:
+            pass
+
+    return result

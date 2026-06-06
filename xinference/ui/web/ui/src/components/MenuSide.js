@@ -14,6 +14,7 @@ import {
   PeopleOutlined,
   Psychology,
   RocketLaunchOutlined,
+  SecurityOutlined,
   SmartToyOutlined,
   VpnKeyOutlined,
 } from '@mui/icons-material'
@@ -34,7 +35,7 @@ import { useCookies } from 'react-cookie'
 import { useTranslation } from 'react-i18next'
 import { useNavigate } from 'react-router-dom'
 
-import icon from '../media/icon.webp'
+import icon from '../media/icon.png'
 import { ApiContext } from './apiContext'
 import ThemeButton from './themeButton'
 import TranslateButton from './translateButton'
@@ -70,6 +71,7 @@ const MenuSide = () => {
   const { endPoint } = useContext(ApiContext)
   const [esEnabled, setEsEnabled] = useState(false)
   const [authAdvanced, setAuthAdvanced] = useState(false)
+  const [isAdmin, setIsAdmin] = useState(false)
   const [, , removeCookie] = useCookies(['token'])
   const [currentUser, setCurrentUser] = useState('')
 
@@ -93,6 +95,8 @@ const MenuSide = () => {
       if (token) {
         const payload = JSON.parse(atob(token.split('.')[1]))
         setCurrentUser(payload.username || payload.sub || '')
+        const scopes = payload.scopes || []
+        setIsAdmin(scopes.includes('admin'))
       }
     } catch {
       // ignore
@@ -158,6 +162,17 @@ const MenuSide = () => {
           },
         ]
       : []),
+    ...(isAdmin
+      ? [
+          {
+            text: 'audit_log',
+            label: t('menu.auditLog') || 'Audit Log',
+            icon: <ArticleOutlined />,
+            action: 'navigate',
+            path: '/audit_log',
+          },
+        ]
+      : []),
     ...(authAdvanced
       ? [
           {
@@ -173,6 +188,13 @@ const MenuSide = () => {
             icon: <VpnKeyOutlined />,
             action: 'navigate',
             path: '/apikey_management',
+          },
+          {
+            text: 'security_settings',
+            label: t('menu.securitySettings') || 'Security',
+            icon: <SecurityOutlined />,
+            action: 'navigate',
+            path: '/security_settings',
           },
         ]
       : []),
