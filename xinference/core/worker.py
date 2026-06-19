@@ -19,6 +19,7 @@ import os
 import pathlib
 import platform
 import queue
+import re
 import shutil
 import signal
 import sys
@@ -78,6 +79,7 @@ from ..types import PeftModelConfig
 from ..utils import get_pip_config_args, get_real_path
 from .cache_tracker import CacheTrackerActor
 from .event import Event, EventCollectorActor, EventType
+from .exceptions import ModelNotReadyError
 from .metrics import (
     launch_metrics_export_server,
     record_metrics,
@@ -154,10 +156,226 @@ if _MODEL_ACTOR_AUTO_RECOVER_LIMIT is not None:
 else:
     MODEL_ACTOR_AUTO_RECOVER_LIMIT = None
 
+# Strip test-injected envs from cached launch_args before recover.
+# All test-specific env vars MUST use the XINFERENCE_TEST_ prefix so they can be
+# stripped here and not persist across recover / worker restart cycles.
+_TEST_ENV_RE = re.compile(r"^XINFERENCE_TEST_")
+
+# Max retries for persisting cleaned launch_args to disk.
+_PERSIST_RETRY_MAX = 3
+
+# VRAM reclaim timeout (seconds) for orphan cleanup waits.
+_VRAM_RECLAIM_TIMEOUT = 30
+# VRAM free ratio threshold — ratio >= this means "released".
+_VRAM_READY_RATIO = 0.90
+
+
+def _strip_test_envs(launch_args: dict) -> Tuple[dict, Set[str]]:
+    """Strip XINFERENCE_TEST_* envs from launch_args.
+
+    Returns (cleaned_launch_args, stripped_keys). The cleaned dict is a
+    shallow copy of the top level with an independent copy of envs, so
+    mutating the result never affects the original. stripped_keys lets
+    callers determine whether anything was actually removed.
+
+    Exception-safe: any error returns (shallow copy of input, empty set)
+    so the recover path is never blocked.
+    """
+    try:
+        launch_args = dict(launch_args)
+        original_envs = launch_args.get("envs")
+
+        if not original_envs:
+            return launch_args, set()
+
+        if not isinstance(original_envs, dict):
+            _uid = launch_args.get("model_uid", "<unknown>")
+            logger.error(
+                "launch_args['envs'] is %s (not dict) for model_uid=%s, "
+                "launch_args_keys=%s, skip strip",
+                type(original_envs).__name__,
+                _uid,
+                sorted(launch_args.keys()),
+            )
+            return launch_args, set()
+
+        cleaned = {k: v for k, v in original_envs.items() if not _TEST_ENV_RE.match(k)}
+        stripped = set(original_envs.keys()) - set(cleaned.keys())
+
+        if cleaned:
+            launch_args["envs"] = cleaned
+        else:
+            launch_args.pop("envs")
+
+        return launch_args, stripped
+    except Exception as e:
+        logger.error("_strip_test_envs unexpected error: %s", e, exc_info=True)
+        return dict(launch_args), set()
+
+
+def _snapshot_gpu_occupying_pids(device_indices: list) -> set:
+    """List PIDs currently occupying GPU memory via pynvml.
+
+    Returns set of int. Gracefully degrades to empty set if pynvml is
+    unavailable.
+    """
+    try:
+        import pynvml
+
+        pynvml.nvmlInit()
+    except Exception:
+        return set()
+    pids: set = set()
+    try:
+        for idx in device_indices:
+            try:
+                h = pynvml.nvmlDeviceGetHandleByIndex(int(idx))
+                for pro in pynvml.nvmlDeviceGetComputeRunningProcesses(h):
+                    if pro.pid:
+                        pids.add(pro.pid)
+            except Exception:
+                continue
+    finally:
+        try:
+            pynvml.nvmlShutdown()
+        except Exception:
+            pass
+    return pids
+
+
+def _snapshot_gpu_free_ratio(device_indices: list) -> float:
+    """Return the minimum free VRAM ratio across specified GPUs.
+
+    Returns 0.0~1.0, or -1 if pynvml is unavailable.
+    """
+    try:
+        import pynvml
+
+        pynvml.nvmlInit()
+    except Exception:
+        return -1
+    min_ratio = float("inf")
+    try:
+        for idx in device_indices:
+            try:
+                h = pynvml.nvmlDeviceGetHandleByIndex(int(idx))
+                info = pynvml.nvmlDeviceGetMemoryInfo(h)
+                ratio = info.free / info.total
+                if ratio < min_ratio:
+                    min_ratio = ratio
+            except Exception:
+                continue
+    finally:
+        try:
+            pynvml.nvmlShutdown()
+        except Exception:
+            pass
+    return min_ratio if min_ratio != float("inf") else -1
+
+
+def _parse_gpu_indices(gpu_idx) -> list:
+    """Parse gpu_idx parameter into a list of GPU indices."""
+    if gpu_idx is None:
+        return []
+    if isinstance(gpu_idx, int):
+        return [gpu_idx]
+    if isinstance(gpu_idx, list):
+        return [int(x) for x in gpu_idx]
+    if isinstance(gpu_idx, str):
+        return [int(x.strip()) for x in gpu_idx.split(",") if x.strip()]
+    return []
+
+
+async def _wait_pids_dead(pids: set, timeout: float = 5.0):
+    """Wait until all given PIDs have exited or timeout expires."""
+    import psutil
+
+    deadline = time.monotonic() + timeout
+    remaining = set(pids)
+    while remaining and time.monotonic() < deadline:
+        still_alive = set()
+        for pid in remaining:
+            try:
+                p = psutil.Process(pid)
+                if p.is_running() and p.status() != psutil.STATUS_ZOMBIE:
+                    still_alive.add(pid)
+            except Exception:
+                pass
+        remaining = still_alive
+        if remaining:
+            await asyncio.sleep(0.2)
+
+
+def _process_or_ancestor_has_uid(proc: Any, uid_lower: str) -> bool:
+    """Return True if proc or any of its ancestors has uid_lower in cmdline."""
+    current = proc
+    while current is not None:
+        try:
+            cmd = " ".join(current.cmdline()).lower()
+            if uid_lower in cmd:
+                return True
+            current = current.parent()
+        except Exception:
+            return False
+    return False
+
+
+async def _kill_orphan_gpu_pids(
+    device_indices: list,
+    pre_pids: set,
+    model_uid: str = "",
+    grace: float = 2.0,
+):
+    """Snapshot current GPU PIDs, kill orphans not in pre_pids.
+
+    An orphan is a PID present on the GPU that was not in pre_pids (the set
+    of PIDs known to belong to other models or the worker itself).
+
+    Requires model_uid in the process cmdline (or in an ancestor's cmdline)
+    to avoid killing unrelated processes on shared GPUs.
+    """
+    post_pids = _snapshot_gpu_occupying_pids(device_indices)
+    orphan_pids = [pid for pid in post_pids if pid not in pre_pids]
+    if not orphan_pids:
+        return []
+
+    import psutil
+
+    killed = []
+    uid_lower = model_uid.lower() if model_uid else ""
+    for pid in orphan_pids:
+        try:
+            p = psutil.Process(pid)
+            if not p.is_running() or p.status() == psutil.STATUS_ZOMBIE:
+                continue
+            cmd = " ".join(p.cmdline()).lower()
+            if uid_lower:
+                if uid_lower not in cmd and not _process_or_ancestor_has_uid(
+                    p, uid_lower
+                ):
+                    continue
+            if not any(k in cmd for k in ("vllm", "enginecore", "python")):
+                continue
+            p.kill()
+            killed.append(pid)
+        except (
+            psutil.NoSuchProcess,
+            psutil.AccessDenied,
+            ProcessLookupError,
+            PermissionError,
+        ):
+            continue
+        except Exception:
+            pass
+    if killed:
+        await asyncio.sleep(grace)
+    return killed
+
 
 @dataclass
 class ModelStatus:
     last_error: str = ""
+    model_state: str = ""
 
 
 @dataclass
@@ -264,6 +482,9 @@ class WorkerActor(xo.StatelessActor):
         self._virtual_env_manager = XinferenceVirtualEnvManager(self.address)
 
         self._lock = asyncio.Lock()
+        self._persist_lock = asyncio.Lock()
+        self._persist_launch_args_dirty_uids: Set[str] = set()
+        self._persist_retry_count: Dict[str, int] = {}
 
     async def recover_sub_pool(self, address):
         logger.warning("Process %s is down.", address)
@@ -281,10 +502,118 @@ class WorkerActor(xo.StatelessActor):
                     )
                 else:
                     recover_count = self._model_uid_to_recover_count.get(model_uid)
+
+                    # Strip test-injected envs from cached launch_args before
+                    # passing them to recover_model, so test env vars don't
+                    # persist across recover cycles.
+                    launch_args, stripped_keys = _strip_test_envs(launch_args)
+                    if stripped_keys:
+                        logger.warning(
+                            "Stripped test envs on recover for %s: stripped=%s, kept=%s",
+                            model_uid,
+                            sorted(stripped_keys),
+                            sorted(launch_args.get("envs", {}).keys()),
+                        )
+                        self._model_uid_to_launch_args[model_uid] = launch_args
+                        try:
+                            async with self._persist_lock:
+                                self._persist_launch_args()
+                                self._persist_launch_args_dirty_uids.discard(model_uid)
+                                self._persist_retry_count.pop(model_uid, None)
+                        except Exception as e:
+                            retry_n = self._persist_retry_count.get(model_uid, 0) + 1
+                            self._persist_retry_count[model_uid] = retry_n
+                            if retry_n >= _PERSIST_RETRY_MAX:
+                                self._persist_launch_args_dirty_uids.discard(model_uid)
+                                logger.error(
+                                    "Persist cleaned launch_args for %s failed "
+                                    "%d times, giving up: %s",
+                                    model_uid,
+                                    retry_n,
+                                    e,
+                                )
+                            else:
+                                self._persist_launch_args_dirty_uids.add(model_uid)
+                                logger.warning(
+                                    "Failed to persist cleaned launch_args for "
+                                    "%s (attempt %d/%d): %s",
+                                    model_uid,
+                                    retry_n,
+                                    _PERSIST_RETRY_MAX,
+                                    e,
+                                )
+
                     try:
                         await self.terminate_model(model_uid, is_model_die=True)
                     except Exception:
                         pass
+
+                    # Wait for VRAM reclaim after terminate, then clean up
+                    # any orphan GPU processes (e.g. spawn-created EngineCore
+                    # that survived subpool removal).
+                    _recover_gpu_idx = _parse_gpu_indices(launch_args.get("gpu_idx"))
+                    if not _recover_gpu_idx:
+                        try:
+                            import pynvml
+
+                            pynvml.nvmlInit()
+                            try:
+                                _recover_gpu_idx = list(
+                                    range(pynvml.nvmlDeviceGetCount())
+                                )
+                            finally:
+                                try:
+                                    pynvml.nvmlShutdown()
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+                    if _recover_gpu_idx:
+                        try:
+                            await asyncio.sleep(1.0)
+                            _free_ratio = _snapshot_gpu_free_ratio(_recover_gpu_idx)
+                            if 0 <= _free_ratio < _VRAM_READY_RATIO:
+                                _other_pids: set = {os.getpid()}
+                                for (
+                                    _uid,
+                                    _pids,
+                                ) in self._model_uid_to_subpool_pids.items():
+                                    _other_pids.update(_pids)
+                                _killed = await _kill_orphan_gpu_pids(
+                                    _recover_gpu_idx,
+                                    _other_pids,
+                                    model_uid=model_uid,
+                                )
+                                if _killed:
+                                    logger.warning(
+                                        "Killed %d GPU orphan(s) after "
+                                        "recover terminate for %s: %s",
+                                        len(_killed),
+                                        model_uid,
+                                        _killed,
+                                    )
+                            # Poll VRAM until released or timeout
+                            _vram_deadline = time.monotonic() + _VRAM_RECLAIM_TIMEOUT
+                            while time.monotonic() < _vram_deadline:
+                                _free_ratio = _snapshot_gpu_free_ratio(_recover_gpu_idx)
+                                if _free_ratio < 0 or _free_ratio >= _VRAM_READY_RATIO:
+                                    break
+                                await asyncio.sleep(1.0)
+                            else:
+                                logger.warning(
+                                    "VRAM reclaim timed out after %.0fs for "
+                                    "%s, min_free_ratio=%.2f",
+                                    _VRAM_RECLAIM_TIMEOUT,
+                                    model_uid,
+                                    _snapshot_gpu_free_ratio(_recover_gpu_idx),
+                                )
+                        except Exception:
+                            logger.debug(
+                                "VRAM/orphan cleanup error for %s",
+                                model_uid,
+                                exc_info=True,
+                            )
+
                     if recover_count is not None:
                         if recover_count > 0:
                             logger.warning(
@@ -315,6 +644,38 @@ class WorkerActor(xo.StatelessActor):
                             await self.recover_model(launch_args)
                         else:
                             logger.warning("Stop recreating model actor.")
+
+                            # Worker has given up recreating; notify supervisor
+                            # to evict the dead replica from round-robin and
+                            # light up the failure gauge. add_worker=False:
+                            # only fetch the ref, do not trigger
+                            # re-registration. The whole notification --
+                            # get_supervisor_ref + mark_replica_dead -- is
+                            # wrapped in a single xo.wait_for(5s): this runs
+                            # inside the recover_sub_pool tail path, and
+                            # get_supervisor_ref itself issues blocking
+                            # xo.actor_ref calls when the cached ref is missing,
+                            # so the bound must cover both to keep a stalled
+                            # supervisor from holding up the worker's local
+                            # shutdown. A failure/timeout is non-fatal -- the
+                            # next death detection / redeploy will reconcile.
+                            async def _notify_replica_dead():
+                                supervisor_ref = await self.get_supervisor_ref(
+                                    add_worker=False
+                                )
+                                await supervisor_ref.mark_replica_dead(model_uid)
+
+                            try:
+                                await xo.wait_for(
+                                    _notify_replica_dead(),
+                                    timeout=5,
+                                )
+                            except Exception:
+                                logger.warning(
+                                    "Failed to notify supervisor of dead replica %s",
+                                    model_uid,
+                                    exc_info=True,
+                                )
                     else:
                         logger.warning("Recreating model actor %s ...", model_uid)
                         await self.recover_model(launch_args)
@@ -763,6 +1124,14 @@ class WorkerActor(xo.StatelessActor):
                 logger.info("Recovering model %s ...", model_uid)
                 # Remove non-callable keys that may have been serialized
                 launch_args.pop("launch_ts", None)
+                # Strip test-injected envs from persisted launch_args
+                launch_args, _stripped = _strip_test_envs(launch_args)
+                if _stripped:
+                    logger.warning(
+                        "Stripped test envs on startup recovery for %s: %s",
+                        model_uid,
+                        sorted(_stripped),
+                    )
                 await self.launch_builtin_model(**launch_args)
                 recovered += 1
             except Exception:
@@ -905,6 +1274,18 @@ class WorkerActor(xo.StatelessActor):
             for model_info in model_infos:
                 self._user_specified_gpu_to_model_uids[dev].remove(model_info)
 
+    async def _ensure_subpool_monitor(self):
+        # The worker main pool is created with n_process=0, so xoscar's
+        # start_monitor() (called once in start()) is a no-op because its guard
+        # `and self.sub_processes` is empty at that point; monitor_sub_pools
+        # therefore never runs and subprocess deaths (OOM / crash / kill) go
+        # undetected and unrecovered. After every append_sub_pool the new
+        # subpool is already in sub_processes, so calling start_monitor() again
+        # here actually starts the monitor loop. start_monitor has its own
+        # `_monitor_task is None` guard, so this is idempotent: at most one
+        # monitor task per worker process.
+        await self._main_pool.start_monitor()
+
     async def _create_subpool(
         self,
         model_uid: str,
@@ -937,6 +1318,7 @@ class WorkerActor(xo.StatelessActor):
         subpool_address = await self._main_pool.append_sub_pool(
             env=env, start_python=start_python
         )
+        await self._ensure_subpool_monitor()
         return subpool_address, [str(dev) for dev in devices]
 
     def _check_model_is_valid(self, model_name: str, model_format: Optional[str]):
@@ -1516,6 +1898,12 @@ class WorkerActor(xo.StatelessActor):
             for f in get_user_defined_reranks():
                 if f.model_name == model_name:
                     return self._prefer_model_hub(f)
+        elif model_type == "flexible":
+            from ..model.flexible import get_flexible_models
+
+            for f in get_flexible_models():
+                if f.model_name == model_name:
+                    return f
         return None
 
     @log_async(logger=logger)
@@ -2201,6 +2589,7 @@ class WorkerActor(xo.StatelessActor):
                                     )
                                 )
                             pool_addresses = await asyncio.gather(*coros)
+                            await self._ensure_subpool_monitor()
                             all_subpool_addresses.extend(pool_addresses)
                             await model_ref.set_pool_addresses(pool_addresses)
 
@@ -2231,6 +2620,7 @@ class WorkerActor(xo.StatelessActor):
                                 raise
                     except Exception:
                         logger.error(f"Failed to load model {model_uid}", exc_info=True)
+                        await self._update_model_state(model_uid, "error")
                         self.release_devices(model_uid=model_uid)
                         for addr in all_subpool_addresses:
                             try:
@@ -2258,7 +2648,9 @@ class WorkerActor(xo.StatelessActor):
                     self._model_uid_to_subpool_pids[model_uid] = subpool_pids
                     model_spec = model.model_family.to_description()
                     self._model_uid_to_model_spec[model_uid] = model_spec
-                    self._model_uid_to_model_status[model_uid] = ModelStatus()
+                    self._model_uid_to_model_status[model_uid] = ModelStatus(
+                        model_state="loading"
+                    )
                     self._model_uid_to_addr[model_uid] = subpool_address
                     self._model_uid_to_recover_count.setdefault(
                         model_uid, MODEL_ACTOR_AUTO_RECOVER_LIMIT
@@ -2321,6 +2713,7 @@ class WorkerActor(xo.StatelessActor):
     async def wait_for_load(self, model_uid: str):
         model_ref = self._model_uid_to_model[model_uid]
         await model_ref.wait_for_load()
+        await self._update_model_state(model_uid, "ready")
 
     @log_sync(logger=logger, level=logging.INFO)
     async def cancel_launch_model(self, model_uid: str):
@@ -2360,6 +2753,7 @@ class WorkerActor(xo.StatelessActor):
         # Terminate model while its launching is not allow
         if model_uid in self._model_uid_launching_guard:
             raise ValueError(f"{model_uid} is launching")
+        await self._update_model_state(model_uid, "stopping")
         # In special cases, if the suffix is `-rank0`, this is the Xavier's rank 0 model actor.
         if model_uid.endswith("-rank0"):
             origin_uid = model_uid.removesuffix("-rank0")
@@ -2396,6 +2790,24 @@ class WorkerActor(xo.StatelessActor):
             except Exception as e:
                 # process may disappear, we just ignore it.
                 logger.debug("Fail to get pool addresses, error: %s", e)
+
+        # Resolve GPU indices for terminate-path orphan cleanup.
+        # Prefer launch_args["gpu_idx"] (user-specified), but fall back to
+        # model_spec["accelerators"] (allocated devices when gpu_idx=None
+        # and _create_subpool() auto-selected GPUs).
+        _gpu_indices_for_terminate: list = []
+        if not is_model_die:
+            _launch_args = self._model_uid_to_launch_args.get(model_uid)
+            if _launch_args:
+                _gpu_indices_for_terminate = _parse_gpu_indices(
+                    _launch_args.get("gpu_idx")
+                )
+            if not _gpu_indices_for_terminate:
+                _model_spec = self._model_uid_to_model_spec.get(model_uid)
+                if _model_spec and _model_spec.get("accelerators"):
+                    _gpu_indices_for_terminate = [
+                        int(dev) for dev in _model_spec["accelerators"]
+                    ]
 
         try:
             logger.debug("Start to destroy model actor: %s", model_ref)
@@ -2457,6 +2869,7 @@ class WorkerActor(xo.StatelessActor):
                 status = LaunchStatus.ERROR.name
             else:
                 status = LaunchStatus.TERMINATED.name
+                await self._update_model_state(model_uid, "stopped")
                 self._model_uid_to_model_status.pop(model_uid, None)
 
             if self._status_guard_ref is None:
@@ -2465,6 +2878,70 @@ class WorkerActor(xo.StatelessActor):
             await self._status_guard_ref.update_instance_info(
                 origin_uid, {"status": status}
             )
+
+        # Per-uid persist state cleanup (prevent zombie entries on long-running workers)
+        self._persist_launch_args_dirty_uids.discard(model_uid)
+        self._persist_retry_count.pop(model_uid, None)
+
+        # Terminate-path orphan cleanup for TP=1 spawn EngineCore.
+        # When is_model_die=False (normal terminate), spawn-created EngineCore
+        # may survive stop() + remove_sub_pool as an orphan, holding VRAM.
+        # Scan current GPU pids and SIGKILL those whose cmdline matches
+        # vllm/enginecore (same identity check as the is_model_die=True path).
+        try:
+            if not is_model_die and _gpu_indices_for_terminate:
+                await asyncio.sleep(1.0)
+                _free_ratio = _snapshot_gpu_free_ratio(_gpu_indices_for_terminate)
+                if 0 <= _free_ratio < _VRAM_READY_RATIO:
+                    _exclude_pids: set = {os.getpid()}
+                    for _uid, _pids in self._model_uid_to_subpool_pids.items():
+                        _exclude_pids.update(_pids)
+                    _killed = await _kill_orphan_gpu_pids(
+                        _gpu_indices_for_terminate,
+                        _exclude_pids,
+                        model_uid=model_uid,
+                    )
+                    if _killed:
+                        logger.warning(
+                            "Killed %d GPU-occupying orphan(s) for %s: %s",
+                            len(_killed),
+                            model_uid,
+                            _killed,
+                        )
+                    else:
+                        logger.warning(
+                            "No vllm/enginecore orphans found on GPU, "
+                            "but VRAM still held for %s (free_ratio=%.2f)",
+                            model_uid,
+                            _free_ratio,
+                        )
+                    # Wait for VRAM reclaim after orphan cleanup
+                    _vram_deadline = time.monotonic() + _VRAM_RECLAIM_TIMEOUT
+                    while time.monotonic() < _vram_deadline:
+                        await asyncio.sleep(1.0)
+                        _free_ratio = _snapshot_gpu_free_ratio(
+                            _gpu_indices_for_terminate
+                        )
+                        if _free_ratio < 0:
+                            break
+                        if _free_ratio >= _VRAM_READY_RATIO:
+                            logger.info(
+                                "VRAM reclaimed after orphan cleanup "
+                                "for %s, free_ratio=%.2f",
+                                model_uid,
+                                _free_ratio,
+                            )
+                            break
+                    else:
+                        logger.warning(
+                            "VRAM still not freed after orphan cleanup "
+                            "+ %ds for %s (free_ratio=%.2f)",
+                            _VRAM_RECLAIM_TIMEOUT,
+                            model_uid,
+                            _snapshot_gpu_free_ratio(_gpu_indices_for_terminate),
+                        )
+        except Exception:
+            logger.warning("Orphan cleanup failed for %s", model_uid, exc_info=True)
 
     # Provide an interface for future version of supervisor to call
     def get_model_launch_status(self, model_uid: str) -> Optional[str]:
@@ -2485,11 +2962,54 @@ class WorkerActor(xo.StatelessActor):
     async def list_models(self) -> Dict[str, Dict[str, Any]]:
         return {k: v for k, v in self._model_uid_to_model_spec.items()}
 
-    @log_sync(logger=logger)
+    @log_async(logger=logger)
+    async def _update_model_state(self, model_uid: str, state: str):
+        """Update ModelStatus.model_state and sync to StatusGuard."""
+        ms = self._model_uid_to_model_status.get(model_uid)
+        if ms is None:
+            ms = ModelStatus()
+            self._model_uid_to_model_status[model_uid] = ms
+        ms.model_state = state
+        status_map = {
+            "registering": LaunchStatus.CREATING.name,
+            "loading": LaunchStatus.LOADING.name,
+            "ready": LaunchStatus.READY.name,
+            "error": LaunchStatus.ERROR.name,
+            "stopping": LaunchStatus.TERMINATING.name,
+            "stopped": LaunchStatus.TERMINATED.name,
+        }
+        if self._status_guard_ref is not None:
+            try:
+                origin_uid, rank_suffix = parse_replica_model_uid(model_uid)
+                replica_id = rank_suffix - 1 if rank_suffix > 0 else 0
+                await self._status_guard_ref.update_replica_status(
+                    origin_uid,
+                    replica_id,
+                    {
+                        "status": status_map.get(state, LaunchStatus.CREATING.name),
+                        "model_state": state,
+                    },
+                )
+            except Exception:
+                logger.debug(
+                    "Failed to sync model_state to StatusGuard for %s",
+                    model_uid,
+                    exc_info=True,
+                )
+
     def get_model(self, model_uid: str) -> xo.ActorRefType["ModelActor"]:
         model_status = self._model_uid_to_model_status.get(model_uid)
-        if model_status and model_status.last_error:
-            raise Exception(model_status.last_error)
+        if model_status:
+            if model_status.model_state in ("registering", "loading"):
+                raise ModelNotReadyError(
+                    f"Model {model_uid} is {model_status.model_state}"
+                )
+            if model_status.model_state in ("error", "stopping", "stopped"):
+                raise RuntimeError(
+                    f"Model {model_uid} is in {model_status.model_state} state"
+                )
+            if model_status.last_error:
+                raise Exception(model_status.last_error)
         model_ref = self._model_uid_to_model.get(model_uid, None)
         if model_ref is None:
             raise ValueError(f"Model not found, uid: {model_uid}")
@@ -2790,6 +3310,7 @@ class WorkerActor(xo.StatelessActor):
         from ..model.llm.vllm.xavier.collective_manager import Rank0ModelActor
 
         subpool_address = await self._main_pool.append_sub_pool()
+        await self._ensure_subpool_monitor()
 
         store_address = subpool_address.split(":")[0]
         # Note that `store_port` needs to be generated on the worker,
@@ -2818,6 +3339,20 @@ class WorkerActor(xo.StatelessActor):
 
     @no_type_check
     async def recover_model(self, launch_args: Dict[str, Any]):
+        # `launch_ts` is an internal timestamp stamped onto the launch snapshot at
+        # the entry of `launch_builtin_model` (see the `launch_args["launch_ts"]`
+        # assignment); it is not a model construction parameter. recover_model
+        # splats the whole snapshot back via `launch_builtin_model(**launch_args)`,
+        # so `launch_ts` would land in that call's `**kwargs` and sink into the
+        # model's `self._kwargs`. Models that forward the full `self._kwargs` into a
+        # strict constructor (e.g. jina-reranker-v3 ->
+        # `AutoModelForCausalLM.from_pretrained(**model_kwargs)`) then crash with
+        # `TypeError: ... unexpected keyword argument 'launch_ts'`. The cross-session
+        # recovery path (`recover_models_on_startup`) already pops it before
+        # relaunch; do the same here. Copy first so the cached snapshot in
+        # `self._model_uid_to_launch_args` keeps its `launch_ts` (used as created_ts).
+        launch_args = dict(launch_args)
+        launch_args.pop("launch_ts", None)
         rep_model_uid = launch_args.get("model_uid")
         origin_uid, _ = parse_replica_model_uid(rep_model_uid)
         xavier_config: Optional[Dict[str, Any]] = launch_args.get("xavier_config", None)
