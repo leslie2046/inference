@@ -50,3 +50,4 @@ tensorboard # IndexTTS2
 randomname # IndexTTS2
 argbind # IndexTTS2
 pytest
+qwen-asr
