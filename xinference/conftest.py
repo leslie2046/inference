@@ -1,4 +1,4 @@
-# Copyright 2022-2026 XProbe Inc.
+# Copyright 2022-2026 Xinference Holdings Pte. Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -269,7 +269,7 @@ def setup_with_auth():
     user3 = User(
         username="user3",
         password="pass3",
-        permissions=["models:list", "models:read", "models:start"],
+        permissions=["models:list", "models:read", "models:write"],
         api_keys=["sk-m6jEzEwmCc4iQ", "sk-ZOTLIY4gt9w11"],
     )
     auth_config = AuthConfig(
