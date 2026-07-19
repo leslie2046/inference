@@ -1,0 +1,12 @@
+# Shared parent-environment pins for the CUDA 12.4 slim image.
+#
+# CUDA 12.4 wheels stop at the PyTorch 2.6 family. Model engines that require
+# a newer PyTorch/CUDA combination must use the default CUDA 13 image.
+torch==2.6.0
+torchvision==0.21.0
+torchaudio==2.6.0
+torchcodec==0.2.1
+transformers==5.13.1
+accelerate==1.14.0
+numpy==2.3.5
+pandas==3.0.3
