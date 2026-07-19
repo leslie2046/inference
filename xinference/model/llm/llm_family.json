@@ -1615,7 +1615,7 @@
     "stop": [
       "<|im_end|>"
     ],
-    "updated_at": 1769418483,
+    "updated_at": 1784394363,
     "featured": false,
     "architectures": [
       "InternVLChatModel"
@@ -1624,6 +1624,7 @@
     "virtualenv": {
       "packages": [
         "#transformers_dependencies# ; #engine# == \"Transformers\"",
+        "eva-decord ; #engine# == \"Transformers\" and sys_platform == \"linux\" and platform_machine == \"x86_64\"",
         "#vllm_dependencies# ; #engine# == \"vllm\"",
         "#system_numpy# ; #engine# == \"vllm\""
       ]
@@ -1693,7 +1694,7 @@
       "<|im_end|>",
       "<|endoftext|>"
     ],
-    "updated_at": 1769418484,
+    "updated_at": 1784394363,
     "featured": false,
     "architectures": [
       "MiniCPMV"
@@ -1702,6 +1703,7 @@
     "virtualenv": {
       "packages": [
         "#transformers_dependencies# ; #engine# == \"Transformers\"",
+        "eva-decord ; #engine# == \"Transformers\" and sys_platform == \"linux\" and platform_machine == \"x86_64\"",
         "#vllm_dependencies# ; #engine# == \"vllm\"",
         "#system_numpy# ; #engine# == \"vllm\""
       ]
@@ -2326,7 +2328,7 @@
       "<|im_end|>",
       "<|endoftext|>"
     ],
-    "updated_at": 1769418486,
+    "updated_at": 1784394363,
     "featured": false,
     "architectures": [
       "Qwen2VLForConditionalGeneration"
@@ -2335,6 +2337,7 @@
     "virtualenv": {
       "packages": [
         "#transformers_dependencies# ; #engine# == \"Transformers\"",
+        "qwen-vl-utils!=0.0.9 ; #engine# == \"Transformers\"",
         "#mlx_dependencies# ; #engine# == \"MLX\"",
         "#vllm_dependencies# ; #engine# == \"vllm\"",
         "#system_numpy# ; #engine# == \"vllm\""
@@ -3820,7 +3823,7 @@
         }
       }
     ],
-    "updated_at": 1769418498,
+    "updated_at": 1784394363,
     "featured": false,
     "architectures": [
       "BaichuanForCausalLM"
@@ -3828,7 +3831,9 @@
     "model_type": "baichuan",
     "virtualenv": {
       "packages": [
-        "#transformers_dependencies# ; #engine# == \"Transformers\""
+        "#transformers_dependencies# ; #engine# == \"Transformers\"",
+        "sentencepiece ; #engine# == \"Transformers\"",
+        "transformers_stream_generator ; #engine# == \"Transformers\""
       ]
     }
   },
@@ -3904,7 +3909,7 @@
       195
     ],
     "stop": [],
-    "updated_at": 1769418499,
+    "updated_at": 1784394364,
     "featured": false,
     "architectures": [
       "BaichuanForCausalLM"
@@ -3912,7 +3917,9 @@
     "model_type": "baichuan",
     "virtualenv": {
       "packages": [
-        "#transformers_dependencies# ; #engine# == \"Transformers\""
+        "#transformers_dependencies# ; #engine# == \"Transformers\"",
+        "sentencepiece ; #engine# == \"Transformers\"",
+        "transformers_stream_generator ; #engine# == \"Transformers\""
       ]
     }
   },
@@ -7739,7 +7746,7 @@
     "stop": [
       "<｜end▁of▁sentence｜>"
     ],
-    "updated_at": 1769418522,
+    "updated_at": 1784394364,
     "featured": false,
     "architectures": [
       "DeepseekV2ForCausalLM"
@@ -7748,6 +7755,9 @@
     "virtualenv": {
       "packages": [
         "#transformers_dependencies# ; #engine# == \"Transformers\"",
+        "attrdict ; #engine# == \"Transformers\"",
+        "einops ; #engine# == \"Transformers\"",
+        "timm>=0.9.16 ; #engine# == \"Transformers\"",
         "#vllm_dependencies# ; #engine# == \"vllm\"",
         "#system_numpy# ; #engine# == \"vllm\""
       ]
@@ -11220,7 +11230,7 @@
       "</s>",
       "<|im_end|>"
     ],
-    "updated_at": 1769418546,
+    "updated_at": 1784394364,
     "featured": false,
     "architectures": [
       "MiniCPMForCausalLM"
@@ -11229,6 +11239,8 @@
     "virtualenv": {
       "packages": [
         "#transformers_dependencies# ; #engine# == \"Transformers\"",
+        "datamodel_code_generator ; #engine# == \"Transformers\"",
+        "jsonschema ; #engine# == \"Transformers\"",
         "#mlx_dependencies# ; #engine# == \"MLX\"",
         "#vllm_dependencies# ; #engine# == \"vllm\"",
         "#system_numpy# ; #engine# == \"vllm\""
@@ -12272,7 +12284,7 @@
     "stop": [
       "<|im_end|>"
     ],
-    "updated_at": 1769418553,
+    "updated_at": 1784394364,
     "featured": false,
     "architectures": [
       "DeepseekV3ForCausalLM"
@@ -12281,6 +12293,7 @@
     "virtualenv": {
       "packages": [
         "#transformers_dependencies# ; #engine# == \"Transformers\"",
+        "blobfile ; #engine# == \"Transformers\"",
         "#vllm_dependencies# ; #engine# == \"vllm\"",
         "#system_numpy# ; #engine# == \"vllm\""
       ]
@@ -12742,7 +12755,7 @@
       "<|im_start|>",
       "<|im_end|>"
     ],
-    "updated_at": 1769418557,
+    "updated_at": 1784394364,
     "featured": false,
     "architectures": [
       "QWenLMHeadModel"
@@ -12751,6 +12764,8 @@
     "virtualenv": {
       "packages": [
         "#transformers_dependencies# ; #engine# == \"Transformers\"",
+        "tiktoken>=0.6.0 ; #engine# == \"Transformers\"",
+        "transformers_stream_generator ; #engine# == \"Transformers\"",
         "#llama_cpp_dependencies# ; #engine# == \"llama.cpp\"",
         "#sglang_dependencies# ; #engine# == \"sglang\"",
         "#vllm_dependencies# ; #engine# == \"vllm\"",
@@ -14760,7 +14775,7 @@
       "<|im_end|>",
       "<|endoftext|>"
     ],
-    "updated_at": 1769418564,
+    "updated_at": 1784394365,
     "featured": false,
     "architectures": [
       "Qwen2VLForConditionalGeneration"
@@ -14769,6 +14784,7 @@
     "virtualenv": {
       "packages": [
         "#transformers_dependencies# ; #engine# == \"Transformers\"",
+        "qwen-vl-utils!=0.0.9 ; #engine# == \"Transformers\"",
         "#mlx_dependencies# ; #engine# == \"MLX\"",
         "#sglang_dependencies# ; #engine# == \"sglang\"",
         "#vllm_dependencies# ; #engine# == \"vllm\"",
@@ -17631,7 +17647,7 @@
       "<|im_end|>",
       "<|endoftext|>"
     ],
-    "updated_at": 1769418570,
+    "updated_at": 1784394365,
     "featured": false,
     "architectures": [
       "Qwen2_5_VLForConditionalGeneration"
@@ -17640,6 +17656,7 @@
     "virtualenv": {
       "packages": [
         "#transformers_dependencies# ; #engine# == \"Transformers\"",
+        "qwen-vl-utils!=0.0.9 ; #engine# == \"Transformers\"",
         "#mlx_dependencies# ; #engine# == \"MLX\"",
         "#sglang_dependencies# ; #engine# == \"sglang\"",
         "#vllm_dependencies# ; #engine# == \"vllm\"",
@@ -24746,7 +24763,7 @@
       "<|im_end|>"
     ],
     "tool_parser": "qwen",
-    "updated_at": 1769418594,
+    "updated_at": 1784394365,
     "featured": true,
     "architectures": [
       "Qwen3VLMoeForConditionalGeneration"
@@ -24755,6 +24772,7 @@
     "virtualenv": {
       "packages": [
         "#transformers_dependencies# ; #engine# == \"Transformers\"",
+        "qwen-vl-utils!=0.0.9 ; #engine# == \"Transformers\"",
         "#mlx_dependencies# ; #engine# == \"MLX\"",
         "#sglang_dependencies# ; #engine# == \"sglang\"",
         "#vllm_dependencies# ; #engine# == \"vllm\"",
@@ -25234,7 +25252,7 @@
     "reasoning_start_tag": "<think>",
     "reasoning_end_tag": "</think>",
     "tool_parser": "qwen",
-    "updated_at": 1769418596,
+    "updated_at": 1784394365,
     "featured": false,
     "architectures": [
       "Qwen3VLMoeForConditionalGeneration"
@@ -25243,6 +25261,7 @@
     "virtualenv": {
       "packages": [
         "#transformers_dependencies# ; #engine# == \"Transformers\"",
+        "qwen-vl-utils!=0.0.9 ; #engine# == \"Transformers\"",
         "#mlx_dependencies# ; #engine# == \"MLX\"",
         "#sglang_dependencies# ; #engine# == \"sglang\"",
         "#vllm_dependencies# ; #engine# == \"vllm\"",
@@ -25569,12 +25588,13 @@
     "virtualenv": {
       "packages": [
         "#transformers_dependencies# ; #engine# == \"Transformers\"",
+        "eva-decord ; #engine# == \"Transformers\" and sys_platform == \"linux\" and platform_machine == \"x86_64\"",
         "#vllm_dependencies# ; #engine# == \"vllm\"",
         "#sglang_dependencies# ; #engine# == \"sglang\"",
         "#system_numpy# ; #engine# == \"vllm\""
       ]
     },
-    "updated_at": 1769418599,
+    "updated_at": 1784394366,
     "featured": false,
     "architectures": [
       "MiniCPMV"
@@ -26153,9 +26173,8 @@
         "mlx_dependencies ; #engine# == \"MLX\"",
         "vllm_dependencies ; #engine# == \"vllm\"",
         "sglang_dependencies ; #engine# == \"sglang\"",
-        "https://github.com/sgl-project/whl/releases/download/v0.3.20/sgl_kernel-0.3.20+cu130-cp310-abi3-manylinux2014_x86_64.whl ; #engine# == \"sglang\" and cuda_version == \"13.0\" and platform_machine == \"x86_64\"",
-        "https://github.com/sgl-project/whl/releases/download/v0.3.20/sgl_kernel-0.3.20+cu130-cp310-abi3-manylinux2014_aarch64.whl ; #engine# == \"sglang\" and cuda_version == \"13.0\" and platform_machine == \"aarch64\"",
-        "sgl_kernel ; #engine# == \"sglang\" and cuda_version < \"13.0\"",
+        "https://github.com/sgl-project/whl/releases/download/v0.3.21/sgl_kernel-0.3.21+cu130-cp310-abi3-manylinux2014_x86_64.whl ; #engine# == \"sglang\" and cuda_version == \"13.0\" and platform_machine == \"x86_64\"",
+        "https://github.com/sgl-project/whl/releases/download/v0.3.21/sgl_kernel-0.3.21+cu130-cp310-abi3-manylinux2014_aarch64.whl ; #engine# == \"sglang\" and cuda_version == \"13.0\" and platform_machine == \"aarch64\"",
         "#system_numpy# ; #engine# == \"vllm\""
       ],
       "extra_index_url": [
@@ -26168,7 +26187,7 @@
     "architectures": [
       "Glm4MoeForCausalLM"
     ],
-    "updated_at": 1778125438
+    "updated_at": 1784296176
   },
   {
     "version": 2,
@@ -26306,9 +26325,8 @@
         "mlx_dependencies ; #engine# == \"MLX\"",
         "vllm_dependencies ; #engine# == \"vllm\"",
         "sglang_dependencies ; #engine# == \"sglang\"",
-        "https://github.com/sgl-project/whl/releases/download/v0.3.20/sgl_kernel-0.3.20+cu130-cp310-abi3-manylinux2014_x86_64.whl ; #engine# == \"sglang\" and cuda_version == \"13.0\" and platform_machine == \"x86_64\"",
-        "https://github.com/sgl-project/whl/releases/download/v0.3.20/sgl_kernel-0.3.20+cu130-cp310-abi3-manylinux2014_aarch64.whl ; #engine# == \"sglang\" and cuda_version == \"13.0\" and platform_machine == \"aarch64\"",
-        "sgl_kernel ; #engine# == \"sglang\" and cuda_version < \"13.0\"",
+        "https://github.com/sgl-project/whl/releases/download/v0.3.21/sgl_kernel-0.3.21+cu130-cp310-abi3-manylinux2014_x86_64.whl ; #engine# == \"sglang\" and cuda_version == \"13.0\" and platform_machine == \"x86_64\"",
+        "https://github.com/sgl-project/whl/releases/download/v0.3.21/sgl_kernel-0.3.21+cu130-cp310-abi3-manylinux2014_aarch64.whl ; #engine# == \"sglang\" and cuda_version == \"13.0\" and platform_machine == \"aarch64\"",
         "#system_numpy# ; #engine# == \"vllm\""
       ],
       "extra_index_url": [
@@ -26320,7 +26338,7 @@
     "architectures": [
       "Glm4MoeForCausalLM"
     ],
-    "updated_at": 1770100010
+    "updated_at": 1784296177
   },
   {
     "version": 2,
@@ -30148,6 +30166,7 @@
       "packages": [
         "sglang_dependencies ; #engine# == \"sglang\"",
         "transformers>=5.2.0 ; #engine# == \"Transformers\"",
+        "qwen-vl-utils!=0.0.9 ; #engine# == \"Transformers\"",
         "qwen_omni_utils==0.0.9 ; #engine# == \"vllm\"",
         "vllm>=0.17.0 ; #engine# == \"vllm\"",
         "transformers==4.57.6 ; #engine# == \"vllm\"",
@@ -30171,7 +30190,7 @@
     ],
     "tool_parser": "qwen",
     "featured": true,
-    "updated_at": 1782995874
+    "updated_at": 1784394366
   },
   {
     "model_name": "gemma-4",
@@ -30905,6 +30924,7 @@
       "packages": [
         "sglang_dependencies ; #engine# == \"sglang\"",
         "transformers>=5.2.0 ; #engine# == \"Transformers\"",
+        "qwen-vl-utils!=0.0.9 ; #engine# == \"Transformers\"",
         "qwen_omni_utils ; #engine# == \"vllm\"",
         "vllm==0.21.0 ; #engine# == \"vllm\"",
         "ninja ; #engine# == \"vllm\"",
@@ -30927,7 +30947,7 @@
     ],
     "tool_parser": "qwen",
     "featured": false,
-    "updated_at": 1782995875
+    "updated_at": 1784394366
   },
   {
     "model_name": "MiniMax-M2.7",

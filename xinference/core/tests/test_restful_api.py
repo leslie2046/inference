@@ -1252,8 +1252,12 @@ def test_lang_chain(setup):
         ),
     ],
 )
-async def test_chat_completion_enable_thinking_injected(payload, expected):
+async def test_chat_completion_enable_thinking_injected(monkeypatch, payload, expected):
     from ...api.restful_api import RESTfulAPI
+
+    # This test exercises request-body handling, not auth; advanced auth
+    # defaults to on, so disable it to keep the dummy request unauthenticated.
+    monkeypatch.setenv("XINFERENCE_AUTH_ADVANCED", "false")
 
     api = RESTfulAPI("localhost", "localhost", 9997)
     mock_supervisor = AsyncMock()

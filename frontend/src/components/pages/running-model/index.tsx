@@ -12,6 +12,7 @@ import {
   Cpu,
   Server,
   Code,
+  RefreshCw,
 } from 'lucide-react';
 import { useRouter } from 'next/navigation';
 import { toast } from 'sonner';
@@ -70,6 +71,14 @@ const ContentItemInfo = ({ title, value }: ContentItemInfoProps) => {
       <div className="font-medium mt-1.5">{value}</div>
     </div>
   );
+};
+
+const formatGpuMemory = (bytes: number): string => {
+  const gib = bytes / 1024 ** 3;
+  if (gib >= 1) {
+    return `${gib.toFixed(2)} GiB`;
+  }
+  return `${(bytes / 1024 ** 2).toFixed(2)} MiB`;
 };
 
 const RunningModel = () => {
@@ -150,6 +159,15 @@ const RunningModel = () => {
       }));
     });
   }, []);
+
+  const handleRefresh = useCallback(() => {
+    fetchModels();
+    fetchAutostartModels();
+    if (activeModel?.id) {
+      fetchReplicas(activeModel.id);
+    }
+  }, [activeModel?.id, fetchAutostartModels, fetchModels, fetchReplicas]);
+
   const handleDeleteModel = () => {
     if (!activeModel) return;
     setDeleteConfirmLoading(true);
@@ -208,8 +226,8 @@ const RunningModel = () => {
         <EmptyState
           loading
           icon={null}
-          title="Loading models..."
-          description="Fetching the latest running model list."
+          title={t('runningModels.loadingModels')}
+          description={t('runningModels.fetchingModelList')}
         />
       );
     }
@@ -217,8 +235,8 @@ const RunningModel = () => {
       return (
         <EmptyState
           icon={<ServerOff className="size-7" />}
-          title="No running models"
-          description="Please launch a model first"
+          title={t('runningModels.noRunningModels')}
+          description={t('runningModels.launchModelFirst')}
         />
       );
     }
@@ -226,8 +244,8 @@ const RunningModel = () => {
       return (
         <EmptyState
           icon={<SearchX className="size-7" />}
-          title="No models found"
-          description="Try changing your search keywords."
+          title={t('runningModels.noModelsFound')}
+          description={t('runningModels.tryChangingSearchKeywords')}
         />
       );
     }
@@ -255,8 +273,8 @@ const RunningModel = () => {
       return (
         <EmptyState
           icon={<MousePointerClick className="size-7" />}
-          title="Select a model"
-          description="Click an item in the left list to view details."
+          title={t('runningModels.selectModel')}
+          description={t('runningModels.selectModelDescription')}
         />
       );
     }
@@ -271,7 +289,7 @@ const RunningModel = () => {
             <div className="text-muted-foreground text-xs truncate">{activeModel?.model_name}</div>
           </div>
           <div className="shrink-0 flex item-center gap-2">
-            <InfoTooltip content="Try To API">
+            <InfoTooltip content={t('runningModels.tryApi')}>
               <Button
                 type="button"
                 variant="outline"
@@ -362,6 +380,32 @@ const RunningModel = () => {
                 )
               }
             />
+            <ContentItemInfo
+              title={t('runningModels.gpuMemory')}
+              value={
+                activeModel?.gpu_memory && Object.keys(activeModel.gpu_memory).length > 0 ? (
+                  <div className="flex flex-col gap-0.5 text-xs">
+                    {Object.keys(activeModel.gpu_memory)
+                      .sort()
+                      .map((workerAddress, _, workers) => {
+                        const perGpu = activeModel.gpu_memory![workerAddress];
+                        const multiWorker = workers.length > 1;
+                        return Object.keys(perGpu)
+                          .map((k) => [Number(k), perGpu[k]] as [number, number])
+                          .sort((a, b) => a[0] - b[0])
+                          .map(([gpuIdx, bytes]) => (
+                            <span key={`${workerAddress}-${gpuIdx}`}>
+                              {multiWorker ? `${workerAddress} · ` : ''}
+                              GPU {gpuIdx}: {formatGpuMemory(bytes)}
+                            </span>
+                          ));
+                      })}
+                  </div>
+                ) : (
+                  '-'
+                )
+              }
+            />
           </div>
           <h3 className="font-medium">{t('runningModels.replicaDetail')}</h3>
           {(replicaLogs?.[activeModel.id] || []).map((replica) => (
@@ -412,7 +456,20 @@ const RunningModel = () => {
   }, [fetchAutostartModels, fetchModels]);
 
   return (
-    <PageContainer title={t('menu.runningModels')}>
+    <PageContainer
+      title={t('menu.runningModels')}
+      extraContent={
+        <Button
+          variant="outline"
+          size="icon"
+          aria-label={t('runningModels.refresh')}
+          loading={loading}
+          onClick={handleRefresh}
+        >
+          {!loading && <RefreshCw className="size-4" />}
+        </Button>
+      }
+    >
       <div className="flex gap-6 h-[calc(100vh-130px)]">
         <div className="w-80 rounded-xl bg-card text-card-foreground shadow-sm shrink-0 border border-border flex flex-col overflow-hidden overflow-y-auto">
           <div className="px-4 pt-6 pb-2 shrink-0">

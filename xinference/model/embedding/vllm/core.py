@@ -24,7 +24,7 @@ from ...utils import check_dependency_available
 from ..core import EmbeddingModel, EmbeddingModelFamilyV2, EmbeddingSpecV1
 
 logger = logging.getLogger(__name__)
-SUPPORTED_MODELS_PREFIXES = ["bge", "gte", "text2vec", "m3e", "gte", "Qwen3"]
+SUPPORTED_MODELS_PREFIXES = ["bge", "gte", "text2vec", "m3e", "Qwen3", "bce"]
 
 
 class VLLMEmbeddingModel(EmbeddingModel, BatchMixin):
@@ -299,24 +299,35 @@ class VLLMEmbeddingModel(EmbeddingModel, BatchMixin):
     ) -> Union[bool, Tuple[bool, str]]:
 
         if model_family.model_name.startswith("Qwen3-VL-Embedding"):
+            # In virtualenv mode vLLM (and a compatible version) can be
+            # installed on demand, so only the missing-library / old-version
+            # rejection is exempt here; the format/prefix compatibility checks
+            # below still apply (virtualenv cannot make an incompatible spec
+            # work).
+            from ...utils import virtual_env_allows_missing_engine
+
+            allow_missing_env = virtual_env_allows_missing_engine()
             try:
                 import vllm
                 from packaging import version
             except ImportError:
-                return False, "vLLM is not installed"
-
-            if version.parse(vllm.__version__) < version.parse("0.14.0"):
-                return (
-                    False,
-                    f"Qwen3-VL embedding requires vLLM>=0.14.0, current: {vllm.__version__}",
-                )
+                if not allow_missing_env:
+                    return False, "vLLM is not installed"
+            else:
+                if not allow_missing_env and version.parse(
+                    vllm.__version__
+                ) < version.parse("0.14.0"):
+                    return (
+                        False,
+                        f"Qwen3-VL embedding requires vLLM>=0.14.0, current: {vllm.__version__}",
+                    )
         if model_spec.model_format not in ["pytorch"]:
             return False, "vLLM embedding engine only supports pytorch format"
         prefix = model_family.model_name.split("-", 1)[0]
         if prefix not in SUPPORTED_MODELS_PREFIXES:
             return (
                 False,
-                f"Model family {model_family.model_name} is not in the supported prefix list for vLLM embeddings",
+                f"Model family {model_family.model_name} is not in the supported model prefix list for vLLM embeddings",
             )
         return True
 

@@ -52,20 +52,22 @@ from ..constants import (
     XINFERENCE_ALLOW_MULTI_REPLICA_PER_GPU,
     XINFERENCE_CACHE_DIR,
     XINFERENCE_DISABLE_HEALTH_CHECK,
-    XINFERENCE_DISABLE_METRICS,
     XINFERENCE_ENABLE_VIRTUAL_ENV,
     XINFERENCE_HEALTH_CHECK_INTERVAL,
     XINFERENCE_HOME,
     XINFERENCE_LOG_CONSOLE,
     XINFERENCE_LOG_DOWNLOAD_PROGRESS,
     XINFERENCE_MAX_CONCURRENT_LAUNCHES,
+    XINFERENCE_MODEL_ACTOR_AUTO_RECOVER_LIMIT,
     XINFERENCE_MODEL_DOWNLOAD_WORKERS,
     XINFERENCE_STATUS_GATHER_TIMEOUT,
     XINFERENCE_STATUS_REPORT_MULTIPLIER,
     XINFERENCE_SUBPOOL_LAUNCH_TIMEOUT,
     XINFERENCE_TCP_REQUEST_TIMEOUT,
     XINFERENCE_VIRTUAL_ENV_DIR,
+    XINFERENCE_VIRTUAL_ENV_OFFLINE_INSTALL,
     XINFERENCE_VIRTUAL_ENV_SKIP_INSTALLED,
+    is_metrics_disabled,
 )
 from ..core.model import ModelActor
 from ..core.status_guard import LaunchStatus
@@ -93,15 +95,19 @@ from .utils import (
     apply_engine_virtualenv_settings,
     build_subpool_envs_for_virtual_env,
     filter_virtualenv_packages_by_markers,
+    find_direct_reference_packages,
     log_async,
     log_sync,
     merge_virtual_env_packages,
     parse_replica_model_uid,
     purge_dir,
+    rewrite_direct_url_packages_for_index,
 )
 from .virtual_env_manager import VirtualEnvManager as XinferenceVirtualEnvManager
 from .virtual_env_manager import (
     expand_engine_dependency_placeholders,
+    get_engine_critical_dependency_specs,
+    get_engine_model_format_virtualenv_packages,
     is_cuda_compatible,
     resolve_virtualenv_python_path,
 )
@@ -149,13 +155,6 @@ def _exclusive_venv_path_lock(env_path: str):
         fcntl.flock(fd, fcntl.LOCK_UN)
         os.close(fd)
 
-
-MODEL_ACTOR_AUTO_RECOVER_LIMIT: Optional[int]
-_MODEL_ACTOR_AUTO_RECOVER_LIMIT = os.getenv("XINFERENCE_MODEL_ACTOR_AUTO_RECOVER_LIMIT")
-if _MODEL_ACTOR_AUTO_RECOVER_LIMIT is not None:
-    MODEL_ACTOR_AUTO_RECOVER_LIMIT = int(_MODEL_ACTOR_AUTO_RECOVER_LIMIT)
-else:
-    MODEL_ACTOR_AUTO_RECOVER_LIMIT = None
 
 # Strip test-injected envs from cached launch_args before recover.
 # All test-specific env vars MUST use the XINFERENCE_TEST_ prefix so they can be
@@ -582,7 +581,7 @@ class WorkerActor(xo.StatelessActor):
         # any process environ.
         self._model_uid_to_subpool_pids: Dict[str, Set[int]] = {}
 
-        if XINFERENCE_DISABLE_METRICS:
+        if is_metrics_disabled():
             logger.info(
                 "Worker metrics is disabled due to the environment XINFERENCE_DISABLE_METRICS=1"
             )
@@ -782,45 +781,77 @@ class WorkerActor(xo.StatelessActor):
                             self._model_uid_to_recover_count[model_uid] = (
                                 recover_count - 1
                             )
-                            await self.recover_model(launch_args)
-                        else:
-                            logger.warning("Stop recreating model actor.")
-
-                            # Worker has given up recreating; notify supervisor
-                            # to evict the dead replica from round-robin and
-                            # light up the failure gauge. add_worker=False:
-                            # only fetch the ref, do not trigger
-                            # re-registration. The whole notification --
-                            # get_supervisor_ref + mark_replica_dead -- is
-                            # wrapped in a single xo.wait_for(5s): this runs
-                            # inside the recover_sub_pool tail path, and
-                            # get_supervisor_ref itself issues blocking
-                            # xo.actor_ref calls when the cached ref is missing,
-                            # so the bound must cover both to keep a stalled
-                            # supervisor from holding up the worker's local
-                            # shutdown. A failure/timeout is non-fatal -- the
-                            # next death detection / redeploy will reconcile.
-                            async def _notify_replica_dead():
-                                supervisor_ref = await self.get_supervisor_ref(
-                                    add_worker=False
-                                )
-                                await supervisor_ref.mark_replica_dead(model_uid)
-
+                            # Symmetric to the unbounded branch below: if recreate
+                            # itself fails, evict the dead replica so it cannot sit
+                            # in a "stopping"/"error" state poisoning routing with
+                            # persistent 500s. Same launch_args would fail again, and
+                            # recover_model failure leaves no new subpool to retrigger
+                            # recover_sub_pool, so eviction (not retry) is the only
+                            # recovery. mark_replica_dead is idempotent (safe).
                             try:
-                                await xo.wait_for(
-                                    _notify_replica_dead(),
-                                    timeout=5,
-                                )
+                                await self.recover_model(launch_args)
                             except Exception:
                                 logger.warning(
-                                    "Failed to notify supervisor of dead replica %s",
+                                    "Recreate failed for %s, evicting dead replica "
+                                    "from supervisor",
                                     model_uid,
                                     exc_info=True,
                                 )
+                                await self._evict_replica_from_supervisor(model_uid)
+                        else:
+                            logger.warning("Stop recreating model actor.")
+
+                            # Bounded retries exhausted: evict the dead replica
+                            # from the supervisor's round-robin so traffic stops
+                            # routing to it. Failure/timeout is non-fatal -- the
+                            # next death detection / redeploy will reconcile.
+                            await self._evict_replica_from_supervisor(model_uid)
                     else:
                         logger.warning("Recreating model actor %s ...", model_uid)
-                        await self.recover_model(launch_args)
+                        # Unbounded branch (default, recover_count is None). If
+                        # recreate itself fails, evict the dead replica so it
+                        # cannot poison routing as a permanent "loading" zombie.
+                        # mark_replica_dead is idempotent, so this is safe.
+                        try:
+                            await self.recover_model(launch_args)
+                        except Exception:
+                            logger.warning(
+                                "Recreate failed for %s, evicting dead replica "
+                                "from supervisor",
+                                model_uid,
+                                exc_info=True,
+                            )
+                            await self._evict_replica_from_supervisor(model_uid)
                 break
+
+    async def _evict_replica_from_supervisor(self, model_uid: str) -> None:
+        """Notify the supervisor to evict a dead replica from round-robin.
+
+        Best-effort: ``get_supervisor_ref`` (``add_worker=False``, no
+        re-registration) + ``mark_replica_dead`` are wrapped in a single
+        ``xo.wait_for(5s)``. ``get_supervisor_ref`` issues blocking
+        ``xo.actor_ref`` calls when the cached ref is missing, so the bound
+        must cover both to keep a stalled supervisor from holding up the
+        worker's local shutdown. A failure/timeout is non-fatal --
+        ``mark_replica_dead`` is idempotent and the next death detection /
+        redeploy will reconcile.
+        """
+
+        async def _notify_replica_dead():
+            supervisor_ref = await self.get_supervisor_ref(add_worker=False)
+            await supervisor_ref.mark_replica_dead(model_uid)
+
+        try:
+            await xo.wait_for(
+                _notify_replica_dead(),
+                timeout=5,
+            )
+        except Exception:
+            logger.warning(
+                "Failed to notify supervisor of dead replica %s",
+                model_uid,
+                exc_info=True,
+            )
 
     @classmethod
     def default_uid(cls) -> str:
@@ -1292,7 +1323,7 @@ class WorkerActor(xo.StatelessActor):
             tmp_path = filepath + ".tmp"
             with open(tmp_path, "w") as f:
                 json.dump(data, f, ensure_ascii=False)
-            os.rename(tmp_path, filepath)
+            os.replace(tmp_path, filepath)
             logger.debug(
                 "Persisted launch_args for %d models to %s", len(data), filepath
             )
@@ -1315,7 +1346,7 @@ class WorkerActor(xo.StatelessActor):
                 tmp_path = filepath + ".tmp"
                 with open(tmp_path, "w") as f:
                     json.dump(data, f, ensure_ascii=False)
-                os.rename(tmp_path, filepath)
+                os.replace(tmp_path, filepath)
         except Exception:
             logger.warning("Failed to update persisted launch_args", exc_info=True)
 
@@ -1384,6 +1415,12 @@ class WorkerActor(xo.StatelessActor):
                         sorted(_stripped),
                     )
                 await self.launch_builtin_model(**launch_args)
+                # Mark the recovered replica ready, mirroring the normal launch
+                # path. Same gap as recover_model: launch_builtin_model leaves
+                # model_state="loading"; without this, models recovered on worker
+                # restart stay "loading" forever. Idempotent if the supervisor
+                # also reconciles on reconnect.
+                await self.wait_for_load(model_uid)
                 recovered += 1
             except Exception:
                 logger.error(
@@ -1601,15 +1638,26 @@ class WorkerActor(xo.StatelessActor):
                     )
                 raise
 
-    async def _create_subpool(
+    async def _allocate_subpool_devices(
         self,
         model_uid: str,
         model_type: Optional[str] = None,
         n_gpu: Optional[Union[int, str]] = "auto",
         gpu_idx: Optional[List[int]] = None,
         env: Optional[Dict[str, str]] = None,
-        start_python: Optional[str] = None,
-    ) -> Tuple[str, List[str]]:
+    ) -> Tuple[Dict[str, str], List[str]]:
+        """Reserve GPU devices for a model launch and build the sub-pool env.
+
+        Split out of _create_subpool so callers can reserve devices before a
+        lengthy preparation phase (model download, virtualenv install).
+        allocate_devices/allocate_devices_with_gpu_idx record the reservation
+        synchronously in self._gpu_to_model_uids /
+        self._user_specified_gpu_to_model_uids. Concurrent launches (up to
+        XINFERENCE_MAX_CONCURRENT_LAUNCHES) must see that reservation
+        immediately for idle-first placement and multi-replica load
+        balancing to work; deferring allocation until after preparation lets
+        them all race for the same "idle" GPU snapshot instead.
+        """
         env = {} if env is None else env
         devices = []
         env_name = get_available_device_env_name() or "CUDA_VISIBLE_DEVICES"
@@ -1636,6 +1684,17 @@ class WorkerActor(xo.StatelessActor):
         # here lets the sub-pool and its vLLM descendants inherit the tag.
         env["XINFERENCE_MODEL_UID"] = model_uid
 
+        return env, [str(dev) for dev in devices]
+
+    async def _spawn_subpool(
+        self,
+        model_uid: str,
+        env: Dict[str, str],
+        devices: List[str],
+        start_python: Optional[str] = None,
+    ) -> str:
+        """Spawn the model sub-pool process for devices already reserved by
+        _allocate_subpool_devices."""
         # H2: pre-launch VRAM recheck. _cleanup_gpu_orphans_on_startup runs at
         # worker start, but orphans may appear between startup and this launch
         # (e.g. another worker on the same host died). If free VRAM on the
@@ -1712,7 +1771,30 @@ class WorkerActor(xo.StatelessActor):
             self.release_devices(model_uid=model_uid)
             raise
         await self._ensure_subpool_monitor()
-        return subpool_address, [str(dev) for dev in devices]
+        return subpool_address
+
+    async def _create_subpool(
+        self,
+        model_uid: str,
+        model_type: Optional[str] = None,
+        n_gpu: Optional[Union[int, str]] = "auto",
+        gpu_idx: Optional[List[int]] = None,
+        env: Optional[Dict[str, str]] = None,
+        start_python: Optional[str] = None,
+    ) -> Tuple[str, List[str]]:
+        """Allocate devices and spawn the sub-pool in one call.
+
+        Convenience wrapper combining _allocate_subpool_devices and
+        _spawn_subpool for callers that don't need to split allocation from
+        spawning (e.g. launch paths with no intervening preparation phase).
+        """
+        subpool_env, devices = await self._allocate_subpool_devices(
+            model_uid, model_type, n_gpu=n_gpu, gpu_idx=gpu_idx, env=env
+        )
+        subpool_address = await self._spawn_subpool(
+            model_uid, subpool_env, devices, start_python=start_python
+        )
+        return subpool_address, devices
 
     def _check_model_is_valid(self, model_name: str, model_format: Optional[str]):
         # baichuan-base and baichuan-chat depend on `cpm_kernels` module,
@@ -2478,6 +2560,75 @@ class WorkerActor(xo.StatelessActor):
 
             return virtual_env_manager
 
+    @staticmethod
+    def _is_cuda_device_available() -> bool:
+        """
+        Whether a usable CUDA device is actually present.
+
+        ``get_cuda_version()`` reports ``torch.version.cuda`` (the version the
+        installed PyTorch was built against), which is set even on a CPU-only
+        host with a CUDA-built torch. Selecting a GPU wheel off that alone
+        installs a wheel whose ``libcuda.so.1`` cannot be loaded at import time.
+        Gate the GPU path on real device availability instead.
+        """
+        try:
+            from xoscar.virtualenv.platform import check_cuda_available
+
+            return bool(check_cuda_available())
+        except Exception:
+            try:
+                import torch
+
+                return bool(torch.cuda.is_available())
+            except Exception:
+                return False
+
+    @staticmethod
+    def _uninstall_venv_package(
+        virtual_env_manager: "VirtualEnvManager", package: str
+    ) -> None:
+        """
+        Uninstall a package from the virtual environment, if present.
+
+        Used to force a fresh install of a package whose currently-installed
+        build must be replaced (e.g. swapping a CPU xllamacpp wheel for the GPU
+        wheel, which shares the same version number). Failures are logged and
+        swallowed so a missing package or uninstall hiccup does not abort the
+        launch.
+        """
+        import subprocess
+
+        from .virtual_env_manager import resolve_virtualenv_python_path
+
+        venv_python = resolve_virtualenv_python_path(virtual_env_manager)
+        if not venv_python:
+            return
+        try:
+            subprocess.run(
+                [venv_python, "-m", "pip", "uninstall", "-y", package],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        except Exception as e:  # pragma: no cover - best effort cleanup
+            logger.warning("Failed to uninstall %s from virtual env: %s", package, e)
+
+    @staticmethod
+    def _resolve_virtualenv_model_format(
+        model: Any, requested_model_format: Optional[str]
+    ) -> Optional[str]:
+        """Return the concrete format selected while creating ``model``."""
+        model_family = getattr(model, "model_family", None)
+        model_specs = getattr(model_family, "model_specs", None)
+        if model_specs:
+            resolved_model_format = getattr(model_specs[0], "model_format", None)
+            if resolved_model_format:
+                return resolved_model_format
+
+        model_spec = getattr(model, "model_spec", None)
+        resolved_model_format = getattr(model_spec, "model_format", None)
+        return resolved_model_format or requested_model_format
+
     @classmethod
     def _prepare_virtual_env(
         cls,
@@ -2487,8 +2638,11 @@ class WorkerActor(xo.StatelessActor):
         model_engine: Optional[str],
         model_name: Optional[str] = None,
         architectures: Optional[List[str]] = None,
+        model_format: Optional[str] = None,
     ):
-        engine_defaults: List[str] = []
+        engine_defaults = get_engine_model_format_virtualenv_packages(
+            model_engine, model_format
+        )
         if (
             (not settings or not settings.packages)
             and not virtual_env_packages
@@ -2518,6 +2672,11 @@ class WorkerActor(xo.StatelessActor):
             for k, v in pip_config.items():
                 if hasattr(settings, k) and not getattr(settings, k):
                     setattr(settings, k, v)
+
+        # An extra index present at this point was configured explicitly — by
+        # the model spec or inherited pip config (e.g. an offline/private
+        # mirror) — as opposed to the engine defaults applied below.
+        user_configured_extra_index = settings.extra_index_url is not None
 
         apply_engine_virtualenv_settings(settings, model_engine)
 
@@ -2564,6 +2723,19 @@ class WorkerActor(xo.StatelessActor):
         if system_cuda_urls:
             if settings.extra_index_url is None:
                 settings.extra_index_url = system_cuda_urls
+            elif user_configured_extra_index:
+                # An explicitly configured extra index (model spec or inherited
+                # pip config, e.g. an offline/private mirror) stays
+                # authoritative: uv treats an unreachable extra index as fatal
+                # instead of falling back, so forcing the public CUDA wheel
+                # index here would break air-gapped deployments even when the
+                # wheels exist on the private index.
+                logger.info(
+                    "Skipping auto-configured PyTorch wheel URL %s: explicitly "
+                    "configured extra index takes precedence: %s",
+                    system_cuda_urls,
+                    settings.extra_index_url,
+                )
             else:
                 # Merge with existing extra_index_url, system URLs first for priority
                 existing_urls = (
@@ -2593,15 +2765,109 @@ class WorkerActor(xo.StatelessActor):
                 f"[DEBUG] CUDA version check passed: cuda_version={cuda_version}, keeping settings.extra_index_url={settings.extra_index_url}"
             )
 
+        # For the llama.cpp engine, xllamacpp ships CPU wheels on PyPI and GPU
+        # wheels on a self-hosted per-CUDA index. When a compatible CUDA runtime
+        # is detected, install from the matching GPU index so the GPU build is
+        # pulled instead of the default CPU build.
+        #
+        # The GPU index is used exclusively: it becomes the sole index_url and
+        # any inherited index/extra-index/find-links (e.g. a Tencent/Tsinghua
+        # PyPI mirror pulled in via inherit_pip_config) is dropped for this
+        # install. This is required for correctness: PyPI (and its mirrors)
+        # only carry the CPU build of xllamacpp, and the CPU and GPU wheels
+        # share the same version number, so leaving a mirror in the resolution
+        # set lets the resolver satisfy "xllamacpp" with the CPU wheel -- the
+        # user then gets a CPU runtime while believing the GPU build was
+        # installed. Restricting to the GPU index guarantees the GPU wheel (or a
+        # visible failure). xllamacpp GPU wheels are self-contained abi3 wheels
+        # with no required runtime dependencies, so an exclusive index does not
+        # break resolution.
+        force_reinstall_xllamacpp = False
+        if model_engine and model_engine.lower() == "llama.cpp":
+            from .virtual_env_manager import get_xllamacpp_cuda_index_url
+
+            xllamacpp_index_url = get_xllamacpp_cuda_index_url(cuda_version)
+            # Only switch to the GPU wheel when a CUDA device is actually usable.
+            # cuda_version reflects the PyTorch build, not device availability,
+            # so a CPU-only host with a CUDA-built torch would otherwise get a
+            # GPU wheel that fails to import (missing libcuda.so.1). In that
+            # case keep the default CPU index and behavior.
+            cuda_device_available = bool(
+                xllamacpp_index_url and cls._is_cuda_device_available()
+            )
+            if XINFERENCE_VIRTUAL_ENV_OFFLINE_INSTALL and cuda_device_available:
+                logger.warning(
+                    "Explicit offline-install mode cannot use the xllamacpp "
+                    "GPU wheel index %s; installing the CPU build from the "
+                    "configured private index instead. Preinstall the matching "
+                    "GPU wheel in a custom runtime image to retain llama.cpp "
+                    "GPU acceleration offline.",
+                    xllamacpp_index_url,
+                )
+            elif xllamacpp_index_url and cuda_device_available:
+                logger.info(
+                    "Detected CUDA %s, installing GPU build of xllamacpp "
+                    "exclusively from %s",
+                    cuda_version,
+                    xllamacpp_index_url,
+                )
+                settings.index_url = xllamacpp_index_url
+                settings.extra_index_url = None
+                settings.find_links = None
+                settings.index_strategy = None
+                # A CPU build of xllamacpp may already satisfy the
+                # "xllamacpp>=..." requirement (e.g. inherited from the parent
+                # env, or installed on a previous CPU-only launch). Because the
+                # CPU and GPU wheels share the same version, the skip-installed
+                # filter would drop the requirement before uv ever sees the GPU
+                # index, leaving the CPU build in place. Uninstall it first and
+                # force this install so the GPU wheel actually replaces it.
+                force_reinstall_xllamacpp = True
+
         packages = filter_virtualenv_packages_by_markers(
             packages, model_engine, cuda_version
         )
+
+        critical_specs = get_engine_critical_dependency_specs(model_engine, packages)
+        if critical_specs:
+            logger.info(
+                "Engine %s will be inherited from the parent environment whose "
+                "copies of its critical dependencies do not satisfy the "
+                "engine's declared requirements; installing %s into the venv",
+                model_engine,
+                critical_specs,
+            )
+            packages = packages + critical_specs
+
+        if XINFERENCE_VIRTUAL_ENV_OFFLINE_INSTALL:
+            if not settings.index_url:
+                raise ValueError(
+                    "XINFERENCE_VIRTUAL_ENV_OFFLINE_INSTALL=1 requires a "
+                    "private index_url (configure the offline pip.conf)"
+                )
+            # This explicit flag distinguishes the bundled offline mirror from
+            # an ordinary user-configured PyPI proxy. Rewriting merely because
+            # index_url is present breaks online users whose mirror does not
+            # carry the direct wheel.
+            packages = rewrite_direct_url_packages_for_index(packages)
+            direct_references = find_direct_reference_packages(packages)
+            if direct_references:
+                raise ValueError(
+                    "Offline virtualenv installation does not support "
+                    "non-wheel direct references; preinstall or replace these "
+                    f"requirements: {direct_references}"
+                )
 
         conf = dict(settings)
         conf.pop("packages", None)
         conf.pop("inherit_pip_config", None)
         if XINFERENCE_VIRTUAL_ENV_SKIP_INSTALLED:
             conf["skip_installed"] = XINFERENCE_VIRTUAL_ENV_SKIP_INSTALLED
+        if force_reinstall_xllamacpp:
+            # Bypass the satisfied-package filter so uv is actually invoked with
+            # the GPU index even when a same-version CPU wheel is already
+            # present.
+            conf["skip_installed"] = False
         variables = {}
         if model_engine:
             engine_value = model_engine.lower()
@@ -2615,6 +2881,8 @@ class WorkerActor(xo.StatelessActor):
             ", ".join([f"{k}={v}" for k, v in conf.items() if v]),
         )
         with _exclusive_venv_path_lock(str(virtual_env_manager.env_path)):
+            if force_reinstall_xllamacpp:
+                cls._uninstall_venv_package(virtual_env_manager, "xllamacpp")
             virtual_env_manager.install_packages(packages, **conf, **variables)
 
             # Post-install: flashinfer AOT workaround for sm_120 Blackwell.
@@ -2626,13 +2894,19 @@ class WorkerActor(xo.StatelessActor):
             # See optimize/20260702/2026070209.md
             from .virtual_env_manager import apply_flashinfer_aot_post_install
 
-            apply_flashinfer_aot_post_install(
-                model_engine,
-                architectures,
-                virtual_env_manager,
-                conf,
-                cuda_version,
-            )
+            if XINFERENCE_VIRTUAL_ENV_OFFLINE_INSTALL:
+                logger.info(
+                    "Skipping the FlashInfer AOT post-install from its public "
+                    "wheel index in explicit offline-install mode"
+                )
+            else:
+                apply_flashinfer_aot_post_install(
+                    model_engine,
+                    architectures,
+                    virtual_env_manager,
+                    conf,
+                    cuda_version,
+                )
 
         # Apply engine-specific post-install patches
         if model_engine and model_engine.lower() == "vllm":
@@ -2836,21 +3110,55 @@ class WorkerActor(xo.StatelessActor):
                     subpool_envs = build_subpool_envs_for_virtual_env(
                         envs, enable_virtual_env, virtual_env_manager
                     )
-                    subpool_address, devices = await self._create_subpool(
+                    # Reserve devices now (before download/virtualenv
+                    # install): allocate_devices/allocate_devices_with_gpu_idx
+                    # record the reservation synchronously, so concurrent
+                    # launches (up to XINFERENCE_MAX_CONCURRENT_LAUNCHES) see
+                    # each other's picks for idle-first placement and
+                    # multi-replica load balancing instead of all racing to
+                    # allocate off the same stale snapshot once their prep
+                    # phase finishes.
+                    subpool_alloc_env, devices = await self._allocate_subpool_devices(
                         model_uid,
                         model_type,
                         n_gpu=n_gpu,
                         gpu_idx=gpu_idx,
-                        start_python=subpool_python_path,
                         env=subpool_envs,
                     )
-                    all_subpool_addresses = [subpool_address]
+                    # The model subprocess itself must not be spawned before
+                    # the virtualenv is populated: the subprocess boots on
+                    # the venv's python, and base libraries imported during
+                    # its bootstrap (numpy, and torch via xinference's own
+                    # import chain) are cached in sys.modules from whatever
+                    # is visible at that moment — packages installed
+                    # afterwards cannot replace them. Spawning before install
+                    # therefore made the first launch after a venv (re)build
+                    # fail with host/venv version mixes (e.g. venv numba vs
+                    # host numpy, venv torchvision vs host torch).
+                    # Single-worker launches defer only the spawn (not the
+                    # device reservation above) until after
+                    # _prepare_virtual_env; sharded multi-worker launches
+                    # need the subpool address inside model_kwargs before
+                    # model instantiation, so they still spawn immediately.
+                    subpool_address: Optional[str] = None
+                    all_subpool_addresses: List[str] = []
                     try:
+                        # Multi-worker/sharded launches spawn the subpool up
+                        # front (the address is needed in model_kwargs before
+                        # model instantiation). Keep it inside the try so a
+                        # failure here is caught below and release_devices +
+                        # subpool cleanup run, avoiding GPU/subpool leaks.
+                        if n_worker > 1:  # type: ignore
+                            subpool_address = await self._spawn_subpool(
+                                model_uid,
+                                subpool_alloc_env,
+                                devices,
+                                start_python=subpool_python_path,
+                            )
+                            all_subpool_addresses.append(subpool_address)
                         xavier_config: Optional[Dict] = kwargs.pop(
                             "xavier_config", None
                         )
-                        if xavier_config is not None:
-                            xavier_config["rank_address"] = subpool_address
                         model_kwargs = kwargs.copy()
                         model_kwargs["enable_virtual_env"] = enable_virtual_env
                         if n_worker > 1:  # type: ignore
@@ -2940,8 +3248,6 @@ class WorkerActor(xo.StatelessActor):
                                         )
                                     else:
                                         os.environ.pop("HF_HUB_DOWNLOAD_WORKERS", None)
-                            model.model_family.address = subpool_address
-                            model.model_family.accelerators = devices
                             model.model_family.multimodal_projector = model_kwargs.get(
                                 "multimodal_projector", None
                             )
@@ -2975,11 +3281,30 @@ class WorkerActor(xo.StatelessActor):
                                     "_resolve_architectures",
                                     lambda: None,
                                 )(),
+                                model_format=self._resolve_virtualenv_model_format(
+                                    model, model_format
+                                ),
                             )
                             launch_info.virtual_env_manager = virtual_env_manager
 
-                        # check before creating model actor
+                        # check before creating subpool and model actor
                         check_cancel()
+
+                        if subpool_address is None:
+                            # Devices were already reserved above; only spawn
+                            # the subprocess now that the virtualenv (if any)
+                            # is installed.
+                            subpool_address = await self._spawn_subpool(
+                                model_uid,
+                                subpool_alloc_env,
+                                devices,
+                                start_python=subpool_python_path,
+                            )
+                            all_subpool_addresses.append(subpool_address)
+                        if xavier_config is not None:
+                            xavier_config["rank_address"] = subpool_address
+                        model.model_family.address = subpool_address
+                        model.model_family.accelerators = devices
 
                         model_ref = await xo.create_actor(
                             ModelActor,
@@ -3078,7 +3403,7 @@ class WorkerActor(xo.StatelessActor):
                     )
                     self._model_uid_to_addr[model_uid] = subpool_address
                     self._model_uid_to_recover_count.setdefault(
-                        model_uid, MODEL_ACTOR_AUTO_RECOVER_LIMIT
+                        model_uid, XINFERENCE_MODEL_ACTOR_AUTO_RECOVER_LIMIT
                     )
                     self._model_uid_to_launch_args[model_uid] = launch_args
                     # §4.3: Persist for auto-recovery on restart
@@ -3820,3 +4145,10 @@ class WorkerActor(xo.StatelessActor):
             await supervisor_ref.call_collective_manager(
                 origin_uid, "register_rank", rank, subpool_address, update=True
             )
+        # Mark the recreated replica ready, mirroring the normal launch path
+        # (supervisor calls wait_for_load after launch). Without this the worker
+        # keeps model_state="loading" forever (set in launch_builtin_model), so
+        # get_model raises ModelNotReadyError and the recreated replica is a
+        # permanent "loading" zombie -- the original 33% symptom. launch_builtin_model
+        # already awaited model_ref.load(), so wait_for_load is near-instant here.
+        await self.wait_for_load(rep_model_uid)

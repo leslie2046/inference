@@ -14,6 +14,7 @@
 import base64
 import logging
 import os
+import re
 import secrets
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
@@ -29,8 +30,6 @@ from .crypto import (
     aes_encrypt,
     derive_encryption_key,
     generate_api_key,
-    generate_password,
-    get_password_hash,
     sha256_hex,
     verify_password,
 )
@@ -70,6 +69,26 @@ def _get_client_ip(request: Request) -> str:
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token", auto_error=False)
 
+# Full permission set granted to the account created through the initial
+# setup flow (POST /v1/admin/setup). Kept as a module-level constant so
+# routes.py can reuse it without duplicating the list.
+INITIAL_ADMIN_PERMISSIONS = [
+    "admin",
+    "models:list",
+    "models:read",
+    "models:write",
+    "models:register",
+    "keys:create",
+    "keys:manage",
+    "users:manage",
+    "cache:list",
+    "cache:delete",
+    "virtualenv:list",
+    "virtualenv:delete",
+    "logs:list",
+    "monitor:view",
+]
+
 try:
     ACCESS_TOKEN_EXPIRE_MINUTES = int(
         os.environ.get("XINFERENCE_ACCESS_TOKEN_EXPIRE_MINUTES", "30")
@@ -86,6 +105,23 @@ except (TypeError, ValueError):
 REFRESH_TOKEN_EXPIRE_DAYS = 7
 JWT_ALGORITHM = "HS256"
 
+# Matches the self-service password-change endpoint,
+# PUT /v1/admin/users/{user_id}/password. Anchored on the trailing segments so
+# it is independent of any router mount prefix.
+_PASSWORD_CHANGE_PATH_RE = re.compile(r"^.*/users/(\d+)/password$")
+
+try:
+    PASSWORD_MIN_LENGTH = int(os.environ.get("XINFERENCE_PASSWORD_MIN_LENGTH", "8"))
+    if PASSWORD_MIN_LENGTH <= 0:
+        raise ValueError("must be positive")
+except (TypeError, ValueError):
+    logger.warning(
+        "XINFERENCE_PASSWORD_MIN_LENGTH must be a positive integer (got %r); "
+        "falling back to 8.",
+        os.environ.get("XINFERENCE_PASSWORD_MIN_LENGTH"),
+    )
+    PASSWORD_MIN_LENGTH = 8
+
 
 class AdvancedAuthService:
     def __init__(self, db_path: str, jwt_secret_key: str, encryption_key: str):
@@ -93,7 +129,6 @@ class AdvancedAuthService:
         self._jwt_secret_key = jwt_secret_key
         self._encryption_key = derive_encryption_key(encryption_key)
         self._cache = ApiKeyCache(self._db)
-        self._init_admin()
 
         try:
             from .rate_limiter import RateLimiter
@@ -110,53 +145,21 @@ class AdvancedAuthService:
     def cache(self) -> ApiKeyCache:
         return self._cache
 
-    def _init_admin(self):
-        if self._db.user_count() == 0:
-            password = generate_password()
-            password_hash = get_password_hash(password)
-            admin_perms = [
-                "admin",
-                "models:list",
-                "models:read",
-                "models:write",
-                "models:register",
-                "keys:create",
-                "keys:manage",
-                "users:manage",
-                "cache:list",
-                "cache:delete",
-                "virtualenv:list",
-                "virtualenv:delete",
-                "logs:list",
-                "monitor:view",
-            ]
-            self._db.create_user(
-                username="admin",
-                password_hash=password_hash,
-                source="local",
-                enabled=1,
-                must_change_password=1,
-                permissions=admin_perms,
-            )
-            logger.warning(
-                "\n" + "=" * 60 + "\n"
-                "  INITIAL ADMIN CREDENTIALS (shown only once)\n"
-                "  Username: admin\n"
-                "  Password: %s\n"
-                "  Please change the password on first login.\n" + "=" * 60,
-                password,
-            )
+    def needs_setup(self) -> bool:
+        """True until the first admin account is created via /v1/admin/setup."""
+        return self._db.user_count() == 0
 
     # --- JWT ---
 
     def create_access_token(
-        self, user_id: int, username: str, scopes: List[str]
+        self, user_id: int, username: str, scopes: List[str], token_version: int = 0
     ) -> str:
         expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
         payload = {
             "sub": username,
             "user_id": user_id,
             "scopes": scopes,
+            "token_version": token_version,
             "exp": expire,
             "type": "access",
         }
@@ -181,6 +184,19 @@ class AdvancedAuthService:
             )
             if payload.get("type") != "access":
                 return None
+            # Reject tokens whose embedded version is stale (e.g. minted before
+            # a password reset, which bumps the user's token_version). This is
+            # checked against the database on every request so a reset -- even
+            # one done out-of-band by the offline reset command -- immediately
+            # invalidates access tokens issued beforehand, rather than letting
+            # them live on with their scopes until expiry.
+            user_id = payload.get("user_id")
+            if user_id is not None:
+                current_version = self._db.get_user_token_version(user_id)
+                if current_version is None:
+                    return None
+                if payload.get("token_version", 0) != current_version:
+                    return None
             return payload
         except JWTError:
             return None
@@ -199,12 +215,30 @@ class AdvancedAuthService:
             self._db.delete_refresh_token(token_hash)
             return None
 
-        # Token rotation: invalidate old token, issue new one
-        self._db.delete_refresh_token(token_hash)
-        new_refresh_token = self.create_refresh_token(user["id"])
+        # Token rotation: delete the old token and issue a new one atomically.
+        # Doing this in a single BEGIN IMMEDIATE transaction serializes it
+        # against a concurrent password reset (which revokes all of the user's
+        # tokens in its own BEGIN IMMEDIATE transaction), so a rotation that
+        # started before the reset cannot leave a live token behind it
+        # (see security report, Finding 4).
+        new_refresh_token = secrets.token_urlsafe(64)
+        new_token_hash = sha256_hex(new_refresh_token)
+        new_expires_at = (
+            datetime.utcnow() + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
+        ).isoformat()
+        rotated = self._db.rotate_refresh_token(
+            token_hash, new_token_hash, new_expires_at
+        )
+        if rotated is None:
+            # The token was revoked (e.g. by a password reset) between our read
+            # above and taking the write lock. Refuse to mint a new session.
+            return None
 
         access_token = self.create_access_token(
-            user["id"], user["username"], user["permissions"]
+            user["id"],
+            user["username"],
+            user["permissions"],
+            user.get("token_version", 0),
         )
         return {
             "access_token": access_token,
@@ -239,7 +273,10 @@ class AdvancedAuthService:
                 headers={"WWW-Authenticate": "Bearer"},
             )
         access_token = self.create_access_token(
-            user["id"], user["username"], user["permissions"]
+            user["id"],
+            user["username"],
+            user["permissions"],
+            user.get("token_version", 0),
         )
         refresh_token = self.create_refresh_token(user["id"])
         result: Dict[str, Any] = {
@@ -317,6 +354,16 @@ class AdvancedAuthService:
         return aes_decrypt(encrypted, self._encryption_key)
 
     # --- FastAPI dependency (callable) ---
+
+    @staticmethod
+    def _is_own_password_change(request: Request, user_id: int) -> bool:
+        """True only for ``PUT /v1/admin/users/{user_id}/password`` targeting
+        the caller's own account -- the single request a must_change_password
+        user is allowed to make."""
+        if request.method != "PUT":
+            return False
+        match = _PASSWORD_CHANGE_PATH_RE.match(request.url.path)
+        return match is not None and int(match.group(1)) == user_id
 
     async def __call__(
         self,
@@ -508,6 +555,25 @@ class AdvancedAuthService:
                     auth_type="api_key",
                 )
                 raise credentials_exception
+            # Finding 5: enforce must_change_password on the API-key path too.
+            # An API key cannot change a password (it may only reach model
+            # endpoints), so a key owned by a still-flagged account is blocked
+            # outright until the owner clears the flag via a JWT password
+            # change. Without this, a legacy must_change_password=1 account's
+            # existing API key would keep working, bypassing the JWT gate.
+            if user_obj.get("must_change_password"):
+                _audit(
+                    "must_change_password",
+                    user=_username,
+                    key_name=api_key_entry.name or "",
+                    key_prefix=api_key_entry.key_prefix,
+                    auth_type="api_key",
+                )
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Password change required before using this account.",
+                    headers={"WWW-Authenticate": authenticate_value},
+                )
             # Success — reset counters
             if client_ip and self._rate_limiter:
                 self._rate_limiter.reset_key(client_ip, api_key_entry.key_id)
@@ -556,6 +622,22 @@ class AdvancedAuthService:
         if not user["enabled"]:
             _audit("user_disabled", user=username or "", auth_type="jwt")
             raise credentials_exception
+
+        # Finding 5: enforce must_change_password server-side. A user still
+        # flagged for a forced password change may do nothing except set a new
+        # password on their own account -- not even the admin bypass below is
+        # reached first. This gates existing accounts (e.g. rows migrated from
+        # an older database) regardless of how they were created, so the flag
+        # is not merely an informational hint returned to the frontend.
+        if user.get("must_change_password") and not self._is_own_password_change(
+            request, user["id"]
+        ):
+            _audit("must_change_password", user=username or "", auth_type="jwt")
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Password change required before using this account.",
+                headers={"WWW-Authenticate": authenticate_value},
+            )
 
         if "admin" in token_scopes:
             _category = (

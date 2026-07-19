@@ -13,6 +13,7 @@
 # limitations under the License.
 import asyncio
 import itertools
+from types import SimpleNamespace
 from typing import Any, List, Optional, Tuple, Union
 
 import pytest
@@ -850,6 +851,127 @@ def test_prepare_virtual_env_inherit_pip_config(monkeypatch):
     assert kwargs["index_url"] == "https://example.invalid/simple"
 
 
+def test_prepare_virtual_env_normal_pip_mirror_keeps_direct_wheel(monkeypatch):
+    manager = DummyVirtualEnvManager()
+    direct_wheel = "https://example.invalid/" "pkg-1.0.0-py3-none-any.whl"
+    settings = VirtualEnvSettings(
+        packages=[direct_wheel],
+        inherit_pip_config=False,
+        index_url="https://pypi-mirror.example/simple",
+    )
+    monkeypatch.setattr(
+        "xinference.core.worker.XINFERENCE_VIRTUAL_ENV_OFFLINE_INSTALL", False
+    )
+
+    WorkerActor._prepare_virtual_env(manager, settings, None, model_engine=None)
+
+    packages, _ = manager.calls[0]
+    assert packages == [direct_wheel]
+
+
+def test_prepare_virtual_env_offline_mirror_rewrites_direct_wheel(monkeypatch):
+    manager = DummyVirtualEnvManager()
+    direct_wheel = "https://example.invalid/" "pkg-1.0.0-py3-none-any.whl"
+    settings = VirtualEnvSettings(
+        packages=[direct_wheel],
+        inherit_pip_config=False,
+        index_url="http://xinference-pypiserver:8080/simple",
+    )
+    monkeypatch.setattr(
+        "xinference.core.worker.XINFERENCE_VIRTUAL_ENV_OFFLINE_INSTALL", True
+    )
+
+    WorkerActor._prepare_virtual_env(manager, settings, None, model_engine=None)
+
+    packages, _ = manager.calls[0]
+    assert packages == ["pkg==1.0.0"]
+
+
+def test_prepare_virtual_env_offline_mirror_rejects_git_source(monkeypatch):
+    manager = DummyVirtualEnvManager()
+    settings = VirtualEnvSettings(
+        packages=["diffusers @ git+https://github.com/huggingface/diffusers"],
+        inherit_pip_config=False,
+        index_url="http://xinference-pypiserver:8080/simple",
+    )
+    monkeypatch.setattr(
+        "xinference.core.worker.XINFERENCE_VIRTUAL_ENV_OFFLINE_INSTALL", True
+    )
+
+    with pytest.raises(ValueError, match="non-wheel direct references"):
+        WorkerActor._prepare_virtual_env(manager, settings, None, model_engine=None)
+
+    assert manager.calls == []
+
+
+def test_prepare_virtual_env_offline_sglang_engine_dispatch(monkeypatch):
+    manager = DummyVirtualEnvManager()
+    private_index = "http://xinference-pypiserver:8080/simple"
+    settings = VirtualEnvSettings(
+        packages=["#sglang_dependencies#"],
+        inherit_pip_config=False,
+        index_url=private_index,
+        extra_index_url=private_index,
+    )
+    monkeypatch.setattr(
+        "xinference.core.worker.XINFERENCE_VIRTUAL_ENV_OFFLINE_INSTALL", True
+    )
+    monkeypatch.setattr("xoscar.virtualenv.platform.get_cuda_version", lambda: "13.0")
+    monkeypatch.setattr("xinference.core.utils.platform.machine", lambda: "x86_64")
+    monkeypatch.setattr(
+        "xinference.core.worker.get_engine_critical_dependency_specs",
+        lambda *_args, **_kwargs: [],
+    )
+
+    WorkerActor._prepare_virtual_env(
+        manager,
+        settings,
+        None,
+        model_engine="sglang",
+    )
+
+    packages, kwargs = manager.calls[0]
+    assert "sglang>=0.5.6" in packages
+    assert "sgl_kernel==0.3.21+cu130" in packages
+    assert "sgl_kernel" not in packages
+    assert all("github.com/sgl-project" not in package for package in packages)
+    assert kwargs["index_url"] == private_index
+    assert kwargs["extra_index_url"] == private_index
+    assert kwargs["engine"] == "sglang"
+
+
+def test_prepare_virtual_env_offline_llama_cpp_warns_cpu_fallback(monkeypatch, caplog):
+    manager = DummyVirtualEnvManager()
+    private_index = "http://xinference-pypiserver:8080/simple"
+    settings = VirtualEnvSettings(
+        packages=["xllamacpp>=0.2.6"],
+        inherit_pip_config=False,
+        index_url=private_index,
+        extra_index_url=private_index,
+    )
+    monkeypatch.setattr(
+        "xinference.core.worker.XINFERENCE_VIRTUAL_ENV_OFFLINE_INSTALL", True
+    )
+    monkeypatch.setattr("xoscar.virtualenv.platform.get_cuda_version", lambda: "13.0")
+    monkeypatch.setattr(WorkerActor, "_is_cuda_device_available", lambda: True)
+    monkeypatch.setattr(
+        "xinference.core.worker.get_engine_critical_dependency_specs",
+        lambda *_args, **_kwargs: [],
+    )
+
+    WorkerActor._prepare_virtual_env(
+        manager,
+        settings,
+        None,
+        model_engine="llama.cpp",
+    )
+
+    packages, kwargs = manager.calls[0]
+    assert packages == ["xllamacpp>=0.2.6"]
+    assert kwargs["index_url"] == private_index
+    assert "installing the CPU build" in caplog.text
+
+
 def test_prepare_virtual_env_keeps_system_markers():
     manager = DummyVirtualEnvManager()
     settings = VirtualEnvSettings(
@@ -875,6 +997,80 @@ def test_prepare_virtual_env_keeps_system_markers():
     ]
 
 
+def test_prepare_virtual_env_system_torch_respects_configured_extra_index(monkeypatch):
+    # Regression test: an explicitly configured extra index (e.g. an
+    # offline/private mirror inherited from pip config) must not be overridden
+    # by the auto-configured public CUDA wheel index when the package list
+    # contains a #system_torch# marker — uv treats an unreachable extra index
+    # as fatal, breaking air-gapped deployments.
+    import importlib.metadata
+
+    from ..virtual_env_manager import PYTORCH_PACKAGES
+
+    manager = DummyVirtualEnvManager()
+    settings = VirtualEnvSettings(
+        packages=["#system_torch#"],
+        inherit_pip_config=True,
+    )
+
+    private_index = "http://pypiserver:8080/simple"
+    monkeypatch.setattr(
+        "xinference.core.worker.get_pip_config_args",
+        lambda: {"index_url": private_index, "extra_index_url": private_index},
+    )
+    real_version = importlib.metadata.version
+    monkeypatch.setattr(
+        "importlib.metadata.version",
+        lambda name: "2.9.0+cu130" if name in PYTORCH_PACKAGES else real_version(name),
+    )
+    monkeypatch.setattr("xoscar.virtualenv.platform.get_cuda_version", lambda: "13.0")
+
+    WorkerActor._prepare_virtual_env(
+        manager,
+        settings,
+        None,
+        model_engine="vllm",
+    )
+
+    assert len(manager.calls) == 1
+    _, kwargs = manager.calls[0]
+    assert kwargs["index_url"] == private_index
+    assert "download.pytorch.org" not in str(kwargs["extra_index_url"])
+    assert kwargs["extra_index_url"] == private_index
+
+
+def test_prepare_virtual_env_system_torch_injects_cuda_index_by_default(monkeypatch):
+    # Without any explicitly configured index, the auto-configured CUDA wheel
+    # index keeps being injected for #system_torch# (default online behavior).
+    import importlib.metadata
+
+    from ..virtual_env_manager import PYTORCH_CUDA_WHEEL_URLS, PYTORCH_PACKAGES
+
+    manager = DummyVirtualEnvManager()
+    settings = VirtualEnvSettings(
+        packages=["#system_torch#"],
+        inherit_pip_config=False,
+    )
+
+    real_version = importlib.metadata.version
+    monkeypatch.setattr(
+        "importlib.metadata.version",
+        lambda name: "2.9.0+cu130" if name in PYTORCH_PACKAGES else real_version(name),
+    )
+    monkeypatch.setattr("xoscar.virtualenv.platform.get_cuda_version", lambda: "13.0")
+
+    WorkerActor._prepare_virtual_env(
+        manager,
+        settings,
+        None,
+        model_engine=None,
+    )
+
+    assert len(manager.calls) == 1
+    _, kwargs = manager.calls[0]
+    assert kwargs["extra_index_url"] == [PYTORCH_CUDA_WHEEL_URLS["cu130"]]
+
+
 def test_prepare_virtual_env_expands_engine_dependencies_before_user_override():
     manager = DummyVirtualEnvManager()
     settings = VirtualEnvSettings(
@@ -893,6 +1089,46 @@ def test_prepare_virtual_env_expands_engine_dependencies_before_user_override():
     packages, _ = manager.calls[0]
     assert packages.count("vllm==0.10.2") == 1
     assert "vllm>=0.11.2" not in packages
+
+
+def test_prepare_virtual_env_selects_transformers_packages_by_model_format():
+    settings = VirtualEnvSettings(
+        packages=['#transformers_dependencies# ; #engine# == "Transformers"'],
+        inherit_pip_config=False,
+    )
+
+    # ``match_llm`` narrows model_specs to the selected spec. The request may
+    # still omit model_format, so dependency selection must use that spec.
+    model = SimpleNamespace(
+        model_family=SimpleNamespace(model_specs=[SimpleNamespace(model_format="gptq")])
+    )
+    resolved_model_format = WorkerActor._resolve_virtualenv_model_format(model, None)
+    assert resolved_model_format == "gptq"
+
+    gptq_manager = DummyVirtualEnvManager()
+    WorkerActor._prepare_virtual_env(
+        gptq_manager,
+        settings,
+        None,
+        model_engine="Transformers",
+        model_format=resolved_model_format,
+    )
+    gptq_packages, _ = gptq_manager.calls[0]
+    assert any(package.startswith("gptqmodel") for package in gptq_packages)
+    assert "optimum" in gptq_packages
+    assert "datasets>=3.4.0" in gptq_packages
+    assert not any(package.startswith("autoawq") for package in gptq_packages)
+
+    pytorch_manager = DummyVirtualEnvManager()
+    WorkerActor._prepare_virtual_env(
+        pytorch_manager,
+        settings,
+        None,
+        model_engine="Transformers",
+        model_format="pytorch",
+    )
+    pytorch_packages, _ = pytorch_manager.calls[0]
+    assert pytorch_packages == ["transformers>=4.53.3", "accelerate>=0.28.0"]
 
 
 @pytest.mark.asyncio
@@ -1454,6 +1690,12 @@ async def test_recover_model_pops_launch_ts_from_kwargs():
         async def get_supervisor_ref(self, add_worker=False):
             return None
 
+        async def wait_for_load(self, model_uid):
+            # recover_model now marks the recreated replica ready via wait_for_load
+            # (B3a); provide a no-op so this launch_ts test still exercises the
+            # launch_builtin_model kwargs path.
+            pass
+
     worker = _MockWorker()
 
     # Simulate a cached launch snapshot with launch_ts (the internal timestamp)
@@ -1489,3 +1731,283 @@ async def test_recover_model_pops_launch_ts_from_kwargs():
         assert launch_args["launch_ts"] == 1780900592
     finally:
         worker_module.parse_replica_model_uid = original_parse
+
+
+class _RecordingSupervisorRef:
+    """Minimal supervisor ref that records mark_replica_dead calls (B2)."""
+
+    def __init__(self):
+        self.evicted: List[str] = []
+
+    async def mark_replica_dead(self, replica_model_uid: str):
+        self.evicted.append(replica_model_uid)
+
+
+class _EvictMockWorker:
+    """Minimal worker stand-in for _evict_replica_from_supervisor tests."""
+
+    def __init__(self, supervisor_ref=None, raise_on_get: bool = False):
+        self._supervisor_ref = supervisor_ref
+        self._raise_on_get = raise_on_get
+
+    async def get_supervisor_ref(self, add_worker: bool = False):
+        if self._raise_on_get:
+            raise RuntimeError("supervisor unreachable")
+        return self._supervisor_ref
+
+
+@pytest.mark.asyncio
+async def test_evict_replica_from_supervisor_calls_mark_replica_dead():
+    """B2 helper: notifies the supervisor to evict the dead replica."""
+    sup = _RecordingSupervisorRef()
+    worker = _EvictMockWorker(supervisor_ref=sup)
+    await WorkerActor._evict_replica_from_supervisor(worker, "model-x-1")
+    assert sup.evicted == ["model-x-1"]
+
+
+@pytest.mark.asyncio
+async def test_evict_replica_from_supervisor_is_non_fatal():
+    """B2 helper: a supervisor-ref failure must not propagate out of the
+    recover_sub_pool tail path (non-fatal; next death/redeploy reconciles)."""
+    worker = _EvictMockWorker(supervisor_ref=None, raise_on_get=True)
+    # Must not raise.
+    await WorkerActor._evict_replica_from_supervisor(worker, "model-x-1")
+
+
+class _MainPoolStub:
+    async def remove_sub_pool(self, address):
+        return None
+
+
+class _RecoverWorkerStub:
+    """Worker stand-in for recover_sub_pool unbounded/bounded-branch tests.
+
+    recover_model is overridden per-test (raise vs succeed). The real
+    `_evict_replica_from_supervisor` is bound onto the instance so the
+    recover_sub_pool call exercises the genuine eviction path.
+    """
+
+    def __init__(
+        self,
+        supervisor_ref,
+        recover_raises: bool,
+        recover_count: Optional[int] = None,
+    ):
+        self._supervisor_ref = supervisor_ref
+        self._recover_raises = recover_raises
+        self.recover_called = 0
+        # Wiring used by recover_sub_pool:
+        self._main_pool = _MainPoolStub()
+        self._model_uid_to_addr = {"model-x-0": "addr-1"}
+        self._model_uid_to_launch_args = {
+            "model-x-0": {"model_uid": "model-x-0", "model_name": "m"},
+        }
+        # None -> unbounded branch; int (e.g. 1) -> bounded branch (AUTO_RECOVER_LIMIT)
+        self._model_uid_to_recover_count = {"model-x-0": recover_count}
+        self._model_uid_to_subpool_pids: dict = {}
+
+    async def get_supervisor_ref(self, add_worker: bool = False):
+        return self._supervisor_ref
+
+    async def terminate_model(self, model_uid, is_model_die: bool = False):
+        return None
+
+    async def recover_model(self, launch_args):
+        self.recover_called += 1
+        if self._recover_raises:
+            raise RuntimeError("recreate failed (e.g. OOM during reload)")
+
+
+def _bind_real_evict(worker):
+    import types
+
+    worker._evict_replica_from_supervisor = types.MethodType(
+        WorkerActor._evict_replica_from_supervisor, worker
+    )
+    return worker
+
+
+@pytest.mark.asyncio
+async def test_recover_sub_pool_unbounded_evicts_on_recover_failure(monkeypatch):
+    """B2 (core): in the default unbounded branch (recover_count is None), a
+    recreate that raises must evict the dead replica via mark_replica_dead, so
+    it cannot poison routing as a permanent 'loading' zombie (the 33% error
+    root cause)."""
+    import xinference.core.worker as worker_module
+
+    # Neutralize GPU/persist machinery for a deterministic, GPU-free test.
+    monkeypatch.setattr(worker_module, "_strip_test_envs", lambda args: (args, set()))
+    monkeypatch.setattr(worker_module, "_parse_gpu_indices", lambda x: [])
+    monkeypatch.setattr(worker_module, "_snapshot_gpu_free_ratio", lambda idx: 1.0)
+
+    sup = _RecordingSupervisorRef()
+    worker = _bind_real_evict(
+        _RecoverWorkerStub(supervisor_ref=sup, recover_raises=True)
+    )
+
+    await WorkerActor.recover_sub_pool(worker, "addr-1")
+
+    assert worker.recover_called == 1
+    assert sup.evicted == ["model-x-0"]  # recreate failed -> evicted
+
+
+@pytest.mark.asyncio
+async def test_recover_sub_pool_unbounded_no_evict_on_success(monkeypatch):
+    """B2 regression: a successful recreate in the unbounded branch must NOT
+    evict (infinite-retry-on-success semantics preserved)."""
+    import xinference.core.worker as worker_module
+
+    monkeypatch.setattr(worker_module, "_strip_test_envs", lambda args: (args, set()))
+    monkeypatch.setattr(worker_module, "_parse_gpu_indices", lambda x: [])
+    monkeypatch.setattr(worker_module, "_snapshot_gpu_free_ratio", lambda idx: 1.0)
+
+    sup = _RecordingSupervisorRef()
+    worker = _bind_real_evict(
+        _RecoverWorkerStub(supervisor_ref=sup, recover_raises=False)
+    )
+
+    await WorkerActor.recover_sub_pool(worker, "addr-1")
+
+    assert worker.recover_called == 1
+    assert sup.evicted == []  # succeeded -> not evicted
+
+
+# --- B2 symmetry fix: bounded branch eviction (0902) ------------------------
+
+
+@pytest.mark.asyncio
+async def test_recover_sub_pool_bounded_evicts_on_recover_failure(monkeypatch):
+    """B2 symmetry fix: in the bounded branch (AUTO_RECOVER_LIMIT>=1, here =1),
+    a recreate that raises must ALSO evict via mark_replica_dead -- otherwise the
+    replica is left in a 'stopping'/'error' state poisoning routing with 500s
+    (the gap that the unbounded-branch B2 left asymmetric)."""
+    import xinference.core.worker as worker_module
+
+    monkeypatch.setattr(worker_module, "_strip_test_envs", lambda args: (args, set()))
+    monkeypatch.setattr(worker_module, "_parse_gpu_indices", lambda x: [])
+    monkeypatch.setattr(worker_module, "_snapshot_gpu_free_ratio", lambda idx: 1.0)
+
+    sup = _RecordingSupervisorRef()
+    worker = _bind_real_evict(
+        _RecoverWorkerStub(supervisor_ref=sup, recover_raises=True, recover_count=1)
+    )
+
+    await WorkerActor.recover_sub_pool(worker, "addr-1")
+
+    assert worker.recover_called == 1
+    # count decremented 1 -> 0 before the recreate attempt
+    assert worker._model_uid_to_recover_count["model-x-0"] == 0
+    assert sup.evicted == ["model-x-0"]  # recreate failed -> evicted (the fix)
+
+
+@pytest.mark.asyncio
+async def test_recover_sub_pool_bounded_no_evict_on_success(monkeypatch):
+    """B2 regression: a successful recreate in the bounded branch must NOT evict
+    (count-based retry preserved); count is decremented toward 0."""
+    import xinference.core.worker as worker_module
+
+    monkeypatch.setattr(worker_module, "_strip_test_envs", lambda args: (args, set()))
+    monkeypatch.setattr(worker_module, "_parse_gpu_indices", lambda x: [])
+    monkeypatch.setattr(worker_module, "_snapshot_gpu_free_ratio", lambda idx: 1.0)
+
+    sup = _RecordingSupervisorRef()
+    worker = _bind_real_evict(
+        _RecoverWorkerStub(supervisor_ref=sup, recover_raises=False, recover_count=1)
+    )
+
+    await WorkerActor.recover_sub_pool(worker, "addr-1")
+
+    assert worker.recover_called == 1
+    assert worker._model_uid_to_recover_count["model-x-0"] == 0  # 1 -> 0
+    assert sup.evicted == []  # succeeded -> not evicted
+
+
+# --- B3a: wait_for_load after recover_model / _try_recover_models (0903) ----
+
+
+@pytest.mark.asyncio
+async def test_recover_model_marks_ready_via_wait_for_load():
+    """B3a: recover_model must call wait_for_load after launch_builtin_model so a
+    recreated replica is marked 'ready' instead of stuck at 'loading' forever
+    (the original 33% symptom). Mirrors the normal launch path where the
+    supervisor calls wait_for_load."""
+
+    class _MockWorker:
+        def __init__(self):
+            self.launch_called = False
+            self.wait_for_load_called_with = None
+
+        async def launch_builtin_model(self, **kwargs):
+            self.launch_called = True
+            return "mock-subpool-address"
+
+        async def get_supervisor_ref(self, add_worker=False):
+            return None
+
+        async def wait_for_load(self, model_uid):
+            self.wait_for_load_called_with = model_uid
+
+    worker = _MockWorker()
+    launch_args = {"model_uid": "test-model-0", "model_name": "test-model"}
+
+    def mock_parse(uid):
+        return ("test-model", 0)
+
+    import xinference.core.worker as worker_module
+
+    original_parse = worker_module.parse_replica_model_uid
+    worker_module.parse_replica_model_uid = mock_parse
+    try:
+        await WorkerActor.recover_model(worker, launch_args)
+        assert worker.launch_called
+        assert worker.wait_for_load_called_with == "test-model-0"
+    finally:
+        worker_module.parse_replica_model_uid = original_parse
+
+
+@pytest.mark.asyncio
+async def test_try_recover_models_marks_ready_via_wait_for_load(monkeypatch):
+    """B3a: _try_recover_models (worker restart recovery) must also call
+    wait_for_load after launch_builtin_model, so recovered models are marked
+    'ready' instead of stuck 'loading' (same gap as recover_model)."""
+
+    import xinference.core.worker as worker_module
+
+    monkeypatch.setattr(worker_module, "_strip_test_envs", lambda args: (args, set()))
+    monkeypatch.setattr(
+        worker_module, "parse_replica_model_uid", lambda uid: ("test-model", 0)
+    )
+
+    class _SupervisorRef:
+        async def describe_model(self, origin_uid):
+            return {"some": "info"}  # non-None -> model still registered
+
+    class _MockWorker:
+        def __init__(self):
+            self._supervisor_ref = _SupervisorRef()
+            self.launch_called = False
+            self.wait_for_load_called_with = None
+
+        def _load_persisted_launch_args(self):
+            return {
+                "test-model-0": {
+                    "model_uid": "test-model-0",
+                    "model_name": "test-model",
+                }
+            }
+
+        async def launch_builtin_model(self, **kwargs):
+            self.launch_called = True
+            return "mock-subpool-address"
+
+        async def wait_for_load(self, model_uid):
+            self.wait_for_load_called_with = model_uid
+
+        def _persist_launch_args(self):
+            pass
+
+    worker = _MockWorker()
+    await WorkerActor._try_recover_models(worker)
+
+    assert worker.launch_called
+    assert worker.wait_for_load_called_with == "test-model-0"
