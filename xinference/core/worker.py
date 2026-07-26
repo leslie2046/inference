@@ -93,12 +93,14 @@ from .resource import gather_node_info
 from .status_guard import StatusGuardActor
 from .utils import (
     apply_engine_virtualenv_settings,
+    build_replica_model_uid,
     build_subpool_envs_for_virtual_env,
     filter_virtualenv_packages_by_markers,
     find_direct_reference_packages,
     log_async,
     log_sync,
     merge_virtual_env_packages,
+    parse_legacy_replica_model_uid,
     parse_replica_model_uid,
     purge_dir,
     rewrite_direct_url_packages_for_index,
@@ -912,6 +914,20 @@ class WorkerActor(xo.StatelessActor):
         driver cannot block startup. Never raises — failures degrade to a
         warning and rely on H2/C as backstops.
         """
+        # This cleanup is NVIDIA-specific.  CPU images still install pynvml as
+        # a lightweight runtime dependency, but they do not expose NVML (or any
+        # CUDA devices) to the container.  Avoid an unnecessary 10-second
+        # nvmlInit timeout and a misleading warning in that environment.  The
+        # environment-name check also excludes non-NVIDIA accelerators.
+        if (
+            get_available_device_env_name() != "CUDA_VISIBLE_DEVICES"
+            or gpu_count() == 0
+        ):
+            logger.debug(
+                "Startup GPU orphan cleanup skipped: no NVIDIA GPU devices detected"
+            )
+            return
+
         if not _nvml_init_with_timeout():
             logger.warning(
                 "Startup GPU orphan cleanup skipped: pynvml init failed or "
@@ -1391,11 +1407,33 @@ class WorkerActor(xo.StatelessActor):
         for model_uid, launch_args in persisted.items():
             try:
                 # Cross-validate: check if supervisor still knows about this model
-                origin_uid, _ = parse_replica_model_uid(model_uid)
+                origin_uid, rep_id = parse_replica_model_uid(model_uid)
                 try:
                     model_info = await supervisor_ref.describe_model(origin_uid)
                 except Exception:
                     model_info = None
+                if model_info is None and rep_id == -1:
+                    # The recovery file may have been written by a version
+                    # that built replica uids as "{uid}-{n}" instead of the
+                    # reserved "-rep{n}" suffix. That format is ambiguous
+                    # (a bare "llama-2" also matches), so only migrate when
+                    # the stripped base uid is a model the supervisor knows.
+                    legacy = parse_legacy_replica_model_uid(model_uid)
+                    if legacy is not None:
+                        try:
+                            model_info = await supervisor_ref.describe_model(legacy[0])
+                        except Exception:
+                            model_info = None
+                        if model_info is not None:
+                            new_uid = build_replica_model_uid(*legacy)
+                            logger.info(
+                                "Migrating legacy replica model uid %s -> %s "
+                                "for recovery",
+                                model_uid,
+                                new_uid,
+                            )
+                            model_uid = new_uid
+                            launch_args["model_uid"] = new_uid
                 if model_info is None:
                     logger.info(
                         "Model %s no longer registered in supervisor, skipping recovery",
