@@ -286,6 +286,58 @@ def _build_engine_params_from_specs_by_quantization(
     return engine_param_list
 
 
+def _annotate_draft_support(
+    params: List[Dict[str, Any]],
+    engine_classes: List[Type[Any]],
+    family: Optional[Any] = None,
+    specs: Optional[List[Any]] = None,
+) -> List[Dict[str, Any]]:
+    """Publish whether an engine can run a drafter, for rebuilt param lists.
+
+    The virtualenv-aware discovery path rebuilds entries from specs rather than
+    from the engine registry, so the model class is not attached to them the way
+    ``_clean_engine_param`` finds it. One engine name maps to several classes —
+    MLX has a text one and a vision one, and only the latter takes a drafter —
+    so resolve which of them claims each entry and read the flag off that,
+    matching what the registry-built path reports.
+
+    ``match_json`` is what narrows it, the same call the non-forced branch makes;
+    it never checks whether the library is installed, so it works on this path
+    too. When nothing claims an entry — which is normal here, since the forced
+    branch exists precisely for engines that cannot match yet — fall back to
+    whether any class of the engine could, so an entry offered for on-demand
+    install is not reported as unable to draft.
+    """
+    for param in params:
+        matching_specs = [
+            spec
+            for spec in specs or []
+            if getattr(spec, "model_format", None) == param.get("model_format")
+            and getattr(spec, "model_size_in_billions", None)
+            == param.get("model_size_in_billions")
+        ]
+        claimed: List[Type[Any]] = []
+        for spec in matching_specs:
+            quantization = getattr(spec, "quantization", None) or "none"
+            for cls in engine_classes:
+                match_func = getattr(cls, "match_json", None)
+                if not callable(match_func):
+                    continue
+                try:
+                    is_match, _, _, _ = _normalize_match_result(
+                        match_func(family, spec, quantization), "", "match"
+                    )
+                except Exception:
+                    is_match = False
+                if is_match and cls not in claimed:
+                    claimed.append(cls)
+        considered = claimed or engine_classes
+        param["support_draft_model"] = any(
+            bool(getattr(cls, "support_draft_model", False)) for cls in considered
+        )
+    return params
+
+
 def _force_virtualenv_engine_params(
     family: Optional[Any],
     supported_engines: Dict[str, List[Type[Any]]],
@@ -372,7 +424,12 @@ def _force_virtualenv_engine_params(
                 continue
 
             selected_specs = matched_specs
-            engine_param_list = param_builder(family, selected_specs)
+            engine_param_list = _annotate_draft_support(
+                param_builder(family, selected_specs),
+                engine_classes,
+                family,
+                selected_specs,
+            )
             engine_params[engine_name] = engine_param_list
             available_params[engine_name] = engine_param_list
             match_status[engine_name] = True
@@ -408,7 +465,12 @@ def _force_virtualenv_engine_params(
         ):
             continue
         selected_specs = matched_specs or specs
-        engine_param_list = param_builder(family, selected_specs)
+        engine_param_list = _annotate_draft_support(
+            param_builder(family, selected_specs),
+            engine_classes,
+            family,
+            selected_specs,
+        )
         if engine_param_list:
             engine_params[engine_name] = engine_param_list
             available_params[engine_name] = engine_param_list
@@ -545,6 +607,25 @@ def check_dependency_available(
     except Exception as exc:
         return False, f"Error while importing {friendly_name or module_name}: {exc}"
     return True
+
+
+@functools.lru_cache
+def has_cuda_device() -> bool:
+    # use pynvml rather than torch to avoid initializing CUDA on import
+    device_count = 0
+    try:
+        from pynvml import nvmlDeviceGetCount, nvmlInit, nvmlShutdown
+
+        nvmlInit()
+        device_count = nvmlDeviceGetCount()
+    except Exception:
+        pass
+    finally:
+        try:
+            nvmlShutdown()
+        except Exception:
+            pass
+    return device_count > 0
 
 
 def is_locale_chinese_simplified() -> bool:
@@ -980,6 +1061,21 @@ class CancellableDownloader:
             logger.debug(f"Error during CancellableDownloader cleanup: {e}")
 
 
+def _clean_engine_param(param: Dict[str, Any], class_field: str) -> Dict[str, Any]:
+    """Drop the model class from an engine entry, keeping what callers need.
+
+    ``support_draft_model`` is published so a caller can tell whether an engine
+    can run a drafter for speculative decoding, rather than finding out when the
+    launch is rejected. Shared by both engine-discovery entry points: they build
+    otherwise identical payloads and have to stay in sync.
+    """
+    cleaned = {k: v for k, v in param.items() if k != class_field}
+    support_draft_model = getattr(param.get(class_field), "support_draft_model", None)
+    if support_draft_model is not None:
+        cleaned["support_draft_model"] = bool(support_draft_model)
+    return cleaned
+
+
 def get_engine_params_by_name(
     model_type: Optional[str],
     model_name: str,
@@ -1016,10 +1112,7 @@ def _get_engine_params_by_name(
     def _append_available_engine(
         engine: str, params: List[Dict[str, Any]], class_field: str
     ):
-        cleaned_params: List[Dict[str, Any]] = []
-        for param in params:
-            new_param = {k: v for k, v in param.items() if k != class_field}
-            cleaned_params.append(new_param)
+        cleaned_params = [_clean_engine_param(param, class_field) for param in params]
         engine_params[engine] = cleaned_params
 
     def _append_unavailable_engine(
@@ -1401,6 +1494,32 @@ def _get_engine_params_by_name(
         )
         return engine_params
 
+    if model_type == "audio":
+        from .audio import BUILTIN_AUDIO_MODELS
+        from .audio.custom import get_user_defined_audios
+        from .audio.engine_family import AUDIO_ENGINES
+        from .audio.engine_family import SUPPORTED_ENGINES as AUDIO_SUPPORTED_ENGINES
+
+        if model_name not in AUDIO_ENGINES:
+            return None
+
+        available_engines = deepcopy(AUDIO_ENGINES[model_name])
+        for engine, params in available_engines.items():
+            _append_available_engine(engine, params, "audio_class")
+        audio_families: List[Any] = list(BUILTIN_AUDIO_MODELS.get(model_name, []))
+        audio_families.extend(
+            f for f in get_user_defined_audios() if f.model_name == model_name
+        )
+        _validate_available_image_engines(
+            audio_families,
+            AUDIO_SUPPORTED_ENGINES,
+            "audio",
+        )
+        _collect_supported_image_engines(
+            audio_families, AUDIO_SUPPORTED_ENGINES, "audio"
+        )
+        return engine_params
+
     return None
 
 
@@ -1456,10 +1575,7 @@ def _get_engine_params_by_name_with_virtual_env(
     def _append_available_engine(
         engine: str, params: List[Dict[str, Any]], class_field: str
     ):
-        cleaned_params: List[Dict[str, Any]] = []
-        for param in params:
-            new_param = {k: v for k, v in param.items() if k != class_field}
-            cleaned_params.append(new_param)
+        cleaned_params = [_clean_engine_param(param, class_field) for param in params]
         engine_params[engine] = cleaned_params
         available_params[engine] = cleaned_params
 
@@ -1912,9 +2028,47 @@ def _get_engine_params_by_name_with_virtual_env(
 
         return engine_params
 
+    elif model_type == "audio":
+        from .audio import BUILTIN_AUDIO_MODELS
+        from .audio.custom import get_user_defined_audios
+        from .audio.engine_family import AUDIO_ENGINES
+        from .audio.engine_family import SUPPORTED_ENGINES as AUDIO_SUPPORTED_ENGINES
+
+        if model_name not in AUDIO_ENGINES:
+            return None
+
+        available_engines = deepcopy(AUDIO_ENGINES[model_name])
+        for engine, params in available_engines.items():
+            _append_available_engine(engine, params, "audio_class")
+        audio_families: List[Any] = list(BUILTIN_AUDIO_MODELS.get(model_name, []))
+        audio_families.extend(
+            f for f in get_user_defined_audios() if f.model_name == model_name
+        )
+        audio_engine_markers: Set[str] = set()
+        for family in audio_families:
+            audio_engine_markers |= _collect_virtualenv_engine_markers(family)
+        _validate_available_image_engines(
+            audio_families,
+            AUDIO_SUPPORTED_ENGINES,
+            "audio",
+            audio_engine_markers,
+            enable_virtual_env,
+        )
+        _collect_supported_image_engines(
+            audio_families, AUDIO_SUPPORTED_ENGINES, "audio"
+        )
+        _apply_virtualenv_engine_overrides(
+            engine_params,
+            AUDIO_SUPPORTED_ENGINES,
+            audio_engine_markers,
+            enable_virtual_env,
+        )
+
+        return engine_params
+
     raise ValueError(
         "Cannot support model_engine for "
-        f"{model_type}, only available for LLM, embedding, rerank, image"
+        f"{model_type}, only available for LLM, embedding, rerank, image, audio"
     )
 
 

@@ -53,11 +53,12 @@ from ....types import (
     Completion,
     CompletionChoice,
     CompletionChunk,
+    CompletionLogprobs,
     CompletionUsage,
     LoRA,
 )
 from .. import BUILTIN_LLM_FAMILIES, LLM, LLMFamilyV2, LLMSpecV1
-from ..core import chat_context_var
+from ..core import chat_context_var, get_model_speculative_tokens_default
 from ..llm_family import cache_model_tokenizer_and_config
 from ..utils import (
     DEEPSEEK_TOOL_CALL_FAMILY,
@@ -115,6 +116,10 @@ class VLLMModelConfig(TypedDict, total=False):
     speculative_config: Optional[Dict[str, Any]]
     rope_scaling: Optional[Dict[str, Any]]
     hf_overrides: Optional[Dict[str, Any]]
+    # engine-neutral speculative decoding options, translated into
+    # speculative_config and never forwarded to the engine as-is
+    draft_model_path: NotRequired[Optional[str]]
+    num_speculative_tokens: NotRequired[Optional[int]]
 
 
 class VLLMGenerateConfig(TypedDict, total=False):
@@ -125,6 +130,8 @@ class VLLMGenerateConfig(TypedDict, total=False):
     presence_penalty: float
     frequency_penalty: float
     repetition_penalty: float
+    logprobs: Optional[int]
+    prompt_logprobs: Optional[int]
     temperature: float
     top_p: float
     top_k: int
@@ -161,6 +168,15 @@ try:
 except ImportError:
     VLLM_INSTALLED = False
     VLLM_VERSION = None
+
+
+def _get_transformers_version() -> Optional[version.Version]:
+    try:
+        import transformers
+    except ImportError:
+        return None
+    return version.parse(transformers.__version__)
+
 
 DEFAULT_VLLM_VERSION = version.parse("0.21.0")
 
@@ -412,6 +428,7 @@ _update_vllm_supported_lists()
 
 class VLLMModel(LLM):
     allow_batch = True
+    support_draft_model = True
 
     def __init__(
         self,
@@ -971,6 +988,83 @@ class VLLMModel(LLM):
             )
             return default
 
+    # vLLM grew a dedicated Gemma 4 MTP path in 0.22.0; before that it treats an
+    # assistant checkpoint as a generic draft model and fails to initialize
+    # against a multimodal target.
+    MTP_MIN_VLLM_VERSION = version.parse("0.22.0")
+    # Gemma4AssistantConfig first shipped in Transformers 5.8.0.
+    MTP_MIN_TRANSFORMERS_VERSION = version.parse("5.8.0")
+    # Generic fallback for MTP families without a model-specific recipe.
+    DEFAULT_NUM_SPECULATIVE_TOKENS = 1
+
+    def _default_num_speculative_tokens(self) -> int:
+        return get_model_speculative_tokens_default(
+            getattr(self.model_family, "model_name", None),
+            getattr(self.model_spec, "model_size_in_billions", None),
+            self.DEFAULT_NUM_SPECULATIVE_TOKENS,
+        )
+
+    def _apply_draft_model(self, model_config: VLLMModelConfig) -> None:
+        """Turn a downloaded drafter into vLLM's ``speculative_config``.
+
+        ``draft_model_path`` / ``num_speculative_tokens`` are the engine-neutral
+        launch options; they must never reach ``AsyncEngineArgs``, so they are
+        consumed here whether or not they end up being used.
+        """
+        draft_model_path = model_config.pop("draft_model_path", None)  # type: ignore[typeddict-item]
+        num_speculative_tokens = model_config.pop("num_speculative_tokens", None)  # type: ignore[typeddict-item]
+        if not draft_model_path:
+            return
+
+        if model_config.get("speculative_config"):
+            # An explicit speculative_config wins: the user is driving vLLM
+            # directly and may be running a different method entirely.
+            logger.info(
+                "Ignoring the drafter of %s, speculative_config was set explicitly",
+                self.model_uid,
+            )
+            return
+
+        if VLLM_VERSION is not None and VLLM_VERSION < self.MTP_MIN_VLLM_VERSION:
+            raise ValueError(
+                f"Speculative decoding with a Gemma 4 style drafter needs "
+                f"vllm>={self.MTP_MIN_VLLM_VERSION}, but {VLLM_VERSION} is installed. "
+                f"Upgrade vLLM, or launch without `enable_mtp`."
+            )
+        transformers_version = _get_transformers_version()
+        if transformers_version is None or (
+            transformers_version < self.MTP_MIN_TRANSFORMERS_VERSION
+        ):
+            installed = (
+                str(transformers_version)
+                if transformers_version is not None
+                else "not installed"
+            )
+            raise ValueError(
+                "Speculative decoding with a Gemma 4 style drafter needs "
+                f"transformers>={self.MTP_MIN_TRANSFORMERS_VERSION}, but "
+                f"{installed} is installed. Upgrade Transformers, or launch "
+                "without `enable_mtp`."
+            )
+
+        from ..core import parse_num_speculative_tokens
+
+        requested = parse_num_speculative_tokens(num_speculative_tokens)
+        model_config["speculative_config"] = {
+            "method": "mtp",
+            "model": draft_model_path,
+            "num_speculative_tokens": (
+                requested
+                if requested is not None
+                else self._default_num_speculative_tokens()
+            ),
+        }
+        logger.info(
+            "Speculative decoding enabled for %s: %s",
+            self.model_uid,
+            model_config["speculative_config"],
+        )
+
     def _sanitize_model_config(
         self, model_config: Optional[VLLMModelConfig]
     ) -> VLLMModelConfig:
@@ -1040,6 +1134,7 @@ class VLLMModel(LLM):
             model_config["speculative_config"] = self.parse_str_field_to_dict(
                 model_config.get("speculative_config", {}), "speculative_config"
             )
+        self._apply_draft_model(model_config)
         if "rope_scaling" in model_config:
             rope_scaling = self.parse_str_field_to_dict(
                 model_config["rope_scaling"], "rope_scaling"
@@ -1145,6 +1240,19 @@ class VLLMModel(LLM):
             "guided_json_object",
             generate_config.get("guided_json_object", guided_json_object),
         )
+        # Legacy completions use an integer ``logprobs`` value directly. Chat
+        # completions use ``logprobs`` as a boolean and put the requested count
+        # in ``top_logprobs``. vLLM uses None, not 0, to disable logprobs.
+        logprobs_req = generate_config.get("logprobs")
+        if isinstance(logprobs_req, bool):
+            top_logprobs_req = generate_config.get("top_logprobs")
+            vllm_logprobs = max(int(top_logprobs_req or 0), 0) if logprobs_req else None
+        else:
+            vllm_logprobs = logprobs_req
+        sanitized.setdefault("logprobs", vllm_logprobs)
+        sanitized.setdefault(
+            "prompt_logprobs", generate_config.get("prompt_logprobs", None)
+        )
         # 1. Try to get from generate config
         ignore_eos_val = generate_config.get("ignore_eos")
 
@@ -1215,17 +1323,88 @@ class VLLMModel(LLM):
         return True
 
     @staticmethod
+    def _build_logprobs(
+        output: "RequestOutput", prompt_offset: int = 0
+    ) -> Optional[CompletionLogprobs]:
+        """Build a legacy-completions ``CompletionLogprobs`` from vLLM output.
+
+        Returns ``None`` when the engine did not produce logprobs (i.e. the
+        caller did not request them via ``generate_config``), preserving the
+        previous behaviour. When logprobs are present, they are mapped to the
+        ``text_offset`` / ``tokens`` / ``token_logprobs`` / ``top_logprobs``
+        shape defined by ``CompletionLogprobs``.
+        """
+        output_logprobs = getattr(output, "logprobs", None)
+        if not output_logprobs:
+            return None
+        token_ids = getattr(output, "token_ids", []) or []
+        tokens: List[str] = []
+        token_logprobs: List[Optional[float]] = []
+        top_logprobs: List[Optional[Dict[str, float]]] = []
+        text_offset: List[int] = []
+        offset = prompt_offset
+        for i, token_id in enumerate(token_ids):
+            lp_dict = output_logprobs[i] if i < len(output_logprobs) else None
+            if not lp_dict:
+                tokens.append("")
+                token_logprobs.append(None)
+                top_logprobs.append(None)
+                text_offset.append(offset)
+                continue
+            sampled = lp_dict.get(token_id)
+            sampled_decoded = (
+                getattr(sampled, "decoded_token", None) if sampled is not None else None
+            )
+            token_text = sampled_decoded if sampled_decoded else ""
+            raw_token_lp = (
+                getattr(sampled, "logprob", None) if sampled is not None else None
+            )
+            token_lp = (
+                max(float(raw_token_lp), -9999.0) if raw_token_lp is not None else None
+            )
+            tokens.append(token_text)
+            token_logprobs.append(token_lp)
+            decoded_logprobs: Dict[str, float] = {}
+            for lp in lp_dict.values():
+                decoded_token = getattr(lp, "decoded_token", None)
+                logprob = getattr(lp, "logprob", None)
+                if decoded_token is not None and logprob is not None:
+                    decoded_logprobs[decoded_token] = max(float(logprob), -9999.0)
+            top_logprobs.append(decoded_logprobs)
+            text_offset.append(offset)
+            if token_text:
+                offset += len(token_text)
+        return CompletionLogprobs(
+            text_offset=text_offset,
+            token_logprobs=token_logprobs,
+            tokens=tokens,
+            top_logprobs=top_logprobs,
+        )
+
+    @staticmethod
+    def _slice_logprobs(logprobs: CompletionLogprobs, start: int) -> CompletionLogprobs:
+        """Return the newly generated portion of cumulative vLLM logprobs."""
+        return CompletionLogprobs(
+            text_offset=logprobs["text_offset"][start:],
+            token_logprobs=logprobs["token_logprobs"][start:],
+            tokens=logprobs["tokens"][start:],
+            top_logprobs=logprobs["top_logprobs"][start:],
+        )
+
+    @staticmethod
     def _convert_request_output_to_completion_chunk(
         request_id: str, model: str, request_output: "RequestOutput"
     ) -> Tuple[CompletionChunk, Optional[str]]:
         choices: List[CompletionChoice] = []
         finish_reason = None
+        prompt = getattr(request_output, "prompt", None)
+        prompt_offset = len(prompt) if isinstance(prompt, str) else 0
         for output in request_output.outputs:
             choices.append(
                 CompletionChoice(
                     text=output.text,
                     index=output.index,
-                    logprobs=None,  # TODO: support logprobs.
+                    logprobs=VLLMModel._build_logprobs(output, prompt_offset),
                     finish_reason=None,
                 )
             )
@@ -1246,12 +1425,14 @@ class VLLMModel(LLM):
         request_id: str, model: str, request_output: "RequestOutput"
     ) -> Completion:
         choices = []
+        prompt = getattr(request_output, "prompt", None)
+        prompt_offset = len(prompt) if isinstance(prompt, str) else 0
         for output in request_output.outputs:
             choices.append(
                 CompletionChoice(
                     text=output.text,
                     index=output.index,
-                    logprobs=None,  # TODO: support logprobs.
+                    logprobs=VLLMModel._build_logprobs(output, prompt_offset),
                     finish_reason=output.finish_reason,
                 )
             )
@@ -1578,6 +1759,7 @@ class VLLMModel(LLM):
 
         async def stream_results() -> AsyncGenerator[CompletionChunk, None]:
             previous_texts = [""] * sanitized_generate_config["n"]
+            previous_logprobs_counts = [0] * sanitized_generate_config["n"]
             prompt_tokens, completion_tokens, total_tokens = 0, 0, 0
             complete_response = ""
             match_tool_call_tmp_results = []
@@ -1595,6 +1777,13 @@ class VLLMModel(LLM):
                     delta = choice["text"][len(previous_texts[i]) :]
                     previous_texts[i] = choice["text"]
                     choice["text"] = delta
+                    logprobs = choice["logprobs"]
+                    if logprobs is not None:
+                        current_count = len(logprobs["tokens"])
+                        choice["logprobs"] = self._slice_logprobs(
+                            logprobs, previous_logprobs_counts[i]
+                        )
+                        previous_logprobs_counts[i] = current_count
                     complete_response += delta
 
                 prompt_tokens = len(_request_output.prompt_token_ids)
