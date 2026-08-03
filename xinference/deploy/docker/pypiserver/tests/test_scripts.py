@@ -231,6 +231,14 @@ def test_runtime_dockerfiles_keep_dependency_layers_source_independent():
         assert dependency_install < project_sources < project_install
 
 
+def test_cpu_dockerfile_skips_torchao_native_extensions():
+    dockerfile = (
+        REPO_ROOT / "xinference/deploy/docker/Dockerfile.cpu"
+    ).read_text(encoding="utf-8")
+
+    assert "ENV TORCHAO_FORCE_SKIP_LOADING_SO_FILES=1" in dockerfile
+
+
 def test_transformers_optional_dependencies_are_scoped_and_mirrored(
     monkeypatch, tmp_path
 ):

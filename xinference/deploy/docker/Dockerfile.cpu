@@ -10,6 +10,10 @@ RUN npm run build
 
 FROM continuumio/miniconda3:23.10.0-1
 
+# gptqmodel installs torchao's native CUDA extensions even in the CPU image.
+# Loading those extensions emits linker errors and can abort worker startup.
+ENV TORCHAO_FORCE_SKIP_LOADING_SO_FILES=1
+
 RUN apt-get -y update \
   && apt install -y build-essential curl procps git libgl1 \
   && apt-get -yq clean
