@@ -12,6 +12,7 @@ import {
   Cpu,
   Server,
   Code,
+  Plus,
   RefreshCw,
 } from 'lucide-react';
 import { useRouter } from 'next/navigation';
@@ -93,6 +94,7 @@ const RunningModel = () => {
   const [deleteConfirmLoading, setDeleteConfirmLoading] = useState(false);
   const [deleteReplicaId, setDeleteReplicaId] = useState<string | undefined>(undefined);
   const [deleteReplicaLoading, setDeleteReplicaLoading] = useState(false);
+  const [addReplicaLoading, setAddReplicaLoading] = useState(false);
   const [tryApiOpen, setTryApiOpen] = useState(false);
   const tryApiAbility = useMemo(
     () => getTryApiAbility(activeModel?.model_ability || []),
@@ -201,6 +203,24 @@ const RunningModel = () => {
       })
       .finally(() => {
         setDeleteReplicaLoading(false);
+      });
+  };
+
+  const handleAddReplica = () => {
+    if (!activeModel) return;
+    setAddReplicaLoading(true);
+    request
+      .post(`/v1/models/${activeModel.id}/replicas`, { replica: 1 }, { noTimeout: true })
+      .then(() => {
+        toast.success(t('runningModels.addReplicaSuccess'));
+        fetchReplicas(activeModel.id);
+        fetchModels();
+      })
+      .catch(() => {
+        toast.error(t('runningModels.addReplicaFailed'));
+      })
+      .finally(() => {
+        setAddReplicaLoading(false);
       });
   };
 
@@ -409,7 +429,20 @@ const RunningModel = () => {
               }
             />
           </div>
-          <h3 className="font-medium">{t('runningModels.replicaDetail')}</h3>
+          <div className="flex items-center justify-between">
+            <h3 className="font-medium">{t('runningModels.replicaDetail')}</h3>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              loading={addReplicaLoading}
+              disabled={addReplicaLoading}
+              onClick={handleAddReplica}
+            >
+              {!addReplicaLoading && <Plus className="size-4" />}
+              {t('runningModels.addReplica')}
+            </Button>
+          </div>
           {(replicaLogs?.[activeModel.id] || []).map((replica) => (
             <div key={replica.replica_model_uid} className="p-3 rounded-lg border">
               <div className="flex items-center justify-between">

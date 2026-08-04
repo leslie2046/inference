@@ -975,6 +975,29 @@ class RESTfulAPI(CancelMixin):
             logger.error(str(e), exc_info=True)
             raise HTTPException(status_code=500, detail=str(e))
 
+    async def add_model_replicas(
+        self, request: Request, model_uid: str
+    ) -> JSONResponse:
+        """Dynamically add replicas to a running model."""
+        payload = await request.json()
+        replica = _validate_replica(payload.get("replica", 1))
+        try:
+            total, replica_ids = await (
+                await self._get_supervisor_ref()
+            ).add_model_replicas(model_uid, replica)
+            return JSONResponse(content={"replica": total, "replica_ids": replica_ids})
+        except ValueError as ve:
+            logger.error(str(ve), exc_info=True)
+            raise HTTPException(status_code=400, detail=str(ve))
+        except ModelNotReadyError as e:
+            raise HTTPException(status_code=409, detail=str(e))
+        except RuntimeError as re:
+            logger.error(str(re), exc_info=True)
+            raise HTTPException(status_code=503, detail=str(re))
+        except Exception as e:
+            logger.error(str(e), exc_info=True)
+            raise HTTPException(status_code=500, detail=str(e))
+
     async def get_launch_model_progress(self, model_uid: str) -> JSONResponse:
         try:
             progress = await (

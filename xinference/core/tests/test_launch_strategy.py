@@ -420,3 +420,135 @@ async def test_terminate_model_replica_updates_active_replica_set():
         "demo-model",
         {"replica": 2, "status": "READY"},
     )
+
+
+class DynamicReplicaStatusGuard:
+    def __init__(self, replica_ids):
+        self.replica_ids = set(replica_ids)
+        self.statuses = {}
+        self.updates = []
+
+    async def update_replica_status(
+        self, model_uid: str, replica_id: int, updates: dict
+    ):
+        self.replica_ids.add(replica_id)
+        self.statuses.setdefault(replica_id, {}).update(updates)
+
+    async def remove_replica_status(self, model_uid: str, replica_id: int):
+        self.replica_ids.discard(replica_id)
+        self.statuses.pop(replica_id, None)
+        return len(self.replica_ids)
+
+    async def update_instance_info(self, model_uid: str, updates: dict):
+        self.updates.append((model_uid, updates))
+
+
+class DynamicReplicaWorker:
+    def __init__(self, fail_uid=None):
+        self.address = "worker-1:1000"
+        self.fail_uid = fail_uid
+        self.launch_args = {
+            "model_uid": "demo-model-rep0",
+            "model_name": "demo",
+            "model_size_in_billions": None,
+            "model_format": None,
+            "quantization": None,
+            "model_engine": None,
+            "model_type": "embedding",
+            "n_gpu": None,
+            "n_worker": 1,
+            "gpu_idx": [7],
+            "launch_ts": 123,
+        }
+        self.launched = []
+        self.terminated = []
+
+    async def get_model_launch_args(self, model_uid: str):
+        return dict(self.launch_args)
+
+    async def launch_builtin_model(self, **kwargs):
+        self.launched.append(kwargs)
+        if kwargs["model_uid"] == self.fail_uid:
+            raise RuntimeError("launch failed")
+        return "subpool"
+
+    async def wait_for_load(self, model_uid: str):
+        return None
+
+    async def terminate_model(self, model_uid: str):
+        self.terminated.append(model_uid)
+
+
+def make_dynamic_replica_supervisor(worker, active_ids):
+    from xinference.core.supervisor import ReplicaInfo, SupervisorActor
+
+    class DynamicReplicaSupervisor:
+        add_model_replicas = SupervisorActor.add_model_replicas
+        _refresh_replica_scheduler = staticmethod(
+            SupervisorActor._refresh_replica_scheduler
+        )
+
+        def __init__(self):
+            self._model_uid_to_replica_info = {
+                "demo-model": ReplicaInfo(
+                    replica=len(active_ids),
+                    scheduler=itertools.cycle(active_ids),
+                    active_replica_ids=list(active_ids),
+                )
+            }
+            info = self._model_uid_to_replica_info["demo-model"]
+            for replica_id in active_ids:
+                info.replica_to_worker_refs[replica_id].append(worker)
+            self._replica_model_uid_to_worker = {
+                build_replica_model_uid("demo-model", replica_id): worker
+                for replica_id in active_ids
+            }
+            self._status_guard_ref = DynamicReplicaStatusGuard(active_ids)
+            self._unexpected_down_replicas = {}
+            self._list_models_cache_version = 0
+
+        async def _choose_worker_for_new_replica(self, n_gpu):
+            return worker, None
+
+        def _invalidate_list_models_debounce_cache(self):
+            self._list_models_cache_version += 1
+
+    return DynamicReplicaSupervisor()
+
+
+@pytest.mark.asyncio
+async def test_add_model_replicas_uses_new_ids_and_keeps_source_spec_immutable():
+    worker = DynamicReplicaWorker()
+    supervisor = make_dynamic_replica_supervisor(worker, [0, 2])
+
+    total, replica_ids = await supervisor.add_model_replicas("demo-model", 1)
+
+    assert (total, replica_ids) == (3, [3])
+    assert worker.launched[0]["model_uid"] == "demo-model-rep3"
+    assert worker.launched[0]["gpu_idx"] is None
+    assert "launch_ts" not in worker.launched[0]
+    assert worker.launch_args["model_uid"] == "demo-model-rep0"
+    assert worker.launch_args["gpu_idx"] == [7]
+    info = supervisor._model_uid_to_replica_info["demo-model"]
+    assert info.active_replica_ids == [0, 2, 3]
+    assert next(info.scheduler) == 0
+    assert next(info.scheduler) == 2
+    assert next(info.scheduler) == 3
+    assert supervisor._status_guard_ref.statuses[3]["status"] == "READY"
+
+
+@pytest.mark.asyncio
+async def test_add_model_replicas_rolls_back_only_new_replicas_on_failure():
+    worker = DynamicReplicaWorker(fail_uid="demo-model-rep4")
+    supervisor = make_dynamic_replica_supervisor(worker, [0, 2])
+
+    with pytest.raises(RuntimeError, match="launch failed"):
+        await supervisor.add_model_replicas("demo-model", 2)
+
+    info = supervisor._model_uid_to_replica_info["demo-model"]
+    assert info.active_replica_ids == [0, 2]
+    assert info.replica == 2
+    assert worker.terminated == ["demo-model-rep3", "demo-model-rep4"]
+    assert supervisor._status_guard_ref.replica_ids == {0, 2}
+    assert "demo-model-rep3" not in supervisor._replica_model_uid_to_worker
+    assert "demo-model-rep4" not in supervisor._replica_model_uid_to_worker

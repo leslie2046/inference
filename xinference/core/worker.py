@@ -1621,6 +1621,19 @@ class WorkerActor(xo.StatelessActor):
     def get_model_count(self) -> int:
         return len(self._model_uid_to_model)
 
+    def get_model_launch_args(self, model_uid: str) -> Dict[str, Any]:
+        """Return a copy of the launch specification for a running model.
+
+        The supervisor uses this internal interface when it creates another
+        replica on a potentially different worker.  Keep the worker-owned
+        snapshot immutable: callers replace fields such as ``model_uid`` and
+        ``gpu_idx`` before launching the new replica.
+        """
+        launch_args = self._model_uid_to_launch_args.get(model_uid)
+        if launch_args is None:
+            raise ValueError(f"Launch arguments not found for model, uid: {model_uid}")
+        return dict(launch_args)
+
     async def is_model_vllm_backend(self, model_uid: str) -> bool:
         _model_uid, _ = parse_replica_model_uid(model_uid)
         supervisor_ref = await self.get_supervisor_ref()

@@ -1492,6 +1492,21 @@ class AsyncClient:
         await _release_response(response)
         return response_data["remaining_replicas"]
 
+    async def add_model_replicas(self, model_uid: str, replica: int = 1) -> dict:
+        """Dynamically add replicas to a running model."""
+
+        url = f"{self.base_url}/v1/models/{model_uid}/replicas"
+        response = await self.session.post(
+            url, json={"replica": replica}, headers=self._headers
+        )
+        if response.status != 200:
+            raise RuntimeError(
+                f"Failed to add model replicas, detail: {await _get_error_string(response)}"
+            )
+        response_data = await response.json()
+        await _release_response(response)
+        return response_data
+
     async def get_launch_model_progress(self, model_uid: str) -> dict:
         """
         Get progress of the specific model.

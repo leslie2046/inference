@@ -226,6 +226,9 @@ const ja = {
     gpuIndexes: 'GPU インデックス',
     gpuMemory: 'GPU メモリ',
     replicaDetail: 'レプリカ詳細',
+    addReplica: 'レプリカを追加',
+    addReplicaSuccess: 'レプリカを追加しました',
+    addReplicaFailed: 'レプリカの追加に失敗しました',
     removeReplicaConfirm:
       'モデル {{modelUid}} のレプリカ {{replicaId}} を削除してもよろしいですか？',
     autostartEnabled: '自動起動が設定されています',

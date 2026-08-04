@@ -55,6 +55,30 @@ GPU Allocation Strategy
 
 The current policy is *Idle First*: The scheduler always attempts to assign replicas to the least utilized GPU. Use the ``XINFERENCE_LAUNCH_STRATEGY`` parameter to choose launch strategy.
 
+Adding Replicas to a Running Model
+==================================
+
+Replicas can be added without restarting a running model. Existing replicas
+continue to serve requests while each new replica is placed on a worker and
+loaded. The new replicas join request load balancing only after they are ready.
+
+Use the Web UI's **Add replica** action, the Python client, or the REST endpoint:
+
+.. code-block:: python
+
+  client.add_model_replicas("my-model", replica=1)
+
+.. code-block:: bash
+
+  curl -X POST http://localhost:9997/v1/models/my-model/replicas \
+    -H "Content-Type: application/json" \
+    -d '{"replica": 1}'
+
+The ``replica`` value is the number of additional replicas, not the desired
+total. If a batch addition fails, Xinference removes the replicas created by
+that request and keeps the existing replicas available. Dynamic addition is
+not supported for multi-worker sharded or Xavier-enabled models.
+
 Set Environment Variables
 =========================
 
