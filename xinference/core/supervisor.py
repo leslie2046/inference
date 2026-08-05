@@ -123,6 +123,9 @@ class ReplicaInfo:
         field(default_factory=lambda: defaultdict(list))
     )
     active_replica_ids: List[int] = field(default_factory=list)
+    operation_lock: asyncio.Lock = field(
+        default_factory=asyncio.Lock, repr=False, compare=False
+    )
 
 
 class SupervisorActor(xo.StatelessActor):
@@ -2698,6 +2701,213 @@ class SupervisorActor(xo.StatelessActor):
             for status in replica_statuses
         ]
 
+    async def _choose_worker_for_new_replica(
+        self, n_gpu: Optional[Union[int, str]]
+    ) -> Tuple[xo.ActorRefType["WorkerActor"], Optional[List[int]]]:
+        workers = list(self._worker_address_to_worker.values())
+        if not workers:
+            raise RuntimeError("No available worker found")
+
+        counts, allocations = await asyncio.gather(
+            asyncio.gather(
+                *[worker.get_model_count() for worker in workers],
+                return_exceptions=True,
+            ),
+            asyncio.gather(
+                *[worker.get_gpu_allocation_status() for worker in workers],
+                return_exceptions=True,
+            ),
+        )
+        candidates = []
+        for worker, count, allocation in zip(workers, counts, allocations):
+            if isinstance(count, Exception):
+                logger.warning(
+                    "Failed to get model count from worker %s: %s",
+                    worker.address,
+                    count,
+                )
+                continue
+            candidates.append(
+                {
+                    "ref": worker,
+                    "count": count,
+                    "alloc": None if isinstance(allocation, Exception) else allocation,
+                }
+            )
+        if not candidates:
+            raise RuntimeError("No available worker found")
+
+        use_gpu = not (n_gpu is None or (isinstance(n_gpu, int) and n_gpu <= 0))
+        strategy_name = (XINFERENCE_LAUNCH_STRATEGY or "").lower().replace("-", "_")
+        if use_gpu and strategy_name in (
+            "idlefirst",
+            "idle_first_launch_strategy",
+        ):
+            requested_gpu = n_gpu if isinstance(n_gpu, int) else None
+            return IdleFirstLaunchStrategy(self._worker_status).select_worker(
+                candidates, n_gpu=requested_gpu
+            )
+
+        candidates.sort(
+            key=lambda candidate: (candidate["count"], candidate["ref"].address)
+        )
+        return candidates[0]["ref"], None
+
+    @log_async(logger=logger)
+    async def add_model_replicas(
+        self, model_uid: str, replica: int = 1
+    ) -> Tuple[int, List[int]]:
+        """Add replicas to a running, non-sharded model atomically.
+
+        Existing replicas continue serving throughout the operation.  New
+        replicas enter the round-robin scheduler only after every requested
+        replica is ready; if any launch fails, only the new replicas are rolled
+        back.
+        """
+        if replica < 1:
+            raise ValueError("The replica count to add must be at least 1")
+
+        replica_info = self._model_uid_to_replica_info.get(model_uid)
+        if replica_info is None or not replica_info.active_replica_ids:
+            raise ValueError(f"Model not found in the model list, uid: {model_uid}")
+
+        # Serialize membership changes for this model. Launches can take
+        # minutes, while unrelated models continue to scale independently.
+        async with replica_info.operation_lock:
+            if self._model_uid_to_replica_info.get(model_uid) is not replica_info:
+                raise ValueError(f"Model not found in the model list, uid: {model_uid}")
+
+            launch_args = None
+            last_source_error = None
+            for source_replica_id in replica_info.active_replica_ids:
+                source_replica_uid = build_replica_model_uid(
+                    model_uid, source_replica_id
+                )
+                source_worker_refs = self._replica_model_uid_to_worker.get(
+                    source_replica_uid
+                )
+                if source_worker_refs is None:
+                    continue
+                if isinstance(source_worker_refs, (list, tuple)):
+                    if len(source_worker_refs) != 1:
+                        raise ValueError(
+                            "Dynamically adding replicas is not supported for "
+                            "multi-worker sharded models"
+                        )
+                    source_worker = source_worker_refs[0]
+                else:
+                    source_worker = source_worker_refs
+                try:
+                    launch_args = await source_worker.get_model_launch_args(
+                        source_replica_uid
+                    )
+                    break
+                except Exception as e:
+                    last_source_error = e
+                    logger.warning(
+                        "Failed to read launch arguments from replica %s",
+                        source_replica_uid,
+                        exc_info=True,
+                    )
+            if launch_args is None:
+                if last_source_error is not None:
+                    raise RuntimeError(
+                        f"Failed to read launch arguments for model {model_uid}"
+                    ) from last_source_error
+                raise ModelNotReadyError(
+                    f"Model {model_uid} is launching, not yet ready to scale"
+                )
+            if launch_args.get("xavier_config") is not None:
+                raise ValueError(
+                    "Dynamically adding replicas is not supported for Xavier-enabled models"
+                )
+            if int(launch_args.get("n_worker") or 1) > 1:
+                raise ValueError(
+                    "Dynamically adding replicas is not supported for multi-worker sharded models"
+                )
+
+            first_replica_id = max(replica_info.active_replica_ids) + 1
+            replica_ids = list(range(first_replica_id, first_replica_id + replica))
+            launched: List[Tuple[int, str, xo.ActorRefType["WorkerActor"]]] = []
+            current: Optional[Tuple[int, str, xo.ActorRefType["WorkerActor"]]] = None
+
+            try:
+                for replica_id in replica_ids:
+                    replica_model_uid = build_replica_model_uid(model_uid, replica_id)
+                    n_gpu = launch_args.get("n_gpu", "auto")
+                    (
+                        worker_ref,
+                        target_gpu_idx,
+                    ) = await self._choose_worker_for_new_replica(n_gpu)
+                    current = (replica_id, replica_model_uid, worker_ref)
+                    await self._status_guard_ref.update_replica_status(
+                        model_uid,
+                        replica_id,
+                        {
+                            "replica_model_uid": replica_model_uid,
+                            "worker_address": worker_ref.address,
+                            "status": LaunchStatus.CREATING.name,
+                            "created_ts": int(time.time()),
+                        },
+                    )
+
+                    new_launch_args = dict(launch_args)
+                    new_launch_args.pop("launch_ts", None)
+                    new_launch_args["model_uid"] = replica_model_uid
+                    # A worker-local GPU index from the source replica must
+                    # never leak into placement on another worker.
+                    new_launch_args["gpu_idx"] = target_gpu_idx
+                    await worker_ref.launch_builtin_model(**new_launch_args)
+                    await worker_ref.wait_for_load(replica_model_uid)
+                    await self._status_guard_ref.update_replica_status(
+                        model_uid,
+                        replica_id,
+                        {"status": LaunchStatus.READY.name},
+                    )
+                    launched.append((replica_id, replica_model_uid, worker_ref))
+                    current = None
+
+                await self._status_guard_ref.update_instance_info(
+                    model_uid,
+                    {
+                        "replica": len(replica_info.active_replica_ids) + len(launched),
+                        "status": LaunchStatus.READY.name,
+                    },
+                )
+            except Exception:
+                rollback = list(launched)
+                if current is not None:
+                    rollback.append(current)
+                for replica_id, replica_model_uid, worker_ref in rollback:
+                    try:
+                        await worker_ref.terminate_model(model_uid=replica_model_uid)
+                    except Exception:
+                        logger.debug(
+                            "Failed to roll back replica %s",
+                            replica_model_uid,
+                            exc_info=True,
+                        )
+                    try:
+                        await self._status_guard_ref.remove_replica_status(
+                            model_uid, replica_id
+                        )
+                    except Exception:
+                        logger.debug(
+                            "Failed to remove rolled-back replica status %s",
+                            replica_model_uid,
+                            exc_info=True,
+                        )
+                raise
+
+            for replica_id, replica_model_uid, worker_ref in launched:
+                self._replica_model_uid_to_worker[replica_model_uid] = worker_ref
+                replica_info.replica_to_worker_refs[replica_id].append(worker_ref)
+                replica_info.active_replica_ids.append(replica_id)
+                self._unexpected_down_replicas.pop((model_uid, replica_id), None)
+            self._refresh_replica_scheduler(replica_info)
+            self._invalidate_list_models_debounce_cache()
+            return replica_info.replica, replica_ids
+
     async def get_instance_count(self, model_name: str) -> int:
         return await self._status_guard_ref.get_instance_count(model_name)
 
@@ -2840,6 +3050,13 @@ class SupervisorActor(xo.StatelessActor):
 
     @log_async(logger=logger)
     async def terminate_model(self, model_uid: str, suppress_exception=False):
+        replica_info = self._model_uid_to_replica_info.get(model_uid)
+        if replica_info is None:
+            raise ValueError(f"Model not found in the model list, uid: {model_uid}")
+        async with replica_info.operation_lock:
+            return await self._terminate_model(model_uid, suppress_exception)
+
+    async def _terminate_model(self, model_uid: str, suppress_exception=False):
         async def _terminate_one_model(_replica_model_uid):
             worker_refs = self._replica_model_uid_to_worker.get(
                 _replica_model_uid, None
@@ -2905,6 +3122,17 @@ class SupervisorActor(xo.StatelessActor):
 
     @log_async(logger=logger)
     async def terminate_model_replica(
+        self, model_uid: str, replica_id: int, suppress_exception: bool = False
+    ) -> int:
+        replica_info = self._model_uid_to_replica_info.get(model_uid)
+        if replica_info is None:
+            raise ValueError(f"Model not found in the model list, uid: {model_uid}")
+        async with replica_info.operation_lock:
+            return await self._terminate_model_replica(
+                model_uid, replica_id, suppress_exception
+            )
+
+    async def _terminate_model_replica(
         self, model_uid: str, replica_id: int, suppress_exception: bool = False
     ) -> int:
         replica_info = self._model_uid_to_replica_info.get(model_uid, None)
@@ -3048,6 +3276,15 @@ class SupervisorActor(xo.StatelessActor):
         if parsed is None:
             return
         base_uid, replica_idx = parsed
+        replica_info = self._model_uid_to_replica_info.get(base_uid)
+        if replica_info is None:
+            return
+        async with replica_info.operation_lock:
+            await self._mark_replica_dead(replica_model_uid, base_uid, replica_idx)
+
+    async def _mark_replica_dead(
+        self, replica_model_uid: str, base_uid: str, replica_idx: int
+    ) -> None:
 
         replica_info = self._model_uid_to_replica_info.get(base_uid)
         if replica_info is None:

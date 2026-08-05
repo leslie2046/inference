@@ -1380,6 +1380,19 @@ class Client:
         response_data = response.json()
         return response_data["remaining_replicas"]
 
+    def add_model_replicas(self, model_uid: str, replica: int = 1) -> dict:
+        """Dynamically add replicas to a running model."""
+
+        url = f"{self.base_url}/v1/models/{model_uid}/replicas"
+        response = self.session.post(
+            url, json={"replica": replica}, headers=self._headers
+        )
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"Failed to add model replicas, detail: {_get_error_string(response)}"
+            )
+        return response.json()
+
     def get_launch_model_progress(self, model_uid: str) -> dict:
         """
         Get progress of the specific model.

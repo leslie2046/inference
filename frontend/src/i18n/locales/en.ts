@@ -228,6 +228,9 @@ const en = {
     gpuIndexes: 'GPU Indexes',
     gpuMemory: 'GPU Memory',
     replicaDetail: 'Replica Details',
+    addReplica: 'Add replica',
+    addReplicaSuccess: 'Replica added successfully',
+    addReplicaFailed: 'Failed to add replica',
     removeReplicaConfirm:
       'Are you sure you want to remove replica {{replicaId}} of model {{modelUid}}?',
     autostartEnabled: 'Autostart configured',
@@ -696,7 +699,8 @@ const en = {
   },
   common: {
     accessDenied: 'Access Denied',
-    accessDeniedDescription: 'You do not have the required permission ({{scope}}) to access this page.',
+    accessDeniedDescription:
+      'You do not have the required permission ({{scope}}) to access this page.',
     valueEmpty: 'Cannot be empty',
     patternError: 'Invalid format, please check',
     loginSuccess: 'Login successful',
