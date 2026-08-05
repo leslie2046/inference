@@ -110,6 +110,12 @@ const en = {
     gpuCount: 'GPU: {{count}}',
     nGpuLayers: 'N GPU Layers',
     replica: 'Replica',
+    additionalReplicaCount: 'Replicas to add',
+    replicaCountPreview: 'Current {{current}} → {{total}} after adding',
+    addReplica: 'Add replicas',
+    deployDialogDescription: 'Configure and deploy a new model instance.',
+    addReplicaDialogDescription:
+      'Reuse the current model configuration. Only the replica count and Worker or GPU resources can be changed.',
     advancedConfiguration: 'Advanced Configuration',
     runtimeEnvironment: 'Runtime Environment',
     engineParameters: 'Engine Parameters',

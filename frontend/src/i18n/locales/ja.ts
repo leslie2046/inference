@@ -110,6 +110,12 @@ const ja = {
     gpuCount: 'GPU数: {{count}}',
     nGpuLayers: 'GPUレイヤー数',
     replica: 'レプリカ',
+    additionalReplicaCount: '追加するレプリカ数',
+    replicaCountPreview: '現在 {{current}} 個 → 追加後 {{total}} 個',
+    addReplica: 'レプリカを追加',
+    deployDialogDescription: '新しいモデルインスタンスを設定してデプロイします。',
+    addReplicaDialogDescription:
+      '現在のモデル設定を再利用します。変更できるのはレプリカ数とワーカーまたはGPUリソースのみです。',
     advancedConfiguration: '高度な設定',
     runtimeEnvironment: '実行環境',
     engineParameters: 'エンジンパラメータ',

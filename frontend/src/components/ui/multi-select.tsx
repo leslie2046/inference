@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useRef, useEffect, useCallback } from 'react';
+import { useState, useRef, useEffect, useCallback, useId } from 'react';
 import { createPortal } from 'react-dom';
 import { cn } from '@/lib/utils';
 import { ChevronDown, X, Check } from 'lucide-react';
@@ -53,8 +53,9 @@ export function MultiSelect({
   const [searchQuery, setSearchQuery] = useState('');
 
   const containerRef = useRef<HTMLDivElement>(null);
-  const triggerRef = useRef<HTMLButtonElement>(null);
+  const triggerRef = useRef<HTMLDivElement>(null);
   const dropdownRef = useRef<HTMLDivElement>(null);
+  const dropdownId = useId();
 
   const selectedValues = Array.isArray(value) ? value : [];
   const getPortalContainer = useCallback(() => {
@@ -72,9 +73,7 @@ export function MultiSelect({
     if (!trigger || !portalContainer) return;
 
     const rect = trigger.getBoundingClientRect();
-    const boundaryRect = trigger
-      .closest('[data-slot="dialog-body"]')
-      ?.getBoundingClientRect();
+    const boundaryRect = trigger.closest('[data-slot="dialog-body"]')?.getBoundingClientRect();
     const boundaryTop = boundaryRect?.top ?? 0;
     const boundaryBottom = boundaryRect?.bottom ?? window.innerHeight;
     const spaceBelow = boundaryBottom - rect.bottom - 50;
@@ -205,11 +204,25 @@ export function MultiSelect({
 
   return (
     <div ref={containerRef} className={cn('relative w-full', className)}>
-      <button
+      <div
         ref={triggerRef}
-        type="button"
-        disabled={disabled}
+        role="combobox"
+        aria-controls={dropdownId}
+        aria-expanded={open}
+        aria-haspopup="listbox"
+        aria-disabled={disabled}
+        tabIndex={disabled ? -1 : 0}
         onClick={toggleOpen}
+        onKeyDown={(event) => {
+          if (disabled) return;
+          if (event.key === 'Enter' || event.key === ' ' || event.key === 'ArrowDown') {
+            event.preventDefault();
+            setOpen(true);
+          }
+          if (event.key === 'Escape') {
+            setOpen(false);
+          }
+        }}
         className={cn(
           'border-input flex min-h-9 w-full items-center justify-between rounded-md border bg-transparent px-3 py-1 text-sm outline-none transition-all',
 
@@ -218,7 +231,7 @@ export function MultiSelect({
           error &&
             'border-destructive focus-within:border-destructive focus-within:ring-destructive/40',
 
-          disabled && 'cursor-not-allowed opacity-50'
+          disabled ? 'cursor-not-allowed opacity-50' : 'cursor-pointer'
         )}
       >
         <div className="flex flex-1 items-center gap-1 overflow-hidden flex-wrap">
@@ -251,14 +264,17 @@ export function MultiSelect({
             open && 'rotate-180'
           )}
         />
-      </button>
+      </div>
 
       {open &&
         dropdownStyle &&
         portalContainer &&
         createPortal(
           <div
+            id={dropdownId}
             ref={dropdownRef}
+            role="listbox"
+            aria-multiselectable="true"
             data-slot="select-dropdown"
             style={dropdownStyle}
             className={cn(
@@ -291,6 +307,8 @@ export function MultiSelect({
                     <button
                       key={option.value}
                       type="button"
+                      role="option"
+                      aria-selected={active}
                       onClick={() => handleSelect(option.value)}
                       className={cn(
                         'w-full rounded-[4px] px-3 py-2 text-left text-sm transition-colors',

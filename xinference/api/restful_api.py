@@ -24,7 +24,7 @@ import time
 import uuid
 import warnings
 from pathlib import Path
-from typing import Any, List, Optional, Union, get_type_hints
+from typing import Any, Dict, List, Optional, Union, get_type_hints
 
 import xoscar as xo
 from aioprometheus import REGISTRY, MetricsMiddleware
@@ -988,10 +988,47 @@ class RESTfulAPI(CancelMixin):
         """Dynamically add replicas to a running model."""
         payload = await request.json()
         replica = _validate_replica(payload.get("replica", 1))
+        worker_ip = payload.get("worker_ip")
+        gpu_idx = payload.get("gpu_idx")
+        if isinstance(worker_ip, list):
+            worker_ip = ",".join(
+                str(item).strip() for item in worker_ip if str(item).strip()
+            )
+        if worker_ip is not None and not isinstance(worker_ip, str):
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid input. `worker_ip` must be a string or a list of strings.",
+            )
+        if isinstance(gpu_idx, int) and not isinstance(gpu_idx, bool):
+            gpu_idx = [gpu_idx]
+        if gpu_idx is not None and (
+            not isinstance(gpu_idx, list)
+            or any(
+                isinstance(index, bool) or not isinstance(index, int) or index < 0
+                for index in gpu_idx
+            )
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid input. `gpu_idx` must contain non-negative integers.",
+            )
+        if gpu_idx and len(gpu_idx) % replica:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid input. Allocated gpu must be a multiple of replica.",
+            )
+
+        resource_options: Dict[str, Any] = {}
+        if "n_gpu" in payload:
+            resource_options["n_gpu"] = payload["n_gpu"]
+        if worker_ip:
+            resource_options["worker_ip"] = worker_ip
+        if gpu_idx:
+            resource_options["gpu_idx"] = gpu_idx
         try:
             total, replica_ids = await (
                 await self._get_supervisor_ref()
-            ).add_model_replicas(model_uid, replica)
+            ).add_model_replicas(model_uid, replica, **resource_options)
             return JSONResponse(content={"replica": total, "replica_ids": replica_ids})
         except ValueError as ve:
             logger.error(str(ve), exc_info=True)

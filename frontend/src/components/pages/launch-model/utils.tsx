@@ -163,7 +163,7 @@ export function renderLaunchFields(fields: LaunchFieldConfig[]) {
   return fields
     .filter((field) => field.show !== false)
     .map((field) => (
-      <div key={field.name} className={field.colSpan === 2 ? 'col-span-2' : undefined}>
+      <div key={field.name} className={field.colSpan === 2 ? 'sm:col-span-2' : undefined}>
         {renderLaunchField(field)}
       </div>
     ));
@@ -933,10 +933,7 @@ export function normalizeWorkerAddress(value: unknown) {
   }
 }
 
-export function extractWorkerItems(
-  clusterInfo: ClusterInfoResponse,
-  t: TFunc
-): WorkerOption[] {
+export function extractWorkerItems(clusterInfo: ClusterInfoResponse, t: TFunc): WorkerOption[] {
   if (!clusterInfo) return [];
   const isFlatNodeList = Array.isArray(clusterInfo);
   const nodes = isFlatNodeList ? clusterInfo : clusterInfo.workers || [];
