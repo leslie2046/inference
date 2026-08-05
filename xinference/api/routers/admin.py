@@ -796,9 +796,11 @@ def _audit_entry_in_time_range(
         timestamp = datetime.fromisoformat(
             str(entry.get("@timestamp", "")).replace("Z", "+00:00")
         )
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.replace(tzinfo=timezone.utc)
+        return not ((t_from and timestamp < t_from) or (t_to and timestamp > t_to))
     except (ValueError, TypeError):
         return False
-    return not ((t_from and timestamp < t_from) or (t_to and timestamp > t_to))
 
 
 async def _search_audit_from_file(
@@ -821,9 +823,6 @@ async def _search_audit_from_file(
     from ...constants import XINFERENCE_LOG_DIR
 
     audit_path = os.path.join(XINFERENCE_LOG_DIR, "audit.log")
-    if not os.path.exists(audit_path):
-        return JSONResponse(content={"hits": [], "total": 0})
-
     t_from = _parse_relative_time(time_from)
     t_to = _parse_relative_time(time_to)
 
@@ -846,59 +845,66 @@ async def _search_audit_from_file(
         else set()
     )
 
-    results: list[dict] = []
-    try:
-        with open(audit_path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    entry = json.loads(line)
-                except (json.JSONDecodeError, ValueError):
-                    continue
+    def _read_and_filter_entries() -> dict[str, Any]:
+        results: list[dict] = []
+        try:
+            with open(audit_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entry = json.loads(line)
+                    except (json.JSONDecodeError, ValueError):
+                        continue
 
-                if not _audit_entry_in_time_range(entry, t_from, t_to):
-                    continue
+                    if not _audit_entry_in_time_range(entry, t_from, t_to):
+                        continue
 
-                text_filters = (
-                    ("user", user),
-                    ("api_key_name", api_key_name),
-                    ("model_id", model_id),
-                    ("model_name", model_name),
-                    ("client_ip", client_ip),
-                )
-                if any(
-                    query and not _matches_audit_text_filter(entry.get(field), query)
-                    for field, query in text_filters
-                ):
-                    continue
-                if status_set and entry.get("status", "").lower() not in status_set:
-                    continue
-                if (
-                    category_set
-                    and entry.get("category", "").lower() not in category_set
-                ):
-                    continue
-                if (
-                    model_type_set
-                    and entry.get("model_type", "").lower() not in model_type_set
-                ):
-                    continue
-                if (
-                    auth_type_set
-                    and entry.get("auth_type", "").lower() not in auth_type_set
-                ):
-                    continue
+                    text_filters = (
+                        ("user", user),
+                        ("api_key_name", api_key_name),
+                        ("model_id", model_id),
+                        ("model_name", model_name),
+                        ("client_ip", client_ip),
+                    )
+                    if any(
+                        query
+                        and not _matches_audit_text_filter(entry.get(field), query)
+                        for field, query in text_filters
+                    ):
+                        continue
+                    if status_set and entry.get("status", "").lower() not in status_set:
+                        continue
+                    if (
+                        category_set
+                        and entry.get("category", "").lower() not in category_set
+                    ):
+                        continue
+                    if (
+                        model_type_set
+                        and entry.get("model_type", "").lower() not in model_type_set
+                    ):
+                        continue
+                    if (
+                        auth_type_set
+                        and entry.get("auth_type", "").lower() not in auth_type_set
+                    ):
+                        continue
 
-                results.append(entry)
-    except OSError:
-        return JSONResponse(content={"hits": [], "total": 0})
+                    results.append(entry)
+        except OSError:
+            return {"hits": [], "total": 0}
 
-    results.sort(key=lambda x: x.get("@timestamp", ""), reverse=True)
-    total = len(results)
-    hits = results[page_from : page_from + size]
-    return JSONResponse(content={"hits": hits, "total": total})
+        results.sort(key=lambda x: x.get("@timestamp", ""), reverse=True)
+        total = len(results)
+        return {
+            "hits": results[page_from : page_from + size],
+            "total": total,
+        }
+
+    content = await asyncio.to_thread(_read_and_filter_entries)
+    return JSONResponse(content=content)
 
 
 async def _list_audit_filter_options_from_file(
@@ -906,36 +912,36 @@ async def _list_audit_filter_options_from_file(
 ) -> JSONResponse:
     from ...constants import XINFERENCE_LOG_DIR
 
-    options: dict[str, set[str]] = {
-        field_name: set() for field_name in _AUDIT_TEXT_FILTER_FIELDS
-    }
     audit_path = os.path.join(XINFERENCE_LOG_DIR, "audit.log")
-    if not os.path.exists(audit_path):
-        return JSONResponse(content={key: [] for key in options})
-
     t_from = _parse_relative_time(time_from)
     t_to = _parse_relative_time(time_to)
-    try:
-        with open(audit_path, "r", encoding="utf-8") as f:
-            for line in f:
-                try:
-                    entry = json.loads(line)
-                except (json.JSONDecodeError, ValueError):
-                    continue
-                if not _audit_entry_in_time_range(entry, t_from, t_to):
-                    continue
-                for field_name in _AUDIT_TEXT_FILTER_FIELDS:
-                    value = entry.get(field_name)
-                    if value is not None and str(value):
-                        options[field_name].add(str(value))
-    except OSError:
-        return JSONResponse(content={key: [] for key in options})
 
-    return JSONResponse(
-        content={
+    def _read_options() -> dict[str, list[str]]:
+        options: dict[str, set[str]] = {
+            field_name: set() for field_name in _AUDIT_TEXT_FILTER_FIELDS
+        }
+        try:
+            with open(audit_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        entry = json.loads(line)
+                    except (json.JSONDecodeError, ValueError):
+                        continue
+                    if not _audit_entry_in_time_range(entry, t_from, t_to):
+                        continue
+                    for field_name in _AUDIT_TEXT_FILTER_FIELDS:
+                        value = entry.get(field_name)
+                        if value is not None and str(value):
+                            options[field_name].add(str(value))
+        except OSError:
+            return {key: [] for key in options}
+
+        return {
             key: sorted(values, key=str.casefold) for key, values in options.items()
         }
-    )
+
+    content = await asyncio.to_thread(_read_options)
+    return JSONResponse(content=content)
 
 
 async def list_audit_filter_options(
@@ -992,8 +998,8 @@ async def list_audit_filter_options(
                 raise HTTPException(
                     status_code=502, detail="Elasticsearch query failed"
                 )
-    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-        logger.error("ES connection error or timeout: %s", e)
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as e:
+        logger.error("ES connection error, timeout, or invalid response: %s", e)
         raise HTTPException(status_code=502, detail="Audit service unavailable")
 
     aggregations = data.get("aggregations", {})
