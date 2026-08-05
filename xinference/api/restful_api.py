@@ -24,7 +24,7 @@ import time
 import uuid
 import warnings
 from pathlib import Path
-from typing import Any, List, Optional, Union, get_type_hints
+from typing import Any, Dict, List, Optional, Union, get_type_hints
 
 import xoscar as xo
 from aioprometheus import REGISTRY, MetricsMiddleware
@@ -76,6 +76,13 @@ from ..types import (
     max_tokens_field,
 )
 from .frontend_static import mount_frontend
+from .pdf_ocr import (
+    DEFAULT_PDF_OCR_DPI,
+    PDF_MAGIC,
+    is_pdf_upload,
+    merge_ocr_page_results,
+    rasterize_pdf,
+)
 from .responses import JSONResponse
 from .schemas import (
     AutoConfigLLMRequest,
@@ -981,10 +988,47 @@ class RESTfulAPI(CancelMixin):
         """Dynamically add replicas to a running model."""
         payload = await request.json()
         replica = _validate_replica(payload.get("replica", 1))
+        worker_ip = payload.get("worker_ip")
+        gpu_idx = payload.get("gpu_idx")
+        if isinstance(worker_ip, list):
+            worker_ip = ",".join(
+                str(item).strip() for item in worker_ip if str(item).strip()
+            )
+        if worker_ip is not None and not isinstance(worker_ip, str):
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid input. `worker_ip` must be a string or a list of strings.",
+            )
+        if isinstance(gpu_idx, int) and not isinstance(gpu_idx, bool):
+            gpu_idx = [gpu_idx]
+        if gpu_idx is not None and (
+            not isinstance(gpu_idx, list)
+            or any(
+                isinstance(index, bool) or not isinstance(index, int) or index < 0
+                for index in gpu_idx
+            )
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid input. `gpu_idx` must contain non-negative integers.",
+            )
+        if gpu_idx and len(gpu_idx) % replica:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid input. Allocated gpu must be a multiple of replica.",
+            )
+
+        resource_options: Dict[str, Any] = {}
+        if "n_gpu" in payload:
+            resource_options["n_gpu"] = payload["n_gpu"]
+        if worker_ip:
+            resource_options["worker_ip"] = worker_ip
+        if gpu_idx:
+            resource_options["gpu_idx"] = gpu_idx
         try:
             total, replica_ids = await (
                 await self._get_supervisor_ref()
-            ).add_model_replicas(model_uid, replica)
+            ).add_model_replicas(model_uid, replica, **resource_options)
             return JSONResponse(content={"replica": total, "replica_ids": replica_ids})
         except ValueError as ve:
             logger.error(str(ve), exc_info=True)
@@ -1992,17 +2036,55 @@ class RESTfulAPI(CancelMixin):
                 parsed_kwargs = {}
             request_id = parsed_kwargs.get("request_id")
             self._add_running_task(request_id)
+            head = image.file.read(len(PDF_MAGIC))
+            image.file.seek(0)
+            if is_pdf_upload(image.content_type, head):
+                pages = parsed_kwargs.pop("pages", None)
+                dpi = parsed_kwargs.pop("dpi", DEFAULT_PDF_OCR_DPI)
+                try:
+                    page_iter = await asyncio.to_thread(
+                        rasterize_pdf, image.file.read(), pages=pages, dpi=dpi
+                    )
+                except ValueError as ve:
+                    raise HTTPException(status_code=400, detail=str(ve))
+                # Pages are rendered lazily, one at a time, so peak memory
+                # stays at a single page regardless of document size.
+                page_results = []
+                try:
+                    while True:
+                        item = await asyncio.to_thread(next, page_iter, None)
+                        if item is None:
+                            break
+                        page_number, page_image = item
+                        try:
+                            result = await model_ref.ocr(
+                                image=page_image,
+                                **parsed_kwargs,
+                            )
+                        finally:
+                            page_image.close()
+                        page_results.append((page_number, json.loads(result)))
+                finally:
+                    page_iter.close()
+                body = merge_ocr_page_results(page_results)
+                return Response(content=body, media_type="application/json")
             im = Image.open(image.file)
             text = await model_ref.ocr(
                 image=im,
                 **parsed_kwargs,
             )
-            return Response(content=text, media_type="text/plain")
+            # ModelActor.ocr serializes the model's return value to JSON
+            # bytes, and both REST clients parse the body with
+            # response.json() — declaring text/plain here breaks aiohttp's
+            # content-type check on the async client.
+            return Response(content=text, media_type="application/json")
         except asyncio.CancelledError:
             err_str = f"The request has been cancelled: {request_id}"
             logger.error(err_str)
             await self._report_error_event(model_uid, err_str)
             raise HTTPException(status_code=409, detail=err_str)
+        except HTTPException:
+            raise
         except Exception as e:
             e = await self._get_model_last_error(model_ref.uid, e)
             logger.error(e, exc_info=True)

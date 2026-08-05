@@ -89,6 +89,7 @@ logger = getLogger(__name__)
 
 
 ASYNC_LAUNCH_TASKS = {}  # type: ignore
+_KEEP_EXISTING_N_GPU = object()
 
 
 def callback_for_async_launch(model_uid: str):
@@ -2702,9 +2703,29 @@ class SupervisorActor(xo.StatelessActor):
         ]
 
     async def _choose_worker_for_new_replica(
-        self, n_gpu: Optional[Union[int, str]]
+        self,
+        n_gpu: Optional[Union[int, str]],
+        worker_ip: Optional[str] = None,
     ) -> Tuple[xo.ActorRefType["WorkerActor"], Optional[List[int]]]:
-        workers = list(self._worker_address_to_worker.values())
+        target_worker_refs = (
+            self._get_worker_refs_by_ip(worker_ip)
+            if worker_ip is not None and not self.is_local_deployment()
+            else []
+        )
+        if (
+            worker_ip is not None
+            and not self.is_local_deployment()
+            and not target_worker_refs
+        ):
+            raise ValueError(f"Worker ip address {worker_ip} is not in the cluster.")
+        if worker_ip is not None and self.is_local_deployment():
+            logger.warning(
+                "You specified the worker ip: %s in local mode, "
+                "xinference will ignore this option.",
+                worker_ip,
+            )
+
+        workers = target_worker_refs or list(self._worker_address_to_worker.values())
         if not workers:
             raise RuntimeError("No available worker found")
 
@@ -2755,7 +2776,12 @@ class SupervisorActor(xo.StatelessActor):
 
     @log_async(logger=logger)
     async def add_model_replicas(
-        self, model_uid: str, replica: int = 1
+        self,
+        model_uid: str,
+        replica: int = 1,
+        n_gpu: Any = _KEEP_EXISTING_N_GPU,
+        worker_ip: Optional[str] = None,
+        gpu_idx: Optional[Union[int, List[int]]] = None,
     ) -> Tuple[int, List[int]]:
         """Add replicas to a running, non-sharded model atomically.
 
@@ -2766,6 +2792,14 @@ class SupervisorActor(xo.StatelessActor):
         """
         if replica < 1:
             raise ValueError("The replica count to add must be at least 1")
+        if isinstance(gpu_idx, int):
+            gpu_idx = [gpu_idx]
+        if gpu_idx is not None and not gpu_idx:
+            gpu_idx = None
+        if gpu_idx and len(gpu_idx) % replica:
+            raise ValueError(
+                "gpu_idx length must be a multiple of replica when specifying GPUs."
+            )
 
         replica_info = self._model_uid_to_replica_info.get(model_uid)
         if replica_info is None or not replica_info.active_replica_ids:
@@ -2828,17 +2862,33 @@ class SupervisorActor(xo.StatelessActor):
 
             first_replica_id = max(replica_info.active_replica_ids) + 1
             replica_ids = list(range(first_replica_id, first_replica_id + replica))
+            effective_n_gpu = (
+                launch_args.get("n_gpu", "auto")
+                if n_gpu is _KEEP_EXISTING_N_GPU
+                else n_gpu
+            )
             launched: List[Tuple[int, str, xo.ActorRefType["WorkerActor"]]] = []
             current: Optional[Tuple[int, str, xo.ActorRefType["WorkerActor"]]] = None
 
             try:
-                for replica_id in replica_ids:
+                for replica_offset, replica_id in enumerate(replica_ids):
                     replica_model_uid = build_replica_model_uid(model_uid, replica_id)
-                    n_gpu = launch_args.get("n_gpu", "auto")
                     (
                         worker_ref,
-                        target_gpu_idx,
-                    ) = await self._choose_worker_for_new_replica(n_gpu)
+                        auto_gpu_idx,
+                    ) = await self._choose_worker_for_new_replica(
+                        None if gpu_idx is not None else effective_n_gpu,
+                        worker_ip,
+                    )
+                    target_gpu_idx = (
+                        assign_replica_gpu(
+                            build_replica_model_uid(model_uid, replica_offset),
+                            replica,
+                            gpu_idx,
+                        )
+                        if gpu_idx is not None
+                        else auto_gpu_idx
+                    )
                     current = (replica_id, replica_model_uid, worker_ref)
                     await self._status_guard_ref.update_replica_status(
                         model_uid,
@@ -2854,6 +2904,7 @@ class SupervisorActor(xo.StatelessActor):
                     new_launch_args = dict(launch_args)
                     new_launch_args.pop("launch_ts", None)
                     new_launch_args["model_uid"] = replica_model_uid
+                    new_launch_args["n_gpu"] = effective_n_gpu
                     # A worker-local GPU index from the source replica must
                     # never leak into placement on another worker.
                     new_launch_args["gpu_idx"] = target_gpu_idx

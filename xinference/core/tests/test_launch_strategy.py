@@ -506,8 +506,10 @@ def make_dynamic_replica_supervisor(worker, active_ids):
             self._status_guard_ref = DynamicReplicaStatusGuard(active_ids)
             self._unexpected_down_replicas = {}
             self._list_models_cache_version = 0
+            self.placement_requests = []
 
-        async def _choose_worker_for_new_replica(self, n_gpu):
+        async def _choose_worker_for_new_replica(self, n_gpu, worker_ip=None):
+            self.placement_requests.append((n_gpu, worker_ip))
             return worker, None
 
         def _invalidate_list_models_debounce_cache(self):
@@ -535,6 +537,87 @@ async def test_add_model_replicas_uses_new_ids_and_keeps_source_spec_immutable()
     assert next(info.scheduler) == 2
     assert next(info.scheduler) == 3
     assert supervisor._status_guard_ref.statuses[3]["status"] == "READY"
+
+
+@pytest.mark.asyncio
+async def test_add_model_replicas_applies_resource_overrides_to_new_replicas():
+    worker = DynamicReplicaWorker()
+    worker.launch_args["n_gpu"] = "auto"
+    supervisor = make_dynamic_replica_supervisor(worker, [0, 2])
+
+    total, replica_ids = await supervisor.add_model_replicas(
+        "demo-model",
+        2,
+        n_gpu=1,
+        worker_ip="worker-1",
+        gpu_idx=[2, 3],
+    )
+
+    assert (total, replica_ids) == (4, [3, 4])
+    assert [item["model_uid"] for item in worker.launched] == [
+        "demo-model-rep3",
+        "demo-model-rep4",
+    ]
+    assert [item["n_gpu"] for item in worker.launched] == [1, 1]
+    assert [item["gpu_idx"] for item in worker.launched] == [[2], [3]]
+    assert supervisor.placement_requests == [
+        (None, "worker-1"),
+        (None, "worker-1"),
+    ]
+    assert worker.launch_args["n_gpu"] == "auto"
+    assert worker.launch_args["gpu_idx"] == [7]
+
+
+@pytest.mark.asyncio
+async def test_add_model_replicas_can_override_gpu_launch_with_cpu():
+    worker = DynamicReplicaWorker()
+    worker.launch_args["n_gpu"] = "auto"
+    supervisor = make_dynamic_replica_supervisor(worker, [0])
+
+    await supervisor.add_model_replicas("demo-model", n_gpu=None)
+
+    assert worker.launched[0]["n_gpu"] is None
+    assert worker.launched[0]["gpu_idx"] is None
+    assert supervisor.placement_requests == [(None, None)]
+
+
+@pytest.mark.asyncio
+async def test_new_replica_worker_selection_respects_worker_filter():
+    from xinference.core.supervisor import SupervisorActor
+
+    class PlacementWorker:
+        def __init__(self, address: str, model_count: int):
+            self.address = address
+            self.model_count = model_count
+
+        async def get_model_count(self):
+            return self.model_count
+
+        async def get_gpu_allocation_status(self):
+            return None
+
+    class PlacementSupervisor:
+        _choose_worker_for_new_replica = SupervisorActor._choose_worker_for_new_replica
+        _get_worker_refs_by_ip = SupervisorActor._get_worker_refs_by_ip
+
+        def __init__(self):
+            self._worker_address_to_worker = {
+                "w1:1000": PlacementWorker("w1:1000", 0),
+                "w2:1000": PlacementWorker("w2:1000", 5),
+            }
+
+        @staticmethod
+        def is_local_deployment():
+            return False
+
+    supervisor = PlacementSupervisor()
+    worker, gpu_idx = await supervisor._choose_worker_for_new_replica(None, "w2")
+
+    assert worker.address == "w2:1000"
+    assert gpu_idx is None
+
+    with pytest.raises(ValueError, match="Worker ip address missing"):
+        await supervisor._choose_worker_for_new_replica(None, "missing")
 
 
 @pytest.mark.asyncio

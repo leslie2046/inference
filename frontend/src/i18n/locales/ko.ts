@@ -110,6 +110,12 @@ const ko = {
     gpuCount: 'GPU 수: {{count}}',
     nGpuLayers: 'GPU 레이어 수',
     replica: '레플리카',
+    additionalReplicaCount: '추가할 레플리카 수',
+    replicaCountPreview: '현재 {{current}}개 → 추가 후 {{total}}개',
+    addReplica: '레플리카 추가',
+    deployDialogDescription: '새 모델 인스턴스를 구성하고 배포합니다.',
+    addReplicaDialogDescription:
+      '현재 모델 구성을 재사용합니다. 레플리카 수와 Worker 또는 GPU 리소스만 변경할 수 있습니다.',
     advancedConfiguration: '고급 설정',
     runtimeEnvironment: '실행 환경',
     engineParameters: '엔진 매개변수',

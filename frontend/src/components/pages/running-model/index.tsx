@@ -23,9 +23,14 @@ import { Button } from '@/components/ui/button';
 import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { InfoTooltip } from '@/components/ui/tooltip';
 import { useI18n } from '@/contexts/i18n-context';
+import { ModelType } from '@/constants';
 import type { RunningModelItem, ReplicaItem } from '@/types/services';
+import type { FormValues } from '@/types/form';
 import request from '@/lib/request';
 import { cn } from '@/lib/utils';
+import LaunchDialog from '@/components/pages/launch-model/launch-dialog/launch-dialog';
+import type { CatalogModel, RequestModelType } from '@/components/pages/launch-model/types';
+import { normalizeWorkerAddress } from '@/components/pages/launch-model/utils';
 import {
   getTryApiAbility,
   TryApiDrawer,
@@ -94,7 +99,8 @@ const RunningModel = () => {
   const [deleteConfirmLoading, setDeleteConfirmLoading] = useState(false);
   const [deleteReplicaId, setDeleteReplicaId] = useState<string | undefined>(undefined);
   const [deleteReplicaLoading, setDeleteReplicaLoading] = useState(false);
-  const [addReplicaLoading, setAddReplicaLoading] = useState(false);
+  const [addReplicaTarget, setAddReplicaTarget] = useState<RunningModelItem>();
+  const [gpuAvailable, setGpuAvailable] = useState(-1);
   const [tryApiOpen, setTryApiOpen] = useState(false);
   const tryApiAbility = useMemo(
     () => getTryApiAbility(activeModel?.model_ability || []),
@@ -115,6 +121,63 @@ const RunningModel = () => {
 
     return filteredModels;
   }, [models, query]);
+
+  const addReplicaModel = useMemo<CatalogModel | undefined>(() => {
+    if (!addReplicaTarget) return undefined;
+
+    return {
+      ...addReplicaTarget,
+      model_name: addReplicaTarget.model_name,
+      model_description: addReplicaTarget.model_description || '',
+      abilities: addReplicaTarget.model_ability || [],
+      languages: addReplicaTarget.model_lang || [],
+      modelSpecs: [
+        {
+          model_format: addReplicaTarget.model_format || '',
+          model_uri: '',
+          model_size_in_billions: addReplicaTarget.model_size_in_billions ?? '',
+          quantization: addReplicaTarget.quantization || undefined,
+          quantizations: addReplicaTarget.quantization
+            ? [addReplicaTarget.quantization]
+            : undefined,
+        },
+      ],
+    };
+  }, [addReplicaTarget]);
+
+  const addReplicaConfig = useMemo<FormValues | undefined>(() => {
+    if (!addReplicaTarget) return undefined;
+
+    const acceleratorIndexes = (addReplicaTarget.accelerators || [])
+      .map(String)
+      .filter((value) => /^\d+$/.test(value));
+    const hasAccelerator = (addReplicaTarget.accelerators || []).length > 0;
+    const usesGpuCount = [ModelType.LLM, ModelType.Image].includes(
+      addReplicaTarget.model_type as ModelType
+    );
+    const workerIp = normalizeWorkerAddress(addReplicaTarget.address);
+
+    return {
+      model_name: addReplicaTarget.model_name,
+      model_type: addReplicaTarget.model_type,
+      model_uid: addReplicaTarget.id,
+      model_engine: addReplicaTarget.model_engine,
+      model_format: addReplicaTarget.model_format,
+      model_size_in_billions: addReplicaTarget.model_size_in_billions,
+      quantization: addReplicaTarget.quantization,
+      multimodal_projector: addReplicaTarget.multimodal_projector || undefined,
+      replica: 1,
+      n_gpu: usesGpuCount
+        ? hasAccelerator
+          ? acceleratorIndexes.length || 'auto'
+          : 'CPU'
+        : hasAccelerator
+          ? 'GPU'
+          : 'CPU',
+      gpu_idx: acceleratorIndexes.length ? acceleratorIndexes : undefined,
+      worker_ip: workerIp || undefined,
+    };
+  }, [addReplicaTarget]);
 
   const fetchModels = useCallback(() => {
     setLoading(true);
@@ -151,6 +214,16 @@ const RunningModel = () => {
       .catch(() => {
         setAutostartModelIds([]);
       });
+  }, []);
+
+  const fetchGpuAvailable = useCallback(() => {
+    request
+      .get('/v1/cluster/devices')
+      .then((res) => {
+        const count = Number.parseInt(String(res), 10);
+        setGpuAvailable(Number.isFinite(count) ? count : 0);
+      })
+      .catch(() => setGpuAvailable(0));
   }, []);
 
   const fetchReplicas = useCallback((modelUid: string) => {
@@ -208,20 +281,7 @@ const RunningModel = () => {
 
   const handleAddReplica = () => {
     if (!activeModel) return;
-    setAddReplicaLoading(true);
-    request
-      .post(`/v1/models/${activeModel.id}/replicas`, { replica: 1 }, { noTimeout: true })
-      .then(() => {
-        toast.success(t('runningModels.addReplicaSuccess'));
-        fetchReplicas(activeModel.id);
-        fetchModels();
-      })
-      .catch(() => {
-        toast.error(t('runningModels.addReplicaFailed'));
-      })
-      .finally(() => {
-        setAddReplicaLoading(false);
-      });
+    setAddReplicaTarget(activeModel);
   };
 
   const handleRemoveAutostart = (modelUid: string) => {
@@ -431,15 +491,8 @@ const RunningModel = () => {
           </div>
           <div className="flex items-center justify-between">
             <h3 className="font-medium">{t('runningModels.replicaDetail')}</h3>
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              loading={addReplicaLoading}
-              disabled={addReplicaLoading}
-              onClick={handleAddReplica}
-            >
-              {!addReplicaLoading && <Plus className="size-4" />}
+            <Button type="button" variant="outline" size="sm" onClick={handleAddReplica}>
+              <Plus className="size-4" />
               {t('runningModels.addReplica')}
             </Button>
           </div>
@@ -488,7 +541,8 @@ const RunningModel = () => {
   useEffect(() => {
     fetchModels();
     fetchAutostartModels();
-  }, [fetchAutostartModels, fetchModels]);
+    fetchGpuAvailable();
+  }, [fetchAutostartModels, fetchGpuAvailable, fetchModels]);
 
   return (
     <PageContainer
@@ -546,6 +600,27 @@ const RunningModel = () => {
         confirmClassName="bg-destructive  hover:bg-destructive/90"
         onConfirm={handleDeleteReplica}
         isLoading={deleteReplicaLoading}
+      />
+      <LaunchDialog
+        mode="add-replica"
+        model={addReplicaModel}
+        modelType={(addReplicaTarget?.model_type || ModelType.LLM) as RequestModelType}
+        gpuAvailable={Math.max(
+          gpuAvailable,
+          addReplicaTarget?.accelerators?.filter((value) => /^\d+$/.test(String(value))).length || 0
+        )}
+        deploymentUid={addReplicaTarget?.id}
+        replicaConfig={addReplicaConfig}
+        currentReplicaCount={addReplicaTarget?.replica || 0}
+        onSuccess={() => {
+          if (addReplicaTarget?.id) {
+            fetchReplicas(addReplicaTarget.id);
+          }
+          fetchModels();
+        }}
+        onOpenChange={(open) => {
+          if (!open) setAddReplicaTarget(undefined);
+        }}
       />
       <TryApiDrawer
         open={tryApiOpen}
