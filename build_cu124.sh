@@ -11,13 +11,18 @@ shift
 
 image_repository=${IMAGE_REPOSITORY:-leslie2046/xinference}
 image="${image_repository}:${version}-cu124"
-proxy_url=${PROXY_URL:-http://192.168.0.188:21026}
+# Keep a rolling tag so inline layer metadata can be reused across versions.
+cache_image=${CACHE_IMAGE:-${image_repository}:buildcache-cu124}
+# An explicitly empty PROXY_URL disables the private-network default.
+proxy_url=${PROXY_URL-http://192.168.0.188:21026}
 
 build_args=(
   --progress=plain
   --memory=8g
   --build-arg BUILDKIT_INLINE_CACHE=1
+  --cache-from "$cache_image"
   --cache-from "$image"
+  --tag "$cache_image"
   --tag "$image"
   --file xinference/deploy/docker/Dockerfile.cu124
 )

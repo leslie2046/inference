@@ -1,1 +1,2 @@
 .git_archival.txt export-subst
+build_cu124.sh text eol=lf
