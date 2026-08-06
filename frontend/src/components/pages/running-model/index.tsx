@@ -179,6 +179,10 @@ const RunningModel = () => {
     };
   }, [addReplicaTarget]);
 
+  const currentReplicaCount = addReplicaTarget
+    ? (replicaLogs[addReplicaTarget.id]?.length ?? addReplicaTarget.replica ?? 0)
+    : 0;
+
   const fetchModels = useCallback(() => {
     setLoading(true);
     request
@@ -611,7 +615,7 @@ const RunningModel = () => {
         )}
         deploymentUid={addReplicaTarget?.id}
         replicaConfig={addReplicaConfig}
-        currentReplicaCount={addReplicaTarget?.replica || 0}
+        currentReplicaCount={currentReplicaCount}
         onSuccess={() => {
           if (addReplicaTarget?.id) {
             fetchReplicas(addReplicaTarget.id);
