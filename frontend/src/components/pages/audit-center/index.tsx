@@ -22,6 +22,7 @@ import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog';
+import { Input } from '@/components/ui/input';
 import { JSONSyntaxHighlighter } from '@/components/ui/json-syntax-highlighter';
 import { Label } from '@/components/ui/label';
 import { MultiSelect } from '@/components/ui/multi-select';
@@ -390,9 +391,8 @@ export default function AuditCenter() {
   const hasFilters = Object.values(filters).some((value) =>
     Array.isArray(value) ? value.length > 0 : Boolean(value)
   );
-  const maxAccessibleTotal = Math.min(total, 10000);
   const currentPage = Math.floor(pageFrom / AUDIT_PAGE_SIZE) + 1;
-  const totalPages = Math.ceil(maxAccessibleTotal / AUDIT_PAGE_SIZE) || 1;
+  const totalPages = Math.ceil(total / AUDIT_PAGE_SIZE) || 1;
   const lastPageFrom = (totalPages - 1) * AUDIT_PAGE_SIZE;
 
   useEffect(() => {
@@ -713,7 +713,7 @@ export default function AuditCenter() {
             className="size-8"
             aria-label={t('auditCenter.nextPage')}
             title={t('auditCenter.nextPage')}
-            disabled={pageFrom + AUDIT_PAGE_SIZE >= maxAccessibleTotal}
+            disabled={pageFrom + AUDIT_PAGE_SIZE >= total}
             onClick={() => setPageFrom(pageFrom + AUDIT_PAGE_SIZE)}
           >
             <ChevronRight />
