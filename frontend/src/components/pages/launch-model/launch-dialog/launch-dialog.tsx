@@ -1,7 +1,7 @@
 'use client';
 
 import { useCallback, useEffect, useId, useMemo, useState, useRef } from 'react';
-import { Ban, Plus, Rocket } from 'lucide-react';
+import { Ban, Rocket } from 'lucide-react';
 import { toast } from 'sonner';
 import { useRouter } from 'next/navigation';
 import request from '@/lib/request';
@@ -20,7 +20,6 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/comp
 import {
   Dialog,
   DialogContent,
-  DialogDescription,
   DialogFooter,
   DialogHeader,
   DialogTitle,
@@ -54,46 +53,26 @@ import {
   isVisibleRequiredLaunchField,
   extractWorkerItems,
   requiresGpuWorkers,
+  GPU_IDX_PATTERN,
 } from '../utils';
 import CommandLine from './command-line';
+import ReplicaPlacementConfig from './replica-placement-config';
 import { FormField } from '@/components/ui/form-field';
 
 interface LaunchDialogProps {
   model?: CatalogModel;
   modelType: RequestModelType;
   gpuAvailable: number;
-  mode?: 'deploy' | 'add-replica';
-  deploymentUid?: string;
-  replicaConfig?: FormValues;
-  currentReplicaCount?: number;
-  onSuccess?: () => void;
   onOpenChange: (open: boolean) => void;
 }
-
-const ADD_REPLICA_EDITABLE_FIELDS = new Set(['replica', 'n_gpu', 'gpu_idx', 'worker_ip']);
-const ADD_REPLICA_VISIBLE_FIELDS = new Set([
-  ...ADD_REPLICA_EDITABLE_FIELDS,
-  'model_uid',
-  'model_engine',
-  'model_format',
-  'model_size_in_billions',
-  'quantization',
-  'multimodal_projector',
-]);
 
 export default function LaunchDialog({
   model,
   modelType,
   gpuAvailable,
-  mode = 'deploy',
-  deploymentUid,
-  replicaConfig,
-  currentReplicaCount = 0,
-  onSuccess,
   onOpenChange,
 }: LaunchDialogProps) {
   const isOpen = Boolean(model);
-  const isAddReplicaMode = mode === 'add-replica';
   const formId = useId();
   const [form] = useForm();
   const { t } = useI18n();
@@ -114,15 +93,17 @@ export default function LaunchDialog({
   const modelEngineValue = toOptionValue(useWatch('model_engine', form));
   const modelFormatValue = toOptionValue(useWatch('model_format', form));
   const modelSizeInBillionsValue = useWatch('model_size_in_billions', form) as
-    | ModelEngineItem['model_size_in_billions']
-    | undefined;
+    ModelEngineItem['model_size_in_billions'] | undefined;
   const enableThinkingValue = useWatch('enable_thinking', form);
   const modelSizeInBillionsKey = toOptionValue(modelSizeInBillionsValue);
   const quantizationValue = toOptionValue(useWatch('quantization', form));
   const multimodalProjectorValue = toOptionValue(useWatch('multimodal_projector', form));
   const nGpuValue = useWatch('n_gpu', form);
-  const replicaValue = useWatch('replica', form);
   const [workerOptions, setWorkerOptions] = useState<WorkerOption[]>([]);
+  const replicaPlacementModeValue = useWatch('replica_placement_mode', form);
+  const replicaValue = Number(useWatch('replica', form)) || 1;
+  const modelUidValue = toOptionValue(useWatch('model_uid', form));
+  const isCustomPlacement = replicaPlacementModeValue === 'custom';
 
   const fetchWorkers = useCallback(async () => {
     if (clusterAuth?.auth && !isAdmin) {
@@ -195,7 +176,7 @@ export default function LaunchDialog({
   }, [model?.modelSpecs]);
 
   const modelEngineOptions = useMemo(() => {
-    const options = Object.entries(modelEngineMap).map(([key, engineData]) => {
+    return Object.entries(modelEngineMap).map(([key, engineData]) => {
       if (typeof engineData === 'string') {
         return {
           label: `${key} (${engineData})`,
@@ -211,78 +192,33 @@ export default function LaunchDialog({
         suffix: cached ? t('launchModel.cached') : undefined,
       };
     });
-
-    if (
-      isAddReplicaMode &&
-      modelEngineValue &&
-      !options.some((option) => option.value === modelEngineValue)
-    ) {
-      options.unshift({
-        label: modelEngineValue,
-        value: modelEngineValue,
-        suffix: undefined,
-      });
-    }
-
-    return options;
-  }, [cacheIndex.formats, isAddReplicaMode, modelEngineMap, modelEngineValue, t]);
+  }, [cacheIndex.formats, modelEngineMap, t]);
 
   const selectedEngineFormats = engineIndex.get(modelEngineValue);
   const selectedFormatIndex = selectedEngineFormats?.get(modelFormatValue);
 
-  const modelFormatOptions = useMemo(() => {
-    const options = Array.from(selectedEngineFormats?.keys() || []).map((format) => ({
-      label: format,
-      value: format,
-      suffix: cacheIndex.formats.has(format) ? t('launchModel.cached') : undefined,
-    }));
-
-    if (
-      isAddReplicaMode &&
-      modelFormatValue &&
-      !options.some((option) => option.value === modelFormatValue)
-    ) {
-      options.unshift({
-        label: modelFormatValue,
-        value: modelFormatValue,
-        suffix: undefined,
-      });
-    }
-
-    return options;
-  }, [cacheIndex.formats, isAddReplicaMode, modelFormatValue, selectedEngineFormats, t]);
-  const modelSizeInBillionsOptions = useMemo(() => {
-    const options = Array.from(selectedFormatIndex?.sizes.values() || []).map((sizeIndex) => ({
-      label: String(sizeIndex.value),
-      value: sizeIndex.value,
-      suffix: cacheIndex.sizes.has(
-        createCacheKey(modelFormatValue, normalizeModelSize(sizeIndex.value))
-      )
-        ? t('launchModel.cached')
-        : undefined,
-    }));
-
-    if (
-      isAddReplicaMode &&
-      modelSizeInBillionsValue !== undefined &&
-      !options.some((option) => option.value === modelSizeInBillionsValue)
-    ) {
-      options.unshift({
-        label: String(modelSizeInBillionsValue),
-        value: modelSizeInBillionsValue,
-        suffix: undefined,
-      });
-    }
-
-    return options;
-  }, [
-    cacheIndex.sizes,
-    isAddReplicaMode,
-    modelFormatValue,
-    modelSizeInBillionsValue,
-    selectedFormatIndex,
-    t,
-  ]);
+  const modelFormatOptions = useMemo(
+    () =>
+      Array.from(selectedEngineFormats?.keys() || []).map((format) => ({
+        label: format,
+        value: format,
+        suffix: cacheIndex.formats.has(format) ? t('launchModel.cached') : undefined,
+      })),
+    [cacheIndex.formats, selectedEngineFormats, t]
+  );
+  const modelSizeInBillionsOptions = useMemo(
+    () =>
+      Array.from(selectedFormatIndex?.sizes.values() || []).map((sizeIndex) => ({
+        label: String(sizeIndex.value),
+        value: sizeIndex.value,
+        suffix: cacheIndex.sizes.has(
+          createCacheKey(modelFormatValue, normalizeModelSize(sizeIndex.value))
+        )
+          ? t('launchModel.cached')
+          : undefined,
+      })),
+    [cacheIndex.sizes, modelFormatValue, selectedFormatIndex, t]
+  );
 
   const quantizationOptions = useMemo(() => {
     const quantizations =
@@ -290,7 +226,7 @@ export default function LaunchDialog({
         ? selectedFormatIndex?.sizes.get(modelSizeInBillionsKey)?.quantizations
         : selectedFormatIndex?.quantizations;
 
-    const options = Array.from(quantizations || []).map((quantization) => ({
+    return Array.from(quantizations || []).map((quantization) => ({
       label: quantization,
       value: quantization,
       suffix: cacheIndex.quantizations.has(
@@ -303,27 +239,11 @@ export default function LaunchDialog({
         ? t('launchModel.cached')
         : undefined,
     }));
-
-    if (
-      isAddReplicaMode &&
-      quantizationValue &&
-      !options.some((option) => option.value === quantizationValue)
-    ) {
-      options.unshift({
-        label: quantizationValue,
-        value: quantizationValue,
-        suffix: undefined,
-      });
-    }
-
-    return options;
   }, [
     cacheIndex.quantizations,
-    isAddReplicaMode,
     modelFormatValue,
     modelSizeInBillionsKey,
     modelType,
-    quantizationValue,
     selectedFormatIndex,
     t,
   ]);
@@ -373,27 +293,16 @@ export default function LaunchDialog({
     }));
   }, [selectedSpec, t]);
 
-  const multimodalProjectorOptions = useMemo(() => {
-    const options = Array.from(
-      selectedFormatIndex?.sizes.get(modelSizeInBillionsKey)?.multimodalProjectors || []
-    ).map((projector) => ({
-      label: projector,
-      value: projector,
-    }));
-
-    if (
-      isAddReplicaMode &&
-      multimodalProjectorValue &&
-      !options.some((option) => option.value === multimodalProjectorValue)
-    ) {
-      options.unshift({
-        label: multimodalProjectorValue,
-        value: multimodalProjectorValue,
-      });
-    }
-
-    return options;
-  }, [isAddReplicaMode, modelSizeInBillionsKey, multimodalProjectorValue, selectedFormatIndex]);
+  const multimodalProjectorOptions = useMemo(
+    () =>
+      Array.from(
+        selectedFormatIndex?.sizes.get(modelSizeInBillionsKey)?.multimodalProjectors || []
+      ).map((projector) => ({
+        label: projector,
+        value: projector,
+      })),
+    [modelSizeInBillionsKey, selectedFormatIndex]
+  );
 
   const nGpuFieldProps = useMemo(() => {
     let options = [];
@@ -506,8 +415,72 @@ export default function LaunchDialog({
     );
   }, [form, multimodalProjectorOptions, multimodalProjectorValue]);
 
+  // Keep replica_config row count in sync with `replica` while in custom
+  // placement mode. Preserves already-filled rows; pads/truncates otherwise.
+  useEffect(() => {
+    if (!isCustomPlacement) return;
+    const current =
+      (form.getFieldValue('replica_config') as
+        Array<{ replica_uid?: string; worker_ip: string; gpu_idx: string }> | undefined) ?? [];
+    if (current.length === replicaValue) return;
+    const next = Array.from(
+      { length: replicaValue },
+      (_, i) => current[i] ?? { replica_uid: '', worker_ip: '', gpu_idx: '' }
+    );
+    form.setFieldsValue({ replica_config: next });
+  }, [isCustomPlacement, replicaValue, form]);
+
+  // Shared per-replica placement fields, appended after the `replica` field in
+  // every model type's field array so the feature is uniform across types.
+  const replicaPlacementFields: LaunchFieldConfig[] = [
+    {
+      name: 'replica_placement_mode',
+      type: 'radio-group',
+      label: t('launchModel.replicaPlacementMode'),
+      colSpan: 2,
+      fieldProps: {
+        options: [
+          { label: t('launchModel.placementAuto'), value: 'auto' },
+          { label: t('launchModel.placementCustom'), value: 'custom' },
+        ],
+      },
+    },
+    {
+      name: 'replica_config',
+      type: 'custom',
+      colSpan: 2,
+      show: isCustomPlacement,
+      content: (
+        <ReplicaPlacementConfig
+          form={form}
+          workerOptions={workerOptions}
+          modelUid={modelUidValue}
+        />
+      ),
+    },
+  ];
+
   const modelTypeFields: Partial<Record<ModelType, LaunchFieldConfig[]>> = {
     [ModelType.LLM]: [
+      {
+        name: 'model_uid',
+        type: 'input',
+        label: t('launchModel.modelUid'),
+        placeholder: t('launchModel.modelUidPlaceholder'),
+      },
+      {
+        name: 'replica',
+        type: 'input',
+        label: t('launchModel.replica'),
+        rules: [
+          {
+            pattern: /^[1-9]\d*$/,
+            message: t('launchModel.enterIntegerGreaterThanZero'),
+          },
+        ],
+        fieldProps: { type: 'number', min: 1 },
+      },
+      ...replicaPlacementFields,
       {
         name: 'model_engine',
         type: 'select',
@@ -545,7 +518,7 @@ export default function LaunchDialog({
         label: t('launchModel.multimodelProjector'),
         rules: [{ required: true }],
         disabled: !modelSizeInBillionsValue,
-        show: Boolean(multimodalProjectorOptions.length || multimodalProjectorValue),
+        show: Boolean(multimodalProjectorOptions.length),
         fieldProps: { options: multimodalProjectorOptions },
       },
       {
@@ -564,24 +537,6 @@ export default function LaunchDialog({
         label: t('launchModel.nGpuLayers'),
         show: [ModelFormat.GGMLV3, ModelFormat.GGUFV2].includes(modelFormatValue as ModelFormat),
         fieldProps: { type: 'number', min: -1 },
-      },
-      {
-        name: 'replica',
-        type: 'input',
-        label: t('launchModel.replica'),
-        rules: [
-          {
-            pattern: /^[1-9]\d*$/,
-            message: t('launchModel.enterIntegerGreaterThanZero'),
-          },
-        ],
-        fieldProps: { type: 'number', min: 1 },
-      },
-      {
-        name: 'model_uid',
-        type: 'input',
-        label: t('launchModel.modelUid'),
-        placeholder: t('launchModel.modelUidPlaceholder'),
       },
       {
         name: 'request_limits',
@@ -618,7 +573,7 @@ export default function LaunchDialog({
         placeholder: t('launchModel.GPUIdxPlaceholder'),
         rules: [
           {
-            pattern: /^\d+(?:,\d+)*$/,
+            pattern: GPU_IDX_PATTERN,
             message: t('launchModel.enterCommaSeparatedNumbers'),
           },
         ],
@@ -678,6 +633,25 @@ export default function LaunchDialog({
     ],
     [ModelType.Embedding]: [
       {
+        name: 'model_uid',
+        type: 'input',
+        label: t('launchModel.modelUid'),
+        placeholder: t('launchModel.modelUidPlaceholder'),
+      },
+      {
+        name: 'replica',
+        type: 'input',
+        label: t('launchModel.replica'),
+        rules: [
+          {
+            pattern: /^[1-9]\d*$/,
+            message: t('launchModel.enterIntegerGreaterThanZero'),
+          },
+        ],
+        fieldProps: { type: 'number', min: 1 },
+      },
+      ...replicaPlacementFields,
+      {
         name: 'model_engine',
         type: 'select',
         label: t('launchModel.modelEngine'),
@@ -701,18 +675,6 @@ export default function LaunchDialog({
         fieldProps: { options: quantizationOptions },
       },
       {
-        name: 'replica',
-        type: 'input',
-        label: t('launchModel.replica'),
-        rules: [
-          {
-            pattern: /^[1-9]\d*$/,
-            message: t('launchModel.enterIntegerGreaterThanZero'),
-          },
-        ],
-        fieldProps: { type: 'number', min: 1 },
-      },
-      {
         name: 'n_gpu',
         type: 'select',
         label: t('launchModel.nGPUDevice'),
@@ -725,17 +687,11 @@ export default function LaunchDialog({
         placeholder: t('launchModel.GPUIdxPlaceholder'),
         rules: [
           {
-            pattern: /^\d+(?:,\d+)*$/,
+            pattern: GPU_IDX_PATTERN,
             message: t('launchModel.enterCommaSeparatedNumbers'),
           },
         ],
         show: nGpuValue === 'GPU',
-      },
-      {
-        name: 'model_uid',
-        type: 'input',
-        label: t('launchModel.modelUid'),
-        placeholder: t('launchModel.modelUidPlaceholder'),
       },
       {
         name: 'download_hub',
@@ -783,6 +739,25 @@ export default function LaunchDialog({
     ],
     [ModelType.Rerank]: [
       {
+        name: 'model_uid',
+        type: 'input',
+        label: t('launchModel.modelUid'),
+        placeholder: t('launchModel.modelUidPlaceholder'),
+      },
+      {
+        name: 'replica',
+        type: 'input',
+        label: t('launchModel.replica'),
+        rules: [
+          {
+            pattern: /^[1-9]\d*$/,
+            message: t('launchModel.enterIntegerGreaterThanZero'),
+          },
+        ],
+        fieldProps: { type: 'number', min: 1 },
+      },
+      ...replicaPlacementFields,
+      {
         name: 'model_engine',
         type: 'select',
         label: t('launchModel.modelEngine'),
@@ -806,18 +781,6 @@ export default function LaunchDialog({
         fieldProps: { options: quantizationOptions },
       },
       {
-        name: 'replica',
-        type: 'input',
-        label: t('launchModel.replica'),
-        rules: [
-          {
-            pattern: /^[1-9]\d*$/,
-            message: t('launchModel.enterIntegerGreaterThanZero'),
-          },
-        ],
-        fieldProps: { type: 'number', min: 1 },
-      },
-      {
         name: 'n_gpu',
         type: 'select',
         label: t('launchModel.nGPUDevice'),
@@ -830,17 +793,11 @@ export default function LaunchDialog({
         placeholder: t('launchModel.GPUIdxPlaceholder'),
         rules: [
           {
-            pattern: /^\d+(?:,\d+)*$/,
+            pattern: GPU_IDX_PATTERN,
             message: t('launchModel.enterCommaSeparatedNumbers'),
           },
         ],
         show: nGpuValue === 'GPU',
-      },
-      {
-        name: 'model_uid',
-        type: 'input',
-        label: t('launchModel.modelUid'),
-        placeholder: t('launchModel.modelUidPlaceholder'),
       },
       {
         name: 'download_hub',
@@ -943,6 +900,7 @@ export default function LaunchDialog({
         ],
         fieldProps: { type: 'number', min: 1 },
       },
+      ...replicaPlacementFields,
       {
         name: 'n_gpu',
         type: 'select',
@@ -956,7 +914,7 @@ export default function LaunchDialog({
         placeholder: t('launchModel.GPUIdxPlaceholder'),
         rules: [
           {
-            pattern: /^\d+(?:,\d+)*$/,
+            pattern: GPU_IDX_PATTERN,
             message: t('launchModel.enterCommaSeparatedNumbers'),
           },
         ],
@@ -1069,6 +1027,7 @@ export default function LaunchDialog({
         ],
         fieldProps: { type: 'number', min: 1 },
       },
+      ...replicaPlacementFields,
       {
         name: 'n_gpu',
         type: 'select',
@@ -1082,7 +1041,7 @@ export default function LaunchDialog({
         placeholder: t('launchModel.GPUIdxPlaceholder'),
         rules: [
           {
-            pattern: /^\d+(?:,\d+)*$/,
+            pattern: GPU_IDX_PATTERN,
             message: t('launchModel.enterCommaSeparatedNumbers'),
           },
         ],
@@ -1167,6 +1126,7 @@ export default function LaunchDialog({
         ],
         fieldProps: { type: 'number', min: 1 },
       },
+      ...replicaPlacementFields,
       {
         name: 'n_gpu',
         type: 'select',
@@ -1180,7 +1140,7 @@ export default function LaunchDialog({
         placeholder: t('launchModel.GPUIdxPlaceholder'),
         rules: [
           {
-            pattern: /^\d+(?:,\d+)*$/,
+            pattern: GPU_IDX_PATTERN,
             message: t('launchModel.enterCommaSeparatedNumbers'),
           },
         ],
@@ -1272,6 +1232,7 @@ export default function LaunchDialog({
         ],
         fieldProps: { type: 'number', min: 1 },
       },
+      ...replicaPlacementFields,
       {
         name: 'n_gpu',
         type: 'select',
@@ -1285,7 +1246,7 @@ export default function LaunchDialog({
         placeholder: t('launchModel.GPUIdxPlaceholder'),
         rules: [
           {
-            pattern: /^\d+(?:,\d+)*$/,
+            pattern: GPU_IDX_PATTERN,
             message: t('launchModel.enterCommaSeparatedNumbers'),
           },
         ],
@@ -1330,39 +1291,12 @@ export default function LaunchDialog({
     ],
   };
 
-  const additionalReplicaCount = Number(replicaValue);
-  const previewAdditionalReplicaCount =
-    Number.isInteger(additionalReplicaCount) && additionalReplicaCount > 0
-      ? additionalReplicaCount
-      : 0;
-  const currentLaunchFields = (modelTypeFields[modelType] || [])
-    .filter((field) => !isAddReplicaMode || ADD_REPLICA_VISIBLE_FIELDS.has(field.name))
-    .map((field): LaunchFieldConfig => {
-      if (!isAddReplicaMode || field.type === 'custom' || field.type === 'form-list') {
-        return field;
-      }
-      if (field.name === 'replica') {
-        return {
-          ...field,
-          label: t('launchModel.additionalReplicaCount'),
-          rules: [
-            {
-              required: true,
-              message: t('launchModel.enterIntegerGreaterThanZero'),
-            },
-            ...(field.rules || []),
-          ],
-          extra: t('launchModel.replicaCountPreview', {
-            current: currentReplicaCount,
-            total: currentReplicaCount + previewAdditionalReplicaCount,
-          }),
-        };
-      }
-      if (ADD_REPLICA_EDITABLE_FIELDS.has(field.name)) {
-        return field;
-      }
-      return { ...field, disabled: true };
-    });
+  // In custom placement mode (LLM only for now), hide the legacy global
+  // placement fields — they are mutually exclusive with replica_config and
+  // would only confuse the operator if shown alongside the per-replica editor.
+  const currentLaunchFields = (modelTypeFields[modelType] || []).filter(
+    (field) => !isCustomPlacement || !['n_gpu', 'gpu_idx', 'worker_ip'].includes(field.name)
+  );
   // required fields is filled in
   const isReady = currentLaunchFields
     .filter(isVisibleRequiredLaunchField)
@@ -1442,6 +1376,17 @@ export default function LaunchDialog({
                   >
                     {replica.worker_address || '-'}
                   </span>
+                  {replica.replica_uid && (
+                    <span className="truncate text-muted-foreground" title={replica.replica_uid}>
+                      {replica.replica_uid}
+                    </span>
+                  )}
+                  <span className="text-muted-foreground">
+                    {t('launchModel.GPUIdx')}:{' '}
+                    {replica.gpu_idx && replica.gpu_idx.length > 0
+                      ? replica.gpu_idx.join(', ')
+                      : 'auto'}
+                  </span>
                 </div>
                 <div
                   className={cn(
@@ -1477,39 +1422,29 @@ export default function LaunchDialog({
   };
 
   const handleLaunch = async (values: FormValues) => {
-    const newValues = transformFormToFetch(values);
-
-    if (isAddReplicaMode) {
-      if (!deploymentUid) {
-        toast.error(t('runningModels.addReplicaFailed'));
+    if (values.replica_placement_mode === 'custom') {
+      const rows = Array.isArray(values.replica_config) ? values.replica_config : [];
+      const replicaCount = Number(values.replica) || 1;
+      const gpuIndexPattern = GPU_IDX_PATTERN;
+      const hasInvalidPlacement =
+        rows.length !== replicaCount ||
+        rows.some((row) => {
+          const gpuIndexes = String(row?.gpu_idx ?? '').trim();
+          return !row?.worker_ip || (gpuIndexes !== '' && !gpuIndexPattern.test(gpuIndexes));
+        });
+      if (hasInvalidPlacement) {
+        toast.error(t('launchModel.replicaPlacementIncomplete'));
         return;
       }
 
-      const payload: FormValues = { replica: newValues.replica };
-
-      ['n_gpu', 'worker_ip', 'gpu_idx'].forEach((key) => {
-        if (Object.prototype.hasOwnProperty.call(newValues, key)) {
-          payload[key] = newValues[key];
-        }
-      });
-
-      setLoading(true);
-      try {
-        await request.post(`/v1/models/${encodeURIComponent(deploymentUid)}/replicas`, payload, {
-          noTimeout: true,
-        });
-        toast.success(t('runningModels.addReplicaSuccess'));
-        onSuccess?.();
-        onOpenChange(false);
-        form.resetFields();
-      } catch {
-        toast.error(t('runningModels.addReplicaFailed'));
-      } finally {
-        setLoading(false);
+      const aliases = rows.map((row) => String(row?.replica_uid ?? '').trim()).filter(Boolean);
+      if (new Set(aliases).size !== aliases.length) {
+        toast.error(t('launchModel.replicaAliasDuplicate'));
+        return;
       }
-      return;
     }
 
+    const newValues = transformFormToFetch(values);
     isCanceledLaunchRef.current = false;
     setLoading(true);
     setProgress(0);
@@ -1584,27 +1519,14 @@ export default function LaunchDialog({
   useEffect(() => {
     if (!isOpen) return;
 
-    form.resetFields();
-
-    if (isAddReplicaMode) {
-      form.setFieldsValue(
-        transformFetchToForm({
-          ...replicaConfig,
-          model_name: model?.model_name,
-          model_type: modelType,
-          model_uid: deploymentUid,
-          replica: replicaConfig?.replica ?? 1,
-        })
-      );
-      return;
-    }
-
     const latestConfig = getLatestModelConfigHistory(model?.model_name);
+
+    form.resetFields();
 
     if (latestConfig) {
       form.setFieldsValue(transformFetchToForm(latestConfig.data));
     }
-  }, [deploymentUid, form, isAddReplicaMode, isOpen, model?.model_name, modelType, replicaConfig]);
+  }, [form, isOpen, model?.model_name]);
 
   useEffect(() => {
     return () => {
@@ -1612,9 +1534,6 @@ export default function LaunchDialog({
     };
   }, [stopPolling]);
 
-  const addReplicaInitialValues: FormValues = isAddReplicaMode
-    ? transformFetchToForm(replicaConfig || {})
-    : {};
   const initialValues = {
     model_name: model?.model_name,
     model_type: modelType,
@@ -1624,13 +1543,12 @@ export default function LaunchDialog({
         ? 'CPU'
         : 'GPU',
     n_gpu_layers: -1,
+    replica: 1,
+    replica_placement_mode: 'auto' as const,
     enable_thinking: true,
     reasoning_content: false,
     enable_virtual_env: 'unset',
     cpu_offload: false,
-    ...addReplicaInitialValues,
-    replica: isAddReplicaMode ? (addReplicaInitialValues.replica ?? 1) : 1,
-    ...(isAddReplicaMode ? { model_uid: deploymentUid } : {}),
   };
   return (
     <>
@@ -1644,68 +1562,44 @@ export default function LaunchDialog({
           onOpenChange(open);
         }}
       >
-        <DialogContent
-          className="!max-w-[calc(100%-2rem)] sm:!max-w-3xl"
-          maskClosable={false}
-          showCloseButton={!isAddReplicaMode || !loading}
-        >
+        <DialogContent className="!max-w-3xl" maskClosable={false}>
           <DialogHeader>
             <div className="flex min-w-0 items-center justify-between gap-3 pr-10">
               <DialogTitle className="min-w-0 truncate">{model?.model_name}</DialogTitle>
-              {!isAddReplicaMode && (
-                <div className="flex gap-2">
-                  <ConfigCache
-                    form={form}
-                    modelName={model?.model_name}
-                    refreshKey={configCacheRefreshKey}
-                  />
-                  <CommandLine form={form} canCopyCommandLine={isReady} />
-                </div>
-              )}
+              <div className="flex gap-2">
+                <ConfigCache
+                  form={form}
+                  modelName={model?.model_name}
+                  refreshKey={configCacheRefreshKey}
+                />
+                <CommandLine form={form} canCopyCommandLine={isReady} />
+              </div>
             </div>
-            <DialogDescription className={isAddReplicaMode ? 'text-left' : 'sr-only'}>
-              {t(
-                isAddReplicaMode
-                  ? 'launchModel.addReplicaDialogDescription'
-                  : 'launchModel.deployDialogDescription'
-              )}
-            </DialogDescription>
           </DialogHeader>
           <Form
             id={formId}
             form={form}
             onFinish={handleLaunch}
             initialValues={initialValues}
-            className="grid grid-cols-1 gap-x-4 gap-y-3 space-y-0 sm:grid-cols-2"
+            className="grid grid-cols-2 gap-x-4 gap-y-3 space-y-0"
           >
             <FormField hidden name="model_name" />
             <FormField hidden name="model_type" />
             {renderLaunchFields(currentLaunchFields)}
           </Form>
-          <DialogFooter className={cn(loading && !isAddReplicaMode ? '!flex-col' : '')}>
-            {loading && !isAddReplicaMode && <Progress value={progress} />}
-            <div
-              className={cn(
-                'flex w-full flex-col gap-3 sm:flex-row sm:items-center',
-                isAddReplicaMode ? 'sm:justify-end' : 'sm:justify-between'
-              )}
-            >
-              {!isAddReplicaMode && (
-                <label className="flex items-center gap-2 text-sm text-muted-foreground">
-                  <Switch checked={saveAutostart} disabled={loading} onChange={setSaveAutostart} />
-                  {t('launchModel.saveAutostart')}
-                </label>
-              )}
+          <DialogFooter className={cn(loading ? '!flex-col' : '')}>
+            {loading && <Progress value={progress} />}
+            <div className="flex w-full flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+              <label className="flex items-center gap-2 text-sm text-muted-foreground">
+                <Switch checked={saveAutostart} disabled={loading} onChange={setSaveAutostart} />
+                {t('launchModel.saveAutostart')}
+              </label>
               <div className="flex items-center justify-end gap-2">
                 <TooltipProvider>
-                  <Button
-                    variant="outline"
-                    disabled={isAddReplicaMode && loading}
-                    onClick={handleClose}
-                  >
+                  <Button variant="outline" onClick={handleClose}>
                     {t('common.cancel')}
                   </Button>
-                  {loading && !isAddReplicaMode ? (
+                  {loading ? (
                     <Tooltip>
                       <TooltipTrigger asChild>
                         <Button
@@ -1729,14 +1623,9 @@ export default function LaunchDialog({
                       </TooltipContent>
                     </Tooltip>
                   ) : (
-                    <Button
-                      type="submit"
-                      form={formId}
-                      loading={isAddReplicaMode && loading}
-                      disabled={isAddReplicaMode && loading}
-                    >
-                      {!loading && (isAddReplicaMode ? <Plus /> : <Rocket />)}
-                      {t(isAddReplicaMode ? 'launchModel.addReplica' : 'common.deploy')}
+                    <Button type="submit" form={formId}>
+                      <Rocket />
+                      {t('common.deploy')}
                     </Button>
                   )}
                 </TooltipProvider>

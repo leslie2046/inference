@@ -19,6 +19,7 @@ import {
 } from 'lucide-react';
 
 import { Badge } from '@/components/ui/badge';
+import { AutoComplete } from '@/components/ui/auto-complete';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog';
@@ -105,6 +106,14 @@ const defaultFilters: AuditFilters = {
   category: [],
   authType: '',
   status: [],
+  clientIp: '',
+};
+
+const defaultTextFilters = {
+  user: '',
+  apiKeyName: '',
+  modelId: '',
+  modelName: '',
   clientIp: '',
 };
 
@@ -210,11 +219,16 @@ export default function AuditCenter() {
   const [loading, setLoading] = useState(false);
   const [timeRange, setTimeRange] = useState<TimeRangeValue>(DEFAULT_LOG_TIME_RANGE);
   const [filters, setFilters] = useState<AuditFilters>(defaultFilters);
+  const [draftFilters, setDraftFilters] = useState(defaultTextFilters);
   const [filterOptions, setFilterOptions] =
     useState<Required<AuditFilterOptionsResponse>>(defaultFilterOptions);
   const [pageFrom, setPageFrom] = useState(0);
   const [selectedRecord, setSelectedRecord] = useState<AuditRecord | null>(null);
   const requestSeqRef = useRef(0);
+  const lastSuccessfulRequestRef = useRef<{
+    queryKey: string;
+    pageFrom: number;
+  } | null>(null);
   // Tracks whether the latest fetch is still pending so the auto-refresh
   // interval can skip a tick instead of stacking overlapping requests.
   const inFlightRef = useRef(false);
@@ -242,6 +256,10 @@ export default function AuditCenter() {
   const fetchAuditRecords = useCallback(
     async (silent = false) => {
       const seq = ++requestSeqRef.current;
+      const queryKeyParams = new URLSearchParams(queryParams);
+      queryKeyParams.delete('page_from');
+      queryKeyParams.delete('size');
+      const queryKey = queryKeyParams.toString();
       inFlightRef.current = true;
       // Background refreshes stay silent so the table does not flip to the
       // loading spinner every interval; only user-initiated fetches show it.
@@ -256,14 +274,21 @@ export default function AuditCenter() {
         if (seq === requestSeqRef.current) {
           setRecords(Array.isArray(data.hits) ? data.hits : []);
           setTotal(data.total || 0);
+          lastSuccessfulRequestRef.current = { queryKey, pageFrom };
         }
       } catch {
         // A transient failure during a silent background refresh must not wipe
-        // the table — keep the last good results. Foreground (user-initiated)
-        // fetches keep the original clear-on-error behavior.
+        // the table. A failed foreground page jump also keeps the last good
+        // results and restores the page that produced them.
         if (!silent && seq === requestSeqRef.current) {
-          setRecords([]);
-          setTotal(0);
+          const lastSuccessfulRequest = lastSuccessfulRequestRef.current;
+          if (lastSuccessfulRequest?.queryKey === queryKey) {
+            setPageFrom(lastSuccessfulRequest.pageFrom);
+          } else {
+            setRecords([]);
+            setTotal(0);
+            setPageFrom(0);
+          }
         }
       } finally {
         if (seq === requestSeqRef.current) {
@@ -272,7 +297,7 @@ export default function AuditCenter() {
         }
       }
     },
-    [queryParams]
+    [pageFrom, queryParams]
   );
 
   useEffect(() => {
@@ -291,6 +316,23 @@ export default function AuditCenter() {
       return () => clearInterval(timer);
     }
   }, [fetchAuditRecords, refreshInterval]);
+
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      setFilters((current) => {
+        const hasChanged = (Object.keys(defaultTextFilters) as AuditTextFilterKey[]).some(
+          (key) => current[key] !== draftFilters[key]
+        );
+
+        if (!hasChanged) return current;
+
+        setPageFrom(0);
+        return { ...current, ...draftFilters };
+      });
+    }, 500);
+
+    return () => clearTimeout(timer);
+  }, [draftFilters]);
 
   useEffect(() => {
     let active = true;
@@ -363,9 +405,8 @@ export default function AuditCenter() {
     ];
   }, [records, t, total]);
 
-  const setTextFilter = (key: AuditTextFilterKey, value?: string | number) => {
-    setFilters((current) => ({ ...current, [key]: String(value || '') }));
-    setPageFrom(0);
+  const setTextFilter = (key: AuditTextFilterKey, value?: string) => {
+    setDraftFilters((current) => ({ ...current, [key]: value || '' }));
   };
 
   const setFilter = (key: Exclude<AuditFilterKey, AuditTextFilterKey>, value?: string | number) => {
@@ -379,6 +420,7 @@ export default function AuditCenter() {
   };
 
   const resetFilters = () => {
+    setDraftFilters(defaultTextFilters);
     setFilters(defaultFilters);
     setPageFrom(0);
   };
@@ -391,6 +433,7 @@ export default function AuditCenter() {
   const hasFilters = Object.values(filters).some((value) =>
     Array.isArray(value) ? value.length > 0 : Boolean(value)
   );
+  const hasDraftFilters = Object.values(draftFilters).some(Boolean);
   const currentPage = Math.floor(pageFrom / AUDIT_PAGE_SIZE) + 1;
   const totalPages = Math.ceil(total / AUDIT_PAGE_SIZE) || 1;
   const lastPageFrom = (totalPages - 1) * AUDIT_PAGE_SIZE;
@@ -403,7 +446,10 @@ export default function AuditCenter() {
     event.preventDefault();
 
     const page = Number(jumpPage);
-    if (!Number.isInteger(page) || page < 1 || page > totalPages) return;
+    if (!Number.isInteger(page) || page < 1 || page > totalPages) {
+      setJumpPage(String(currentPage));
+      return;
+    }
 
     setPageFrom((page - 1) * AUDIT_PAGE_SIZE);
     setJumpPage(String(page));
@@ -478,7 +524,12 @@ export default function AuditCenter() {
               <Filter className="h-4 w-4 text-muted-foreground" />
               {t('auditCenter.filters')}
             </div>
-            <Button variant="ghost" size="sm" onClick={resetFilters} disabled={!hasFilters}>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={resetFilters}
+              disabled={!hasFilters && !hasDraftFilters}
+            >
               <RotateCcw className="mr-2 h-4 w-4" />
               {t('auditCenter.resetFilters')}
             </Button>
@@ -486,35 +537,35 @@ export default function AuditCenter() {
           <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-5">
             <FilterTextSelect
               label={t('auditCenter.user')}
-              value={filters.user}
+              value={draftFilters.user}
               values={filterOptions.user}
               placeholder={t('auditCenter.userPlaceholder')}
               onChange={(value) => setTextFilter('user', value)}
             />
             <FilterTextSelect
               label={t('auditCenter.apiKeyName')}
-              value={filters.apiKeyName}
+              value={draftFilters.apiKeyName}
               values={filterOptions.api_key_name}
               placeholder={t('auditCenter.apiKeyNamePlaceholder')}
               onChange={(value) => setTextFilter('apiKeyName', value)}
             />
             <FilterTextSelect
               label={t('auditCenter.modelId')}
-              value={filters.modelId}
+              value={draftFilters.modelId}
               values={filterOptions.model_id}
               placeholder={t('auditCenter.modelIdPlaceholder')}
               onChange={(value) => setTextFilter('modelId', value)}
             />
             <FilterTextSelect
               label={t('auditCenter.modelName')}
-              value={filters.modelName}
+              value={draftFilters.modelName}
               values={filterOptions.model_name}
               placeholder={t('auditCenter.modelNamePlaceholder')}
               onChange={(value) => setTextFilter('modelName', value)}
             />
             <FilterTextSelect
               label={t('auditCenter.clientIp')}
-              value={filters.clientIp}
+              value={draftFilters.clientIp}
               values={filterOptions.client_ip}
               placeholder={t('auditCenter.clientIpPlaceholder')}
               onChange={(value) => setTextFilter('clientIp', value)}
@@ -665,7 +716,7 @@ export default function AuditCenter() {
           <span className="text-sm text-muted-foreground">
             {t('auditCenter.totalHits', { count: total })}
           </span>
-          <form className="flex items-center gap-2 text-sm" onSubmit={goToPage}>
+          <form className="flex items-center gap-2 text-sm" noValidate onSubmit={goToPage}>
             <Label className="sr-only" htmlFor="audit-jump-page">
               {t('auditCenter.pageNumber')}
             </Label>
@@ -802,19 +853,18 @@ interface FilterTextSelectProps {
   value: string;
   values: string[];
   placeholder: string;
-  onChange: (value?: string | number) => void;
+  onChange: (value?: string) => void;
 }
 
 function FilterTextSelect({ label, value, values, placeholder, onChange }: FilterTextSelectProps) {
   return (
     <div className="space-y-2">
       <Label>{label}</Label>
-      <Select
+      <AutoComplete
         value={value}
         placeholder={placeholder}
-        searchPlaceholder={placeholder}
-        showSearch
-        onChange={onChange}
+        allowCustomValue
+        onChange={(nextValue) => onChange(nextValue)}
         options={values.map((item) => ({ value: item, label: item }))}
       />
     </div>

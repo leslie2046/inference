@@ -12,16 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for the ``_validate_replica`` helper and its integration in REST endpoints."""
+"""Tests for REST launch payload validation helpers."""
 
-import json
 import math
-from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from fastapi import HTTPException
 
-from ..restful_api import RESTfulAPI, _validate_replica
+from ..restful_api import _parse_replica_config, _validate_replica
 
 
 class TestValidateReplica:
@@ -121,57 +119,59 @@ class TestValidateReplica:
         assert "float" in exc.value.detail
 
 
-@pytest.mark.asyncio
-async def test_add_model_replicas_forwards_resource_options():
-    request = MagicMock()
-    request.json = AsyncMock(
-        return_value={
-            "replica": "2",
-            "n_gpu": 1,
-            "worker_ip": ["10.0.0.1", "10.0.0.2"],
-            "gpu_idx": [0, 1],
-        }
+class TestParseReplicaConfig:
+    """Unit tests for ``_parse_replica_config``."""
+
+    def test_absent_config_returns_none(self):
+        assert _parse_replica_config({}) is None
+
+    def test_valid_config_is_parsed(self):
+        configs = _parse_replica_config(
+            {
+                "replica_config": [
+                    {
+                        "replica_uid": "replica-a",
+                        "devices": [
+                            {
+                                "worker_ip": "10.0.0.1:9978",
+                                "n_gpu": 1,
+                                "gpu_idx": [0],
+                            }
+                        ],
+                    }
+                ]
+            }
+        )
+
+        assert configs is not None
+        assert len(configs) == 1
+        assert configs[0].replica_uid == "replica-a"
+        assert configs[0].devices[0].worker_ip == "10.0.0.1:9978"
+
+    def test_empty_config_is_preserved(self):
+        assert _parse_replica_config({"replica_config": []}) == []
+
+    @pytest.mark.parametrize(
+        "legacy_placement",
+        [
+            {"worker_ip": "10.0.0.1:9978"},
+            {"gpu_idx": []},
+            {"n_gpu": 1},
+        ],
     )
-    supervisor = MagicMock()
-    supervisor.add_model_replicas = AsyncMock(return_value=(3, [1, 2]))
-    api = MagicMock()
-    api._get_supervisor_ref = AsyncMock(return_value=supervisor)
+    def test_rejects_legacy_placement_options(self, legacy_placement):
+        payload = {"replica_config": []}
+        payload.update(legacy_placement)
 
-    response = await RESTfulAPI.add_model_replicas(api, request, "demo-model")
+        with pytest.raises(HTTPException) as exc:
+            _parse_replica_config(payload)
 
-    assert json.loads(response.body) == {"replica": 3, "replica_ids": [1, 2]}
-    supervisor.add_model_replicas.assert_awaited_once_with(
-        "demo-model",
-        2,
-        n_gpu=1,
-        worker_ip="10.0.0.1,10.0.0.2",
-        gpu_idx=[0, 1],
-    )
+        assert exc.value.status_code == 400
+        assert "together with replica_config" in exc.value.detail
 
+    def test_rejects_invalid_config(self):
+        with pytest.raises(HTTPException) as exc:
+            _parse_replica_config({"replica_config": [None]})
 
-@pytest.mark.asyncio
-async def test_add_model_replicas_forwards_explicit_cpu_override():
-    request = MagicMock()
-    request.json = AsyncMock(return_value={"replica": 1, "n_gpu": None})
-    supervisor = MagicMock()
-    supervisor.add_model_replicas = AsyncMock(return_value=(2, [1]))
-    api = MagicMock()
-    api._get_supervisor_ref = AsyncMock(return_value=supervisor)
-
-    await RESTfulAPI.add_model_replicas(api, request, "demo-model")
-
-    supervisor.add_model_replicas.assert_awaited_once_with("demo-model", 1, n_gpu=None)
-
-
-@pytest.mark.asyncio
-async def test_add_model_replicas_rejects_boolean_gpu_indexes():
-    request = MagicMock()
-    request.json = AsyncMock(return_value={"replica": 1, "gpu_idx": [True]})
-    api = MagicMock()
-    api._get_supervisor_ref = AsyncMock()
-
-    with pytest.raises(HTTPException) as exc:
-        await RESTfulAPI.add_model_replicas(api, request, "demo-model")
-
-    assert exc.value.status_code == 400
-    api._get_supervisor_ref.assert_not_awaited()
+        assert exc.value.status_code == 400
+        assert "Invalid replica_config" in exc.value.detail

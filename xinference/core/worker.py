@@ -285,6 +285,38 @@ _VRAM_READY_RATIO = 0.90
 _NVML_INIT_TIMEOUT = 10
 
 
+def _inject_jina_v3_allocator_env(
+    model_type: Optional[str],
+    model_name: Optional[str],
+    envs: Optional[Dict[str, str]],
+    launch_args: Dict[str, Any],
+) -> Optional[Dict[str, str]]:
+    """Add the Jina v3 allocator default and persist it for recovery.
+
+    The launch arguments are captured with ``locals()`` before this helper is
+    called.  Updating ``envs`` alone would therefore affect the current launch
+    but not the cached arguments used by worker restart recovery. Allocator
+    settings inherited from the worker process count as explicit user
+    configuration because xoscar applies ``envs`` on top of ``os.environ``.
+    """
+    if (
+        not isinstance(model_type, str)
+        or not isinstance(model_name, str)
+        or model_type.lower() != "embedding"
+        or model_name.lower() != "jina-embeddings-v3"
+    ):
+        return envs
+
+    updated_envs = dict(envs or {})
+    allocator_env_keys = ("PYTORCH_CUDA_ALLOC_CONF", "PYTORCH_ALLOC_CONF")
+    if not any(key in updated_envs or key in os.environ for key in allocator_env_keys):
+        updated_envs["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
+    # ``launch_args`` is the recovery snapshot, so update it explicitly.
+    launch_args["envs"] = updated_envs
+    return updated_envs
+
+
 def _strip_test_envs(launch_args: dict) -> Tuple[dict, Set[str]]:
     """Strip XINFERENCE_TEST_* envs from launch_args.
 
@@ -1617,6 +1649,22 @@ class WorkerActor(xo.StatelessActor):
         # Update persisted file to reflect current state
         self._persist_launch_args()
 
+        # Re-register with supervisor so recovered replicas are added
+        # to the routing table. Without this, models recovered on
+        # worker restart are invisible to the scheduler and the model
+        # disappears when the last pre-existing replica dies.
+        if recovered > 0:
+            try:
+                self._registered = False
+                await self.get_supervisor_ref(add_worker=True)
+            except Exception:
+                logger.error(
+                    "Failed to re-register with supervisor after "
+                    "recovering %d model(s)",
+                    recovered,
+                    exc_info=True,
+                )
+
     @log_sync(logger=logger)
     def get_model_count(self) -> int:
         return len(self._model_uid_to_model)
@@ -1633,6 +1681,15 @@ class WorkerActor(xo.StatelessActor):
         if launch_args is None:
             raise ValueError(f"Launch arguments not found for model, uid: {model_uid}")
         return dict(launch_args)
+
+    @log_sync(logger=logger)
+    def get_launch_args(self, model_uid: str) -> Optional[Dict]:
+        """Return the cached launch args for a given replica model_uid.
+
+        Used by the supervisor to retrieve the original launch parameters
+        when adding a new replica to a running model (scale-up).
+        """
+        return self._model_uid_to_launch_args.get(model_uid)
 
     async def is_model_vllm_backend(self, model_uid: str) -> bool:
         _model_uid, _ = parse_replica_model_uid(model_uid)
@@ -3251,6 +3308,7 @@ class WorkerActor(xo.StatelessActor):
         launch_args.pop("kwargs")
         launch_args.update(kwargs)
         launch_args["launch_ts"] = int(time.time())
+        envs = _inject_jina_v3_allocator_env(model_type, model_name, envs, launch_args)
 
         try:
             origin_uid, _ = parse_replica_model_uid(model_uid)
@@ -4062,7 +4120,7 @@ class WorkerActor(xo.StatelessActor):
         if self._status_guard_ref is not None:
             try:
                 origin_uid, rank_suffix = parse_replica_model_uid(model_uid)
-                replica_id = rank_suffix - 1 if rank_suffix > 0 else 0
+                replica_id = rank_suffix if rank_suffix >= 0 else 0
                 await self._status_guard_ref.update_replica_status(
                     origin_uid,
                     replica_id,

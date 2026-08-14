@@ -67,6 +67,7 @@ from ..constants import (
 from ..core.event import Event, EventCollectorActor, EventType
 from ..core.exceptions import ModelNotReadyError
 from ..core.http_protocol import create_hardened_http_protocol
+from ..core.replica_config import ReplicaConfig
 from ..core.supervisor import SupervisorActor
 from ..core.utils import CancelMixin
 from ..types import (
@@ -79,9 +80,11 @@ from .frontend_static import mount_frontend
 from .pdf_ocr import (
     DEFAULT_PDF_OCR_DPI,
     PDF_MAGIC,
+    WHOLE_DOCUMENT_OCR_TASKS,
     is_pdf_upload,
     merge_ocr_page_results,
     rasterize_pdf,
+    validate_pdf_for_parse,
 )
 from .responses import JSONResponse
 from .schemas import (
@@ -144,6 +147,32 @@ def _validate_replica(value: Any) -> int:
             detail="Invalid input. The `replica` field must be at least 1.",
         )
     return replica
+
+
+def _parse_replica_config(payload: dict) -> Optional[List[ReplicaConfig]]:
+    """Validate and parse per-replica placement from a launch payload."""
+    replica_config_data = payload.get("replica_config")
+    if replica_config_data is None:
+        return None
+
+    if (
+        payload.get("worker_ip") is not None
+        or payload.get("gpu_idx") is not None
+        or payload.get("n_gpu", "auto") != "auto"
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot specify worker_ip / n_gpu / gpu_idx together with "
+            "replica_config.",
+        )
+
+    try:
+        return [ReplicaConfig.from_dict(item) for item in replica_config_data]
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid replica_config: {e}",
+        )
 
 
 def _log_setup_required_notice() -> None:
@@ -852,6 +881,7 @@ class RESTfulAPI(CancelMixin):
         enable_virtual_env = payload.get("enable_virtual_env", None)
         virtual_env_packages = payload.get("virtual_env_packages", None)
         envs = payload.get("envs", None)
+        replica_config = _parse_replica_config(payload)
 
         exclude_keys = {
             "model_uid",
@@ -872,6 +902,7 @@ class RESTfulAPI(CancelMixin):
             "enable_virtual_env",
             "virtual_env_packages",
             "envs",
+            "replica_config",
         }
 
         kwargs = {
@@ -924,8 +955,11 @@ class RESTfulAPI(CancelMixin):
                 enable_virtual_env=enable_virtual_env,
                 virtual_env_packages=virtual_env_packages,
                 envs=envs,
+                replica_config=replica_config,
                 **kwargs,
             )
+        except HTTPException:
+            raise
         except ValueError as ve:
             logger.error(str(ve), exc_info=True)
             raise HTTPException(status_code=400, detail=str(ve))
@@ -981,6 +1015,15 @@ class RESTfulAPI(CancelMixin):
         except Exception as e:
             logger.error(str(e), exc_info=True)
             raise HTTPException(status_code=500, detail=str(e))
+
+    async def add_model_replica_dispatch(
+        self, request: Request, model_uid: str
+    ) -> JSONResponse:
+        """Dispatch legacy bulk and placement-aware single-replica requests."""
+        payload = await request.json()
+        if "replica" in payload:
+            return await self.add_model_replicas(request, model_uid)
+        return await self.add_model_replica(model_uid, payload)
 
     async def add_model_replicas(
         self, request: Request, model_uid: str
@@ -1134,6 +1177,7 @@ class RESTfulAPI(CancelMixin):
         model_version = payload.get("model_version")
         replica = _validate_replica(payload.get("replica", 1))
         n_gpu = payload.get("n_gpu", "auto")
+        replica_config = _parse_replica_config(payload)
 
         try:
             model_uid = await (
@@ -1146,7 +1190,11 @@ class RESTfulAPI(CancelMixin):
                 replica=replica,
                 n_gpu=n_gpu,
                 wait_ready=wait_ready,
+                replica_config=replica_config,
             )
+        except ValueError as ve:
+            logger.error(str(ve), exc_info=True)
+            raise HTTPException(status_code=400, detail=str(ve))
         except Exception as e:
             logger.error(str(e), exc_info=True)
             raise HTTPException(status_code=500, detail=str(e))
@@ -1189,6 +1237,55 @@ class RESTfulAPI(CancelMixin):
         evict_model_cache(model_uid)
         return JSONResponse(content=None)
 
+    async def add_model_replica(
+        self, model_uid: str, payload: Optional[dict[str, Any]] = None
+    ) -> JSONResponse:
+        """Add a single new replica to a running model (scale-up).
+
+        Accepts an optional ``replica_config`` with a single device entry to
+        pin the new replica to a specific worker / GPU.  When omitted the
+        supervisor auto-selects the least-loaded worker.
+        """
+        try:
+            payload = payload or {}
+            replica_config_raw = payload.get("replica_config", None)
+            replica_config: Optional[ReplicaConfig] = None
+            if replica_config_raw is not None:
+                if not isinstance(replica_config_raw, dict):
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Invalid replica_config: expected a dict with a single device entry.",
+                    )
+                try:
+                    replica_config = ReplicaConfig.from_dict(replica_config_raw)
+                except Exception as e:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Invalid replica_config: {e}",
+                    )
+                if len(replica_config.devices) != 1:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="replica_config must contain exactly one device entry for scale-up.",
+                    )
+
+            result = await (await self._get_supervisor_ref()).add_model_replica(
+                model_uid=model_uid,
+                replica_config=replica_config,
+            )
+            return JSONResponse(content=result)
+        except HTTPException:
+            raise
+        except ValueError as ve:
+            logger.error(str(ve), exc_info=True)
+            raise HTTPException(status_code=400, detail=str(ve))
+        except RuntimeError as re:
+            logger.error(str(re), exc_info=True)
+            raise HTTPException(status_code=503, detail=str(re))
+        except Exception as e:
+            logger.error(e, exc_info=True)
+            raise HTTPException(status_code=500, detail=str(e))
+
     async def terminate_model_replica(
         self, model_uid: str, replica_id: int
     ) -> JSONResponse:
@@ -1207,6 +1304,10 @@ class RESTfulAPI(CancelMixin):
                         and route.path == "/" + model_uid
                     )
                 ]
+                self._uid_to_model_name.pop(model_uid, None)
+                from .oauth2.advanced.audit import evict_model_cache
+
+                evict_model_cache(model_uid)
             return JSONResponse(content={"remaining_replicas": remaining_replicas})
         except ValueError as ve:
             logger.error(str(ve), exc_info=True)
@@ -2064,7 +2165,53 @@ class RESTfulAPI(CancelMixin):
             self._add_running_task(request_id)
             head = image.file.read(len(PDF_MAGIC))
             image.file.seek(0)
-            if is_pdf_upload(image.content_type, head):
+            is_pdf = is_pdf_upload(image.content_type, head)
+            # Whole-document tasks parse the PDF themselves and need the
+            # original bytes plus every page at once, so they bypass the
+            # per-page rasterizing path below.
+            requested_task = parsed_kwargs.get("task")
+            if (
+                isinstance(requested_task, str)
+                and requested_task in WHOLE_DOCUMENT_OCR_TASKS
+            ):
+                task = requested_task
+                if not is_pdf:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"OCR task {task!r} requires a PDF upload",
+                    )
+                for unsupported in ("pages", "dpi"):
+                    if unsupported in parsed_kwargs:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=(
+                                f"`{unsupported}` is not supported for OCR task "
+                                f"{task!r}, which parses the whole document"
+                            ),
+                        )
+                from ..model.image.ocr.deepdoc import MAX_PARSE_ZOOMIN, parse_zoomin
+
+                data = image.file.read()
+                try:
+                    # The model validates this too; it is needed here to
+                    # budget the raster before the bytes are handed over.
+                    zoomin = parse_zoomin(parsed_kwargs.get("zoomin"))
+                    await asyncio.to_thread(
+                        validate_pdf_for_parse, data, zoomin, MAX_PARSE_ZOOMIN
+                    )
+                except ValueError as ve:
+                    raise HTTPException(status_code=400, detail=str(ve))
+                try:
+                    result = await model_ref.ocr(
+                        image=data,
+                        **parsed_kwargs,
+                    )
+                except ValueError as ve:
+                    # Bad `zoomin`/`image_scope` and friends are user input,
+                    # not a server fault.
+                    raise HTTPException(status_code=400, detail=str(ve))
+                return Response(content=result, media_type="application/json")
+            if is_pdf:
                 pages = parsed_kwargs.pop("pages", None)
                 dpi = parsed_kwargs.pop("dpi", DEFAULT_PDF_OCR_DPI)
                 try:

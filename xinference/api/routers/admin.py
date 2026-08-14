@@ -8,6 +8,7 @@ import logging
 import os
 import re
 import signal
+from bisect import bisect_left
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
@@ -388,6 +389,7 @@ _FIELD_NAME_RE = re.compile(r"^[a-zA-Z0-9_.@]+$")
 _TEXT_FIELDS = {"message"}
 _ES_PIT_KEEP_ALIVE = "1m"
 _ES_SEARCH_AFTER_BATCH_SIZE = 5000
+_ES_MAX_SEARCH_AFTER_REQUESTS = 10
 
 
 def _get_es_total(data: dict[str, Any]) -> int:
@@ -436,13 +438,15 @@ async def _search_es_page(
             raise HTTPException(status_code=502, detail="Elasticsearch query failed")
         return await resp.json()
 
-    async def _search(body: dict[str, Any]) -> dict[str, Any]:
+    async def _search(
+        body: dict[str, Any], *, include_source: bool = True
+    ) -> dict[str, Any]:
         nonlocal pit_id
         request_body = {
             **body,
             "pit": {"id": pit_id, "keep_alive": _ES_PIT_KEEP_ALIVE},
         }
-        if source is not None:
+        if include_source and source is not None:
             request_body["_source"] = source
         async with session.post(
             f"{base_url}/_search", json=request_body, headers=headers
@@ -464,7 +468,8 @@ async def _search_es_page(
             raise HTTPException(status_code=502, detail="Elasticsearch query failed")
 
         count_data = await _search(
-            {"query": query, "size": 0, "track_total_hits": True}
+            {"query": query, "size": 0, "track_total_hits": True, "_source": False},
+            include_source=False,
         )
         total = _get_es_total(count_data)
         if page_from >= total:
@@ -474,6 +479,15 @@ async def _search_es_page(
         reverse_offset = total - (page_from + result_size)
         ascending = reverse_offset < page_from
         remaining = reverse_offset if ascending else page_from
+        max_traversal_hits = _ES_SEARCH_AFTER_BATCH_SIZE * _ES_MAX_SEARCH_AFTER_REQUESTS
+        if remaining > max_traversal_hits:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Requested page is too far from either end of the result set; "
+                    "narrow the filters or time range"
+                ),
+            )
         order = "asc" if ascending else "desc"
         sort = [
             {
@@ -494,10 +508,11 @@ async def _search_es_page(
                 "size": batch_size,
                 "sort": sort,
                 "track_total_hits": False,
+                "_source": False,
             }
             if search_after is not None:
                 batch_body["search_after"] = search_after
-            batch_data = await _search(batch_body)
+            batch_data = await _search(batch_body, include_source=False)
             batch_hits = batch_data.get("hits", {}).get("hits", [])
             if not batch_hits:
                 return [], total
@@ -566,6 +581,7 @@ async def search_logs(
 
     size = max(1, min(size, 500))
     page_from = max(0, page_from)
+    time_from, time_to = _freeze_es_time_bounds(time_from, time_to)
     if node_field not in ("node", "node.keyword"):
         node_field = "node"
 
@@ -845,12 +861,14 @@ async def search_logs_context(
 # --- Route registration ---
 
 
-def _parse_relative_time(expr: str) -> Optional[datetime]:
+def _parse_relative_time(
+    expr: str, *, now: Optional[datetime] = None
+) -> Optional[datetime]:
     """Parse ES-style relative time, epoch milliseconds, or ISO timestamp."""
-    import re
+    reference_time = now or datetime.now(timezone.utc)
 
     if expr == "now":
-        return datetime.now(timezone.utc)
+        return reference_time
     m = re.match(r"now-(\d+)([mhdw])", expr)
     if m:
         val, unit = int(m.group(1)), m.group(2)
@@ -862,7 +880,7 @@ def _parse_relative_time(expr: str) -> Optional[datetime]:
         }.get(unit)
         if delta is None:
             return None
-        return datetime.now(timezone.utc) - delta
+        return reference_time - delta
     # Epoch milliseconds (numeric string like "1716854400000")
     if expr.isdigit():
         return datetime.fromtimestamp(int(expr) / 1000, tz=timezone.utc)
@@ -874,21 +892,37 @@ def _parse_relative_time(expr: str) -> Optional[datetime]:
     return None
 
 
-def _matches_audit_text_filter(value: Any, query: str) -> bool:
-    return query.casefold() in str(value or "").casefold()
+def _freeze_es_time_bounds(
+    time_from: str,
+    time_to: str,
+    *,
+    now: Optional[datetime] = None,
+) -> tuple[str, str]:
+    """Resolve supported relative date math against one shared instant."""
+    reference_time = now or datetime.now(timezone.utc)
+
+    def _freeze(value: str) -> str:
+        if value != "now" and re.fullmatch(r"now-\d+[mhdw]", value) is None:
+            return value
+        parsed = _parse_relative_time(value, now=reference_time)
+        return parsed.isoformat().replace("+00:00", "Z") if parsed else value
+
+    return _freeze(time_from), _freeze(time_to)
 
 
-def _audit_text_wildcard_filter(field_name: str, value: str) -> dict[str, Any]:
-    escaped_value = value.replace("\\", "\\\\").replace("*", "\\*").replace("?", "\\?")
-    wildcard_value = {
-        "value": f"*{escaped_value}*",
-        "case_insensitive": True,
-    }
+def _escape_es_wildcard(value: str) -> str:
+    """Escape characters that are special to an Elasticsearch wildcard query."""
+    return value.replace("\\", "\\\\").replace("*", "\\*").replace("?", "\\?")
+
+
+def _es_substring_clause(field_name: str, value: str) -> dict[str, Any]:
+    """Build a substring query compatible with common ES string mappings."""
+    pattern = f"*{_escape_es_wildcard(value)}*"
     return {
         "bool": {
             "should": [
-                {"wildcard": {field_name: wildcard_value}},
-                {"wildcard": {f"{field_name}.keyword": wildcard_value}},
+                {"wildcard": {field: {"value": pattern, "case_insensitive": True}}}
+                for field in (field_name, f"{field_name}.keyword")
             ],
             "minimum_should_match": 1,
         }
@@ -902,30 +936,99 @@ _AUDIT_TEXT_FILTER_FIELDS = (
     "model_name",
     "client_ip",
 )
+_AUDIT_FILTER_OPTION_LIMIT = 500
+
+
+def _add_bounded_audit_filter_option(
+    options: list[tuple[str, str]], seen: set[str], value: Any
+) -> None:
+    if value is None:
+        return
+    text = str(value)
+    if not text or text in seen:
+        return
+
+    item = (text.casefold(), text)
+    position = bisect_left(options, item)
+    if len(options) >= _AUDIT_FILTER_OPTION_LIMIT and position >= len(options):
+        return
+
+    options.insert(position, item)
+    seen.add(text)
+    if len(options) > _AUDIT_FILTER_OPTION_LIMIT:
+        _, removed = options.pop()
+        seen.remove(removed)
 
 
 def _audit_filter_aggregation_body(
-    time_from: str, time_to: str, *, keyword_fields: bool = False
+    time_from: str,
+    time_to: str,
+    fields: Optional[dict[str, str]] = None,
 ) -> dict[str, Any]:
+    fields = fields or {
+        field_name: field_name for field_name in _AUDIT_TEXT_FILTER_FIELDS
+    }
     return {
         "size": 0,
         "query": {"range": {"@timestamp": {"gte": time_from, "lte": time_to}}},
         "aggs": {
-            field_name: {
+            response_field: {
                 "terms": {
-                    "field": (
-                        f"{field_name}.keyword" if keyword_fields else field_name
-                    ),
-                    "size": 500,
+                    "field": es_field,
+                    "size": _AUDIT_FILTER_OPTION_LIMIT,
                 }
             }
-            for field_name in _AUDIT_TEXT_FILTER_FIELDS
+            for response_field, es_field in fields.items()
         },
     }
 
 
-def _is_fielddata_disabled_error(status: int, response_text: str) -> bool:
-    return status == 400 and "fielddata is disabled" in response_text.casefold()
+def _aggregatable_field_indices(
+    field_caps: dict[str, Any], field_name: str, all_indices: set[str]
+) -> set[str]:
+    result: set[str] = set()
+    capabilities = field_caps.get("fields", {}).get(field_name, {})
+    for capability in capabilities.values():
+        capability_indices = set(capability.get("indices") or all_indices)
+        non_aggregatable = set(capability.get("non_aggregatable_indices") or [])
+        if capability.get("aggregatable") or non_aggregatable:
+            result.update(capability_indices - non_aggregatable)
+    return result
+
+
+def _audit_filter_field_groups(
+    field_caps: dict[str, Any],
+) -> list[tuple[list[str], dict[str, str]]]:
+    all_indices = {str(index_name) for index_name in field_caps.get("indices", [])}
+    index_fields: dict[str, dict[str, str]] = {
+        index_name: {} for index_name in all_indices
+    }
+
+    for field_name in _AUDIT_TEXT_FILTER_FIELDS:
+        direct_indices = _aggregatable_field_indices(
+            field_caps, field_name, all_indices
+        )
+        keyword_field = f"{field_name}.keyword"
+        keyword_indices = _aggregatable_field_indices(
+            field_caps, keyword_field, all_indices
+        )
+        for index_name in all_indices:
+            if index_name in direct_indices:
+                index_fields[index_name][field_name] = field_name
+            elif index_name in keyword_indices:
+                index_fields[index_name][field_name] = keyword_field
+
+    groups: dict[tuple[tuple[str, str], ...], list[str]] = {}
+    for index_name, fields in index_fields.items():
+        if not fields:
+            continue
+        signature = tuple(sorted(fields.items()))
+        groups.setdefault(signature, []).append(index_name)
+
+    return [
+        (sorted(indices), dict(signature))
+        for signature, indices in sorted(groups.items())
+    ]
 
 
 def _audit_entry_in_time_range(
@@ -942,6 +1045,30 @@ def _audit_entry_in_time_range(
         return not ((t_from and timestamp < t_from) or (t_to and timestamp > t_to))
     except (ValueError, TypeError):
         return False
+
+
+def _match_substring(stored: Any, needle: str) -> bool:
+    """Case-insensitive substring match used by audit free-text filters.
+
+    An empty ``needle`` means the filter is not active and matches everything.
+    """
+    if not needle:
+        return True
+    if not isinstance(stored, str):
+        return False
+    return needle.lower() in stored.lower()
+
+
+def _match_enum(stored: Any, allowed: set) -> bool:
+    """Case-insensitive exact match against a set of allowed values.
+
+    An empty ``allowed`` set means the filter is not active.
+    """
+    if not allowed:
+        return True
+    if not isinstance(stored, str):
+        return False
+    return stored.lower() in allowed
 
 
 async def _search_audit_from_file(
@@ -964,6 +1091,9 @@ async def _search_audit_from_file(
     from ...constants import XINFERENCE_LOG_DIR
 
     audit_path = os.path.join(XINFERENCE_LOG_DIR, "audit.log")
+    if not os.path.exists(audit_path):
+        return JSONResponse(content={"hits": [], "total": 0})
+
     t_from = _parse_relative_time(time_from)
     t_to = _parse_relative_time(time_to)
 
@@ -986,66 +1116,65 @@ async def _search_audit_from_file(
         else set()
     )
 
-    def _read_and_filter_entries() -> dict[str, Any]:
-        results: list[dict] = []
-        try:
-            with open(audit_path, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
+    results: list[dict] = []
+    try:
+        with open(audit_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                # A line may be valid JSON yet not an object (e.g. `null`,
+                # `[1,2]`); `entry.get(...)` below would raise AttributeError.
+                if not isinstance(entry, dict):
+                    continue
+
+                ts_str = entry.get("@timestamp", "")
+                if t_from or t_to:
                     try:
-                        entry = json.loads(line)
-                    except (json.JSONDecodeError, ValueError):
+                        ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                    except (ValueError, TypeError):
+                        continue
+                    if t_from and ts < t_from:
+                        continue
+                    if t_to and ts > t_to:
                         continue
 
-                    if not _audit_entry_in_time_range(entry, t_from, t_to):
-                        continue
-
-                    text_filters = (
+                if not all(
+                    _match_substring(entry.get(field), needle)
+                    for field, needle in (
                         ("user", user),
                         ("api_key_name", api_key_name),
                         ("model_id", model_id),
                         ("model_name", model_name),
                         ("client_ip", client_ip),
                     )
-                    if any(
-                        query
-                        and not _matches_audit_text_filter(entry.get(field), query)
-                        for field, query in text_filters
-                    ):
-                        continue
-                    if status_set and entry.get("status", "").lower() not in status_set:
-                        continue
-                    if (
-                        category_set
-                        and entry.get("category", "").lower() not in category_set
-                    ):
-                        continue
-                    if (
-                        model_type_set
-                        and entry.get("model_type", "").lower() not in model_type_set
-                    ):
-                        continue
-                    if (
-                        auth_type_set
-                        and entry.get("auth_type", "").lower() not in auth_type_set
-                    ):
-                        continue
+                    if needle
+                ):
+                    continue
+                if not all(
+                    _match_enum(entry.get(field), allowed)
+                    for field, allowed in (
+                        ("status", status_set),
+                        ("category", category_set),
+                        ("model_type", model_type_set),
+                        ("auth_type", auth_type_set),
+                    )
+                    if allowed
+                ):
+                    continue
 
-                    results.append(entry)
-        except OSError:
-            return {"hits": [], "total": 0}
+                results.append(entry)
+    except OSError:
+        return JSONResponse(content={"hits": [], "total": 0})
 
-        results.sort(key=lambda x: x.get("@timestamp", ""), reverse=True)
-        total = len(results)
-        return {
-            "hits": results[page_from : page_from + size],
-            "total": total,
-        }
-
-    content = await asyncio.to_thread(_read_and_filter_entries)
-    return JSONResponse(content=content)
+    results.sort(key=lambda x: x.get("@timestamp", ""), reverse=True)
+    total = len(results)
+    hits = results[page_from : page_from + size]
+    return JSONResponse(content={"hits": hits, "total": total})
 
 
 async def _list_audit_filter_options_from_file(
@@ -1058,7 +1187,10 @@ async def _list_audit_filter_options_from_file(
     t_to = _parse_relative_time(time_to)
 
     def _read_options() -> dict[str, list[str]]:
-        options: dict[str, set[str]] = {
+        options: dict[str, list[tuple[str, str]]] = {
+            field_name: [] for field_name in _AUDIT_TEXT_FILTER_FIELDS
+        }
+        seen: dict[str, set[str]] = {
             field_name: set() for field_name in _AUDIT_TEXT_FILTER_FIELDS
         }
         try:
@@ -1068,18 +1200,18 @@ async def _list_audit_filter_options_from_file(
                         entry = json.loads(line)
                     except (json.JSONDecodeError, ValueError):
                         continue
+                    if not isinstance(entry, dict):
+                        continue
                     if not _audit_entry_in_time_range(entry, t_from, t_to):
                         continue
                     for field_name in _AUDIT_TEXT_FILTER_FIELDS:
-                        value = entry.get(field_name)
-                        if value is not None and str(value):
-                            options[field_name].add(str(value))
+                        _add_bounded_audit_filter_option(
+                            options[field_name], seen[field_name], entry.get(field_name)
+                        )
         except OSError:
             return {key: [] for key in options}
 
-        return {
-            key: sorted(values, key=str.casefold) for key, values in options.items()
-        }
+        return {key: [value for _, value in values] for key, values in options.items()}
 
     content = await asyncio.to_thread(_read_options)
     return JSONResponse(content=content)
@@ -1096,7 +1228,6 @@ async def list_audit_filter_options(
 
     from ...constants import XINFERENCE_AUDIT_ES_INDEX
 
-    body = _audit_filter_aggregation_body(time_from, time_to)
     headers = {"Content-Type": "application/json"}
     auth = None
     es_auth = os.environ.get("XINFERENCE_ES_AUTH", "")
@@ -1108,50 +1239,78 @@ async def list_audit_filter_options(
             if len(parts) == 2:
                 auth = aiohttp.BasicAuth(parts[0], parts[1])
 
-    url = f"{es_url.rstrip('/')}/{XINFERENCE_AUDIT_ES_INDEX}/_search"
+    es_base_url = es_url.rstrip("/")
+    field_names = ",".join(
+        field_name
+        for response_field in _AUDIT_TEXT_FILTER_FIELDS
+        for field_name in (response_field, f"{response_field}.keyword")
+    )
+    field_caps_url = (
+        f"{es_base_url}/{XINFERENCE_AUDIT_ES_INDEX}/_field_caps"
+        f"?fields={field_names}&include_unmapped=true"
+    )
+    option_values: dict[str, list[tuple[str, str]]] = {
+        field_name: [] for field_name in _AUDIT_TEXT_FILTER_FIELDS
+    }
+    seen_values: dict[str, set[str]] = {
+        field_name: set() for field_name in _AUDIT_TEXT_FILTER_FIELDS
+    }
     try:
         timeout = aiohttp.ClientTimeout(total=10)
         async with aiohttp.ClientSession(timeout=timeout, auth=auth) as session:
 
             async def fetch(
-                request_body: dict[str, Any],
+                url: str, request_body: Optional[dict[str, Any]] = None
             ) -> tuple[int, str, dict[str, Any]]:
-                async with session.post(
-                    url, json=request_body, headers=headers
-                ) as resp:
+                request_kwargs: dict[str, Any] = {"headers": headers}
+                if request_body is not None:
+                    request_kwargs["json"] = request_body
+                async with session.post(url, **request_kwargs) as resp:
                     if resp.status != 200:
                         return resp.status, await resp.text(), {}
                     return resp.status, "", await resp.json()
 
-            status, response_text, data = await fetch(body)
-            if _is_fielddata_disabled_error(status, response_text):
-                keyword_body = _audit_filter_aggregation_body(
-                    time_from, time_to, keyword_fields=True
-                )
-                status, response_text, data = await fetch(keyword_body)
-
+            status, response_text, field_caps = await fetch(field_caps_url)
             if status != 200:
                 logger.error(
-                    "ES audit filter aggregation failed: status=%d body=%s",
+                    "ES audit field capabilities query failed: status=%d body=%s",
                     status,
                     response_text[:500],
                 )
                 raise HTTPException(
                     status_code=502, detail="Elasticsearch query failed"
                 )
+
+            for indices, fields in _audit_filter_field_groups(field_caps):
+                search_url = f"{es_base_url}/{','.join(indices)}/_search"
+                body = _audit_filter_aggregation_body(time_from, time_to, fields=fields)
+                status, response_text, data = await fetch(search_url, body)
+                if status != 200:
+                    logger.error(
+                        "ES audit filter aggregation failed: status=%d body=%s",
+                        status,
+                        response_text[:500],
+                    )
+                    raise HTTPException(
+                        status_code=502, detail="Elasticsearch query failed"
+                    )
+
+                aggregations = data.get("aggregations", {})
+                for field_name in _AUDIT_TEXT_FILTER_FIELDS:
+                    for bucket in aggregations.get(field_name, {}).get("buckets", []):
+                        _add_bounded_audit_filter_option(
+                            option_values[field_name],
+                            seen_values[field_name],
+                            bucket.get("key"),
+                        )
     except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as e:
         logger.error("ES connection error, timeout, or invalid response: %s", e)
         raise HTTPException(status_code=502, detail="Audit service unavailable")
 
-    aggregations = data.get("aggregations", {})
     return JSONResponse(
         content={
-            field_name: [
-                str(bucket["key"])
-                for bucket in aggregations.get(field_name, {}).get("buckets", [])
-                if bucket.get("key") is not None and str(bucket["key"])
-            ]
-            for field_name in _AUDIT_TEXT_FILTER_FIELDS
+            field_name: [value for _, value in option_values[field_name]]
+            for field_name in option_values
         }
     )
 
@@ -1196,6 +1355,7 @@ async def search_audit_logs(
 
     size = max(1, min(size, 500))
     page_from = max(0, page_from)
+    time_from, time_to = _freeze_es_time_bounds(time_from, time_to)
 
     must: list[dict[str, Any]] = []
     filter_clauses: list[dict[str, Any]] = [
@@ -1210,7 +1370,18 @@ async def search_audit_logs(
         ("client_ip", client_ip),
     ]:
         if value:
-            filter_clauses.append(_audit_text_wildcard_filter(field_name, value))
+            # Substring, case-insensitive, to match the file-mode semantics.
+            # Dynamic mapping commonly creates `text` + `.keyword`, while an
+            # index template may map the field directly as `keyword` or
+            # `wildcard`. Query both names so either mapping works. An unmapped
+            # alternative simply contributes no match.
+            #
+            # NOTE: a leading wildcard cannot use the index and forces a scan of
+            # all terms in the segment. That is acceptable for typical audit
+            # volumes, but on a large index deployments should install an index
+            # template mapping these fields directly to the `wildcard` type
+            # (ES >= 7.9), which is covered by the first alternative.
+            filter_clauses.append(_es_substring_clause(field_name, value))
 
     for field_name, value in [
         ("model_type", model_type),

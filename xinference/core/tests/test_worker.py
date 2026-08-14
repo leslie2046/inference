@@ -25,7 +25,7 @@ from ...model.core import VirtualEnvSettings
 from ..status_guard import InstanceInfo, LaunchStatus, ReplicaStatus
 from ..supervisor import ReplicaInfo, SupervisorActor
 from ..utils import merge_virtual_env_packages
-from ..worker import ModelStatus, WorkerActor
+from ..worker import ModelStatus, WorkerActor, _inject_jina_v3_allocator_env
 
 
 class MockWorkerActor(WorkerActor):
@@ -546,6 +546,110 @@ def test_prepare_virtual_env_injects_engine_vars():
     assert kwargs["model_engine"] == "vllm"
 
 
+def test_jina_v3_allocator_env_is_persisted_for_recovery(monkeypatch):
+    monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
+    monkeypatch.delenv("PYTORCH_ALLOC_CONF", raising=False)
+    launch_args = {"envs": None}
+
+    envs = _inject_jina_v3_allocator_env(
+        "embedding",
+        "jina-embeddings-v3",
+        None,
+        launch_args,
+    )
+
+    assert envs == {"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}
+    assert launch_args["envs"] == envs
+
+
+def test_jina_v3_allocator_env_preserves_user_configuration():
+    launch_args = {"envs": None}
+    user_envs = {"PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:128"}
+
+    envs = _inject_jina_v3_allocator_env(
+        "embedding",
+        "jina-embeddings-v3",
+        user_envs,
+        launch_args,
+    )
+
+    assert envs == user_envs
+    assert envs is not user_envs
+    assert launch_args["envs"] == user_envs
+
+
+@pytest.mark.parametrize(
+    "allocator_key,allocator_value",
+    [
+        ("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:128"),
+        ("PYTORCH_ALLOC_CONF", "backend:cudaMallocAsync"),
+    ],
+)
+def test_jina_v3_allocator_env_preserves_inherited_worker_configuration(
+    monkeypatch, allocator_key, allocator_value
+):
+    monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
+    monkeypatch.delenv("PYTORCH_ALLOC_CONF", raising=False)
+    monkeypatch.setenv(allocator_key, allocator_value)
+    launch_args = {"envs": None}
+    user_envs = {"OTHER_ENV": "value"}
+
+    envs = _inject_jina_v3_allocator_env(
+        "embedding",
+        "jina-embeddings-v3",
+        user_envs,
+        launch_args,
+    )
+
+    assert envs == user_envs
+    assert envs is not user_envs
+    assert "PYTORCH_CUDA_ALLOC_CONF" not in envs
+    assert "PYTORCH_ALLOC_CONF" not in envs
+    assert launch_args["envs"] == user_envs
+
+
+def test_jina_v3_allocator_env_preserves_new_allocator_configuration():
+    launch_args = {"envs": None}
+    user_envs = {"PYTORCH_ALLOC_CONF": "backend:cudaMallocAsync"}
+
+    envs = _inject_jina_v3_allocator_env(
+        "embedding",
+        "jina-embeddings-v3",
+        user_envs,
+        launch_args,
+    )
+
+    assert envs == user_envs
+    assert launch_args["envs"] == user_envs
+
+
+@pytest.mark.parametrize(
+    "model_type,model_name",
+    [
+        ("LLM", "jina-embeddings-v3"),
+        ("embedding", "jina-embeddings-v2"),
+        ("embedding", "jina-embeddings-v4"),
+        ("embedding", "bge-small-en-v1.5"),
+        (None, "jina-embeddings-v3"),
+        ("embedding", None),
+        ("", "jina-embeddings-v3"),
+        ("embedding", ""),
+    ],
+)
+def test_jina_v3_allocator_env_does_not_affect_other_models(model_type, model_name):
+    launch_args = {"envs": None}
+
+    envs = _inject_jina_v3_allocator_env(
+        model_type,
+        model_name,
+        None,
+        launch_args,
+    )
+
+    assert envs is None
+    assert launch_args["envs"] is None
+
+
 @pytest.mark.asyncio
 async def test_worker_report_status_reconnects_and_replays_running_models(
     setup_pool, monkeypatch
@@ -783,6 +887,119 @@ async def test_supervisor_add_worker_idempotent_rebuilds_replica_state(monkeypat
 
 
 @pytest.mark.asyncio
+async def test_supervisor_add_worker_rebuilds_sparse_replica_ids(monkeypatch):
+    supervisor = SupervisorActor()
+    supervisor._status_guard_ref = DummyStatusGuardRef()
+    replica_model_uid = "model-a-rep2"
+    worker_ref = DummyReplicaWorkerRef(
+        "worker-1",
+        models={
+            replica_model_uid: {
+                "model_uid": replica_model_uid,
+                "address": "worker-1",
+            }
+        },
+    )
+
+    async def fake_actor_ref(address, uid):
+        assert address == "worker-1"
+        return worker_ref
+
+    monkeypatch.setattr(xo, "actor_ref", fake_actor_ref)
+
+    await supervisor.add_worker(
+        "worker-1",
+        replica_states=[
+            {
+                "replica_model_uid": replica_model_uid,
+                "n_worker": 1,
+                "shard": 0,
+                "model_uid": "model-a",
+                "model_name": "demo-model",
+                "model_version": None,
+                "model_ability": ["generate"],
+                "status": LaunchStatus.READY.name,
+                "created_ts": 1710000001,
+                "instance_created_ts": 1710000001,
+            }
+        ],
+    )
+
+    replica_info = supervisor._model_uid_to_replica_info["model-a"]
+    assert replica_info.replica == 1
+    assert replica_info.active_replica_ids == [2]
+    assert next(replica_info.scheduler) == 2
+    assert "model-a-rep0" not in supervisor._replica_model_uid_to_worker
+    assert supervisor._replica_model_uid_to_worker[replica_model_uid] is worker_ref
+
+    instance_info = (
+        await supervisor._status_guard_ref.get_instance_info(model_uid="model-a")
+    )[0]
+    assert instance_info.replica == 1
+    assert [status.replica_id for status in instance_info.replica_statuses] == [2]
+
+
+@pytest.mark.asyncio
+async def test_supervisor_add_worker_reconciles_partial_recovery(monkeypatch):
+    supervisor = SupervisorActor()
+    supervisor._status_guard_ref = DummyStatusGuardRef()
+    replica_uids = ["model-a-rep0", "model-a-rep1"]
+    worker_ref = DummyReplicaWorkerRef(
+        "worker-1",
+        models={
+            replica_uid: {"model_uid": replica_uid, "address": "worker-1"}
+            for replica_uid in replica_uids
+        },
+    )
+
+    async def fake_actor_ref(address, uid):
+        assert address == "worker-1"
+        return worker_ref
+
+    monkeypatch.setattr(xo, "actor_ref", fake_actor_ref)
+
+    def build_state(replica_model_uid: str, created_ts: int):
+        return {
+            "replica_model_uid": replica_model_uid,
+            "n_worker": 1,
+            "shard": 0,
+            "model_uid": "model-a",
+            "model_name": "demo-model",
+            "model_version": None,
+            "model_ability": ["generate"],
+            "status": LaunchStatus.READY.name,
+            "created_ts": created_ts,
+            "instance_created_ts": 1710000001,
+        }
+
+    replica_states = [
+        build_state(replica_uids[0], 1710000001),
+        build_state(replica_uids[1], 1710000002),
+    ]
+    await supervisor.add_worker("worker-1", replica_states=replica_states)
+
+    await supervisor.add_worker("worker-1", replica_states=replica_states[:1])
+
+    replica_info = supervisor._model_uid_to_replica_info["model-a"]
+    assert replica_info.replica == 1
+    assert replica_info.active_replica_ids == [0]
+    assert supervisor._replica_model_uid_to_worker[replica_uids[0]] is worker_ref
+    assert replica_uids[1] not in supervisor._replica_model_uid_to_worker
+    assert ("model-a", 1) in supervisor._unexpected_down_replicas
+
+    instance_info = (
+        await supervisor._status_guard_ref.get_instance_info(model_uid="model-a")
+    )[0]
+    assert instance_info.replica == 1
+    assert instance_info.status == LaunchStatus.READY.name
+    replica_statuses = {
+        status.replica_id: status for status in instance_info.replica_statuses
+    }
+    assert replica_statuses[0].status == LaunchStatus.READY.name
+    assert replica_statuses[1].status == LaunchStatus.TERMINATED.name
+
+
+@pytest.mark.asyncio
 async def test_supervisor_report_worker_status_rejects_unregistered_worker():
     """report_worker_status must reject a worker absent from the registry
     (e.g. after a supervisor restart) instead of fabricating a _worker_status
@@ -1015,6 +1232,13 @@ async def test_supervisor_add_worker_rebuilds_replica_details_after_reconnect(
         LaunchStatus.READY.name,
         LaunchStatus.READY.name,
     ]
+
+    await supervisor._status_guard_ref.update_replica_status(
+        "model-a", 0, {"replica_uid": "primary", "gpu_idx": [0]}
+    )
+    api_statuses = await supervisor.get_replica_statuses("model-a")
+    assert api_statuses[0]["replica_uid"] == "primary"
+    assert api_statuses[0]["gpu_idx"] == [0]
 
 
 def test_prepare_virtual_env_without_engine_vars():
