@@ -271,6 +271,13 @@ XINFERENCE_LOG_CONSOLE = (
     os.environ.get("XINFERENCE_LOG_CONSOLE", "true").lower() == "true"
 )
 
+# The Web UI polls /progress and /replicas about once a second per model and
+# metrics scrapers hit /metrics, so at info level those access lines bury
+# everything else. Set to true to log them anyway.
+XINFERENCE_LOG_POLLING_ACCESS = (
+    os.environ.get("XINFERENCE_LOG_POLLING_ACCESS", "false").lower() == "true"
+)
+
 # Download progress logging level (only effective when XINFERENCE_LOG_CONSOLE=false)
 # - "sampled": log 25/50/75/100% per shard + terminal state on exit (default)
 # - "full": log every tqdm frame
@@ -392,6 +399,12 @@ XINFERENCE_MAX_CONCURRENT_LAUNCHES = max(
 # extreme environments (slow NFS, vLLM version upgrade slowing import, etc.).
 XINFERENCE_SUBPOOL_LAUNCH_TIMEOUT = int(
     os.environ.get("XINFERENCE_SUBPOOL_LAUNCH_TIMEOUT", "60")
+)
+
+# How long cancel_launch_model waits for the cancelled launch to unwind before
+# returning anyway, so an immediate relaunch is not rejected as still running.
+XINFERENCE_CANCEL_LAUNCH_TIMEOUT = int(
+    os.environ.get("XINFERENCE_CANCEL_LAUNCH_TIMEOUT", "60")
 )
 
 # Status gather timeout in seconds (for collecting GPU info, etc.)
