@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useMemo } from 'react';
+import { useEffect, useState } from 'react';
 import { Binary, ImageIcon, Sparkles } from 'lucide-react';
 
 import ReactMarkdown from '@/components/ui/markdown-renderer';
@@ -97,7 +97,7 @@ function isVisualAbility(ability: ModelAbility) {
 }
 
 function isAudioResultAbility(ability: ModelAbility) {
-  return [ModelAbility.Text2audio, ModelAbility.Audio2audio, ModelAbility.Audio2audio].includes(
+  return [ModelAbility.Text2audio, ModelAbility.Text2music, ModelAbility.Audio2audio].includes(
     ability
   );
 }
@@ -163,25 +163,65 @@ function BlobMediaPreview({
   blob,
   type,
   className,
+  thumbnailClassName,
 }: {
   blob: Blob;
   type: MediaType;
   className: string;
+  thumbnailClassName?: string;
 }) {
-  const url = useMemo(() => URL.createObjectURL(blob), [blob]);
+  const [url, setUrl] = useState<string>();
 
   useEffect(() => {
-    return () => URL.revokeObjectURL(url);
-  }, [url]);
+    const expectedMimeType = mediaMimeType(type);
+    const mediaBlob =
+      blob.type && blob.type !== 'application/octet-stream'
+        ? blob
+        : new Blob([blob], { type: expectedMimeType });
+    const objectUrl = URL.createObjectURL(mediaBlob);
 
-  return <MediaPreview type={type} url={url} className={className} />;
+    setUrl(objectUrl);
+    return () => URL.revokeObjectURL(objectUrl);
+  }, [blob, type]);
+
+  if (!url) return null;
+
+  return (
+    <MediaPreview
+      type={type}
+      url={url}
+      title={blob instanceof File ? blob.name : undefined}
+      className={className}
+      thumbnailClassName={thumbnailClassName}
+    />
+  );
 }
 
 function MediaResultPanel({ result, type }: { result: unknown; type: MediaType }) {
   const isAudio = type === 'audio';
-  const mediaClassName = isAudio ? 'w-full max-w-full' : 'h-72 w-full max-w-full';
+  const isImage = type === 'image';
+  const mediaClassName = isAudio
+    ? 'w-full max-w-full'
+    : isImage
+      ? 'h-fit w-fit max-h-72 max-w-full'
+      : 'h-72 w-full max-w-full';
+  const thumbnailClassName = isImage
+    ? 'h-auto max-h-72 w-auto max-w-full object-contain'
+    : undefined;
+  const resultLayoutClassName = isAudio
+    ? 'grid'
+    : isImage
+      ? 'flex flex-wrap items-start'
+      : 'grid grid-cols-2';
   if (result instanceof Blob) {
-    return <BlobMediaPreview blob={result} type={type} className={mediaClassName} />;
+    return (
+      <BlobMediaPreview
+        blob={result}
+        type={type}
+        className={mediaClassName}
+        thumbnailClassName={thumbnailClassName}
+      />
+    );
   }
 
   const mediaResults = extractMediaResults(result, type);
@@ -191,7 +231,7 @@ function MediaResultPanel({ result, type }: { result: unknown; type: MediaType }
   }
 
   return (
-    <div className={cn('grid gap-2', !isAudio && 'grid-cols-2')}>
+    <div className={cn('gap-2', resultLayoutClassName)}>
       {mediaResults.map((item, index) => (
         <MediaPreview
           key={item.title || index}
@@ -199,6 +239,7 @@ function MediaResultPanel({ result, type }: { result: unknown; type: MediaType }
           url={item.url}
           title={item.title}
           className={mediaClassName}
+          thumbnailClassName={thumbnailClassName}
         />
       ))}
     </div>

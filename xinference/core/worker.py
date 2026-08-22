@@ -102,6 +102,7 @@ from .utils import (
     log_async,
     log_sync,
     merge_virtual_env_packages,
+    normalize_n_worker,
     normalize_sglang_kernel_packages,
     parse_legacy_replica_model_uid,
     parse_replica_model_uid,
@@ -227,6 +228,23 @@ def _mark_venv_setup_done(
 # and provides a fast uncontended path on Unix as well.
 _venv_locks: Dict[str, threading.Lock] = {}
 _venv_locks_lock = threading.Lock()
+_SUPERVISOR_INIT_TIMEOUT = 60
+
+
+def _wait_for_metrics_export_server(
+    metrics_thread: threading.Thread,
+    address_queue: queue.Queue,
+    startup_timeout: float = 10.0,
+) -> Tuple[str, int]:
+    deadline = time.monotonic() + startup_timeout
+    while True:
+        try:
+            return address_queue.get(timeout=0.1)[:2]
+        except queue.Empty:
+            if not metrics_thread.is_alive():
+                raise RuntimeError("Metrics server thread exited before startup.")
+            if time.monotonic() >= deadline:
+                raise RuntimeError("Timed out waiting for metrics server startup.")
 
 
 @contextmanager
@@ -678,6 +696,11 @@ class WorkerActor(xo.StatelessActor):
         self._supervisor_address = supervisor_address
         self._supervisor_endpoint = supervisor_endpoint
         self._supervisor_ref: Optional[xo.ActorRefType] = None
+        self._supervisor_ref_lock = threading.Lock()
+        self._supervisor_ref_generation = 0
+        self._supervisor_ref_address: Optional[str] = None
+        self._supervisor_init_lock: Optional[asyncio.Lock] = None
+        self._actor_loop: Optional[asyncio.AbstractEventLoop] = None
         self._main_pool = main_pool
         self._main_pool.recover_sub_pool = self.recover_sub_pool
         self._status_guard_ref: xo.ActorRefType[
@@ -745,17 +768,10 @@ class WorkerActor(xo.StatelessActor):
             )
             self._metrics_thread.start()
             logger.info("Checking metrics export server...")
-            while self._metrics_thread.is_alive():
-                try:
-                    host, port = q.get(block=False)[:2]
-                    logger.info(
-                        f"Metrics server is started at: http://{host}:{port}"  # noqa: E231
-                    )
-                    break
-                except queue.Empty:
-                    pass
-            else:
-                raise Exception("Metrics server thread exit.")
+            host, port = _wait_for_metrics_export_server(self._metrics_thread, q)
+            logger.info(
+                f"Metrics server is started at: http://{host}:{port}"  # noqa: E231
+            )
 
         # Initialize virtual environment manager
         self._virtual_env_manager = XinferenceVirtualEnvManager(self.address)
@@ -1167,6 +1183,9 @@ class WorkerActor(xo.StatelessActor):
             logger.debug("Startup VRAM poll failed", exc_info=True)
 
     async def __post_create__(self):
+        self._actor_loop = asyncio.get_running_loop()
+        self._supervisor_init_lock = asyncio.Lock()
+
         from ..model.audio import (
             CustomAudioModelFamilyV2,
             generate_audio_description,
@@ -1335,63 +1354,150 @@ class WorkerActor(xo.StatelessActor):
         Params:
             add_worker: By default will call supervisor.add_worker after first connect
         """
-        from .supervisor import SupervisorActor
+        supervisor_ref, _ = await self._get_supervisor_ref_with_generation(add_worker)
+        return supervisor_ref
 
-        # Cache hit: return immediately only when no registration is required,
-        # or the worker has already been registered. When add_worker=True and
-        # _registered=False, we must fall through to perform add_worker even if
-        # the ref is cached (this happens after heartbeat populated the ref via
-        # add_worker=False before registration completed).
-        if self._supervisor_ref is not None and (not add_worker or self._registered):
-            return self._supervisor_ref
-        try:
-            supervisor_ref = await xo.actor_ref(  # type: ignore
-                address=self._supervisor_address, uid=SupervisorActor.default_uid()
-            )
-        except Exception:
-            await self._refresh_supervisor_address()
-            supervisor_ref = await xo.actor_ref(  # type: ignore
-                address=self._supervisor_address, uid=SupervisorActor.default_uid()
-            )
-        # Prevent concurrent operations leads to double initialization, check again.
-        if self._supervisor_ref is not None and (not add_worker or self._registered):
-            return self._supervisor_ref
-        self._supervisor_ref = supervisor_ref
-        try:
-            if add_worker and not self._registered:
-                replica_states = self._get_running_replica_states()
-                await supervisor_ref.add_worker(
-                    self.address, replica_states=replica_states
-                )
-                self._registered = True
-                if replica_states:
-                    logger.info(
-                        "Connected to supervisor and replayed %s running model replicas",
-                        len(replica_states),
-                    )
-                else:
-                    logger.info("Connected to supervisor as a fresh worker")
+    async def _get_supervisor_ref_with_generation(
+        self, add_worker: bool = True
+    ) -> Tuple[xo.ActorRefType, int]:
+        running_loop = asyncio.get_running_loop()
+        if self._actor_loop is None:
+            # Test/local fallback. Production sets these before the first connect
+            # in __post_create__.
+            self._actor_loop = running_loop
+            self._supervisor_init_lock = asyncio.Lock()
 
-            self._status_guard_ref = await xo.actor_ref(
-                address=self._supervisor_address, uid=StatusGuardActor.default_uid()
+        try:
+            if running_loop is self._actor_loop:
+                return await self._get_supervisor_ref_on_actor_loop(add_worker)
+
+            future = asyncio.run_coroutine_threadsafe(
+                self._get_supervisor_ref_on_actor_loop(add_worker), self._actor_loop
             )
-            self._event_collector_ref = await xo.actor_ref(
-                address=self._supervisor_address, uid=EventCollectorActor.default_uid()
-            )
-            self._cache_tracker_ref = await xo.actor_ref(
-                address=self._supervisor_address, uid=CacheTrackerActor.default_uid()
-            )
-            self._progress_tracker_ref = None
-        except Exception:
-            self._clear_supervisor_refs()
+            return await asyncio.wrap_future(future)
+        except BaseException:
+            # A follower cancelled while waiting for the actor-loop lock must not
+            # clear the leader's in-flight initialization.
+            self._clear_unregistered_supervisor_refs()
             raise
 
-        # record_model_version is an auxiliary cache-management feature.
-        # Its failure must NOT block the worker's core heartbeat/status-report
-        # channel. Guard against _cache_tracker_ref being None when the first
-        # try block failed and cleared all refs (defensive: avoids AttributeError).
-        if self._cache_tracker_ref is None:
-            return self._supervisor_ref
+    async def _get_supervisor_ref_on_actor_loop(
+        self, add_worker: bool
+    ) -> Tuple[xo.ActorRefType, int]:
+        from .supervisor import SupervisorActor
+
+        if self._supervisor_init_lock is None:
+            self._supervisor_init_lock = asyncio.Lock()
+
+        cache_tracker_ref = None
+        replica_states: List[Dict[str, Any]] = []
+        async with self._supervisor_init_lock:
+            # Cache hit: return immediately only when no registration is required,
+            # or the worker has already been registered.
+            with self._supervisor_ref_lock:
+                if self._supervisor_ref is not None and (
+                    not add_worker or self._registered
+                ):
+                    return self._supervisor_ref, self._supervisor_ref_generation
+                supervisor_ref = self._supervisor_ref
+                supervisor_address = self._supervisor_ref_address
+                generation = self._supervisor_ref_generation
+
+            async with timeout(_SUPERVISOR_INIT_TIMEOUT):
+                if supervisor_ref is None:
+                    supervisor_address = self._supervisor_address
+                    try:
+                        supervisor_ref = await xo.actor_ref(  # type: ignore
+                            address=supervisor_address,
+                            uid=SupervisorActor.default_uid(),
+                        )
+                    except Exception:
+                        await self._refresh_supervisor_address()
+                        supervisor_address = self._supervisor_address
+                        supervisor_ref = await xo.actor_ref(  # type: ignore
+                            address=supervisor_address,
+                            uid=SupervisorActor.default_uid(),
+                        )
+
+                    with self._supervisor_ref_lock:
+                        if self._supervisor_ref is None:
+                            self._supervisor_ref = supervisor_ref
+                            self._supervisor_ref_address = supervisor_address
+                            self._supervisor_ref_generation += 1
+                        elif not add_worker or self._registered:
+                            return (
+                                self._supervisor_ref,
+                                self._supervisor_ref_generation,
+                            )
+                        supervisor_ref = self._supervisor_ref
+                        supervisor_address = self._supervisor_ref_address
+                        generation = self._supervisor_ref_generation
+
+                assert supervisor_ref is not None
+                assert supervisor_address is not None
+                if not add_worker:
+                    return supervisor_ref, generation
+
+                # All registration work runs on the actor loop under one asyncio
+                # lock. If the replica set changes while an RPC is in flight,
+                # replay serially until the supervisor has the latest snapshot.
+                while True:
+                    replica_states = self._get_running_replica_states()
+                    await supervisor_ref.add_worker(
+                        self.address, replica_states=replica_states
+                    )
+                    status_guard_ref = await xo.actor_ref(
+                        address=supervisor_address,
+                        uid=StatusGuardActor.default_uid(),
+                    )
+                    event_collector_ref = await xo.actor_ref(
+                        address=supervisor_address,
+                        uid=EventCollectorActor.default_uid(),
+                    )
+                    cache_tracker_ref = await xo.actor_ref(
+                        address=supervisor_address,
+                        uid=CacheTrackerActor.default_uid(),
+                    )
+                    if self._get_running_replica_states() == replica_states:
+                        break
+
+                # No await occurs between the final snapshot check and this
+                # publication, so actor-loop model mutations cannot create a
+                # stale registered snapshot. Address and generation are checked
+                # together to prevent mixing refs from different supervisors.
+                with self._supervisor_ref_lock:
+                    if (
+                        self._supervisor_ref is not supervisor_ref
+                        or self._supervisor_ref_generation != generation
+                        or self._supervisor_ref_address != supervisor_address
+                        or self._supervisor_address != supervisor_address
+                    ):
+                        raise RuntimeError(
+                            "Supervisor reference changed during initialization"
+                        )
+                    self._status_guard_ref = status_guard_ref
+                    self._event_collector_ref = event_collector_ref
+                    self._cache_tracker_ref = cache_tracker_ref
+                    self._progress_tracker_ref = None
+                    self._registered = True
+                    self._supervisor_ref_generation += 1
+                    generation = self._supervisor_ref_generation
+
+        if replica_states:
+            logger.info(
+                "Connected to supervisor and replayed %s running model replicas",
+                len(replica_states),
+            )
+        else:
+            logger.info("Connected to supervisor as a fresh worker")
+
+        if cache_tracker_ref is not None:
+            asyncio.create_task(
+                self._record_model_versions_best_effort(cache_tracker_ref)
+            )
+        return supervisor_ref, generation
+
+    async def _record_model_versions_best_effort(self, cache_tracker_ref):
         try:
             # cache_tracker is on supervisor
             from ..model.audio import get_audio_model_descriptions
@@ -1402,7 +1508,6 @@ class WorkerActor(xo.StatelessActor):
             from ..model.rerank import get_rerank_model_descriptions
             from ..model.video import get_video_model_descriptions
 
-            # record model version
             model_version_infos: Dict[str, List[Dict]] = {}  # type: ignore
             model_version_infos.update(get_llm_version_infos())
             model_version_infos.update(get_embedding_model_descriptions())
@@ -1411,9 +1516,14 @@ class WorkerActor(xo.StatelessActor):
             model_version_infos.update(get_audio_model_descriptions())
             model_version_infos.update(get_video_model_descriptions())
             model_version_infos.update(get_flexible_model_descriptions())
-            await self._cache_tracker_ref.record_model_version(
-                model_version_infos, self.address
+            await xo.wait_for(
+                cache_tracker_ref.record_model_version(
+                    model_version_infos, self.address
+                ),
+                XINFERENCE_TCP_REQUEST_TIMEOUT,
             )
+        except asyncio.CancelledError:
+            raise
         except Exception:
             logger.warning(
                 "Failed to record model version info to cache tracker; "
@@ -1421,17 +1531,58 @@ class WorkerActor(xo.StatelessActor):
                 exc_info=True,
             )
 
-        return self._supervisor_ref
+    def _clear_unregistered_supervisor_refs(self) -> bool:
+        init_lock = self._supervisor_init_lock
+        if init_lock is not None and init_lock.locked():
+            return False
+        with self._supervisor_ref_lock:
+            if self._registered:
+                return False
+            self._supervisor_ref = None
+            self._supervisor_ref_address = None
+            self._status_guard_ref = None  # type: ignore
+            self._event_collector_ref = None  # type: ignore
+            self._cache_tracker_ref = None  # type: ignore
+            self._progress_tracker_ref = None
+            self._supervisor_ref_generation += 1
+            return True
 
-    def _clear_supervisor_refs(self):
-        self._supervisor_ref = None
-        # Reset registration state so the next get_supervisor_ref(add_worker=True)
-        # re-runs add_worker. Keep this in sync with _supervisor_ref lifecycle.
-        self._registered = False
-        self._status_guard_ref = None  # type: ignore
-        self._event_collector_ref = None  # type: ignore
-        self._cache_tracker_ref = None  # type: ignore
-        self._progress_tracker_ref = None
+    def _get_supervisor_ref_generation(
+        self, supervisor_ref: xo.ActorRefType
+    ) -> Optional[int]:
+        with self._supervisor_ref_lock:
+            if self._supervisor_ref is supervisor_ref:
+                return self._supervisor_ref_generation
+            return None
+
+    def _clear_supervisor_refs(
+        self,
+        expected_supervisor_ref: Optional[xo.ActorRefType] = None,
+        expected_generation: Optional[int] = None,
+    ) -> bool:
+        with self._supervisor_ref_lock:
+            if (
+                expected_supervisor_ref is not None
+                and self._supervisor_ref is not expected_supervisor_ref
+            ):
+                return False
+            if (
+                expected_generation is not None
+                and self._supervisor_ref_generation != expected_generation
+            ):
+                return False
+            self._supervisor_ref = None
+            self._supervisor_ref_address = None
+            # Reset registration state so the next
+            # get_supervisor_ref(add_worker=True) re-runs add_worker. Keep this
+            # in sync with _supervisor_ref lifecycle.
+            self._registered = False
+            self._status_guard_ref = None  # type: ignore
+            self._event_collector_ref = None  # type: ignore
+            self._cache_tracker_ref = None  # type: ignore
+            self._progress_tracker_ref = None
+            self._supervisor_ref_generation += 1
+            return True
 
     async def _refresh_supervisor_address(self):
         if self._supervisor_endpoint is None:
@@ -2400,31 +2551,46 @@ class WorkerActor(xo.StatelessActor):
 
             # Add built-in audio models (BUILTIN_AUDIO_MODELS contains model_name -> families list)
             for model_name, families in BUILTIN_AUDIO_MODELS.items():
+                if not families:
+                    continue
                 download_hubs = []
                 for family in families:
                     if family.model_hub not in download_hubs:
                         download_hubs.append(family.model_hub)
-                for family in families:
-                    if detailed:
+
+                if detailed:
+                    model_specs = []
+                    for family in families:
                         audio_cache_manager = CacheManager(family)
-                        model_specs = [
+                        model_specs.append(
                             {
-                                "model_format": "pytorch",
+                                "model_format": family.model_format or "pytorch",
+                                "model_engine": family.engine,
                                 "model_hub": family.model_hub,
                                 "model_id": family.model_id,
+                                "cache_name": family.cache_name,
                                 "cache_status": audio_cache_manager.get_cache_status(),
                             }
-                        ]
-                        ret.append(
-                            {
-                                **family.dict(),
-                                "model_specs": model_specs,
-                                "is_builtin": True,
-                                "download_hubs": download_hubs,
-                            }
                         )
-                    else:
-                        ret.append({"model_name": model_name, "is_builtin": True})
+                    representative = next(
+                        (
+                            family
+                            for family in families
+                            if family.model_hub == "huggingface"
+                            and (family.engine or "").lower() != "mlx"
+                        ),
+                        families[0],
+                    )
+                    ret.append(
+                        {
+                            **representative.dict(),
+                            "model_specs": model_specs,
+                            "is_builtin": True,
+                            "download_hubs": download_hubs,
+                        }
+                    )
+                else:
+                    ret.append({"model_name": model_name, "is_builtin": True})
 
             # Add user-defined audio models
             for model_spec in get_user_defined_audios():
@@ -2912,7 +3078,16 @@ class WorkerActor(xo.StatelessActor):
 
         assert settings is not None  # for mypy type narrowing
 
-        if settings and model_engine and model_engine.lower() not in ("vllm", "sglang"):
+        if (
+            settings
+            and model_engine
+            and model_engine.lower()
+            not in (
+                "vllm",
+                "sglang",
+                "diffusers",
+            )
+        ):
             # Pydantic v1 compatibility: use copy() when model_copy is unavailable.
             if hasattr(settings, "model_copy"):
                 settings = settings.model_copy(deep=True)
@@ -3324,6 +3499,7 @@ class WorkerActor(xo.StatelessActor):
         envs: Optional[Dict[str, str]] = None,
         **kwargs,
     ):
+        n_worker = normalize_n_worker(n_worker)
         # !!! Note that The following code must be placed at the very beginning of this function,
         # or there will be problems with auto-recovery.
         # Because `locals()` will collect all the local parameters of this function and pass to this function again.
@@ -3332,6 +3508,19 @@ class WorkerActor(xo.StatelessActor):
         launch_args.pop("kwargs")
         launch_args.update(kwargs)
         launch_args["launch_ts"] = int(time.time())
+        if model_type.lower() == "audio":
+            from ..model.audio.core import resolve_audio_model_name_and_engine
+
+            model_name, model_engine = resolve_audio_model_name_and_engine(
+                model_name, model_engine, use_default_engine=True
+            )
+            launch_args["model_name"] = model_name
+            launch_args["model_engine"] = model_engine
+        elif model_type.lower() == "image":
+            from ..model.image.core import resolve_image_model_engine
+
+            model_engine = resolve_image_model_engine(model_name, model_engine)
+            launch_args["model_engine"] = model_engine
         envs = _inject_jina_v3_allocator_env(model_type, model_name, envs, launch_args)
 
         try:
@@ -4261,17 +4450,34 @@ class WorkerActor(xo.StatelessActor):
             raise
         except Exception:
             logger.exception("Report status got error.")
+        supervisor_ref = None
+        supervisor_generation = None
         try:
-            supervisor_ref = await self.get_supervisor_ref()
-            await supervisor_ref.report_worker_status(self.address, status)
+            (
+                supervisor_ref,
+                supervisor_generation,
+            ) = await self._get_supervisor_ref_with_generation()
+            await xo.wait_for(
+                supervisor_ref.report_worker_status(self.address, status),
+                XINFERENCE_TCP_REQUEST_TIMEOUT,
+            )
         except Exception:
             logger.warning(
                 "Failed to report worker status, clearing cached supervisor references",
                 exc_info=True,
             )
-            self._clear_supervisor_refs()
-            supervisor_ref = await self.get_supervisor_ref(add_worker=True)
-            await supervisor_ref.report_worker_status(self.address, status)
+            if supervisor_ref is not None and supervisor_generation is not None:
+                self._clear_supervisor_refs(
+                    expected_supervisor_ref=supervisor_ref,
+                    expected_generation=supervisor_generation,
+                )
+            supervisor_ref, _ = await self._get_supervisor_ref_with_generation(
+                add_worker=True
+            )
+            await xo.wait_for(
+                supervisor_ref.report_worker_status(self.address, status),
+                XINFERENCE_TCP_REQUEST_TIMEOUT,
+            )
 
     async def ping(self) -> bool:
         """Lightweight liveness probe for supervisor reverse-channel check."""
@@ -4290,15 +4496,23 @@ class WorkerActor(xo.StatelessActor):
         next attempt can refresh a supervisor whose internal address changed
         after a restart.
         """
+        (
+            supervisor_ref,
+            supervisor_generation,
+        ) = await self._get_supervisor_ref_with_generation(add_worker=False)
         try:
             await xo.wait_for(
-                (await self.get_supervisor_ref(add_worker=False)).receive_heartbeat(
-                    self.address
-                ),
+                supervisor_ref.receive_heartbeat(self.address),
                 XINFERENCE_TCP_REQUEST_TIMEOUT,
             )
+        except asyncio.CancelledError:
+            raise
         except Exception:
-            self._clear_supervisor_refs()
+            if supervisor_generation is not None:
+                self._clear_supervisor_refs(
+                    expected_supervisor_ref=supervisor_ref,
+                    expected_generation=supervisor_generation,
+                )
             raise
 
     async def _periodical_report_status(self):
@@ -4321,14 +4535,13 @@ class WorkerActor(xo.StatelessActor):
                 _heartbeat_fail_count = 0  # reset on success
             except asyncio.CancelledError:  # pragma: no cover
                 break
-            except RuntimeError as ex:  # pragma: no cover
-                if "cannot schedule new futures" not in str(ex):
-                    # when atexit is triggered, the default pool might be shutdown
-                    # and to_thread will fail
-                    break
-            except (
-                Exception
-            ) as ex:  # pragma: no cover  # noqa: E722  # nosec  # pylint: disable=bare-except
+            except Exception as ex:  # pragma: no cover
+                # Isolation.stop() cancels this coroutine during normal shutdown.
+                # Every other exception is treated as recoverable: a transient RPC
+                # RuntimeError must not permanently stop heartbeats and let the
+                # supervisor evict an otherwise healthy worker. The failing RPC
+                # path conditionally invalidates only its own cached ref.
+                report_count = 0
                 _heartbeat_fail_count += 1
                 # §4.4: Log exception type and full traceback.
                 # Print full traceback on 1st failure and every 10th consecutive failure

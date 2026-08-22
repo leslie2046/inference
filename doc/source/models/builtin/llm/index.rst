@@ -176,6 +176,11 @@ The following is a list of built-in LLM in Xinference:
      - 163840
      - We present a preview version of DeepSeek-V4 series, including two strong Mixture-of-Experts (MoE) language models — DeepSeek-V4-Pro with 1.6T parameters (49B activated) and DeepSeek-V4-Flash with 284B parameters (13B activated) — both supporting a context length of one million tokens.
 
+   * - :ref:`deepseek-v4-flash-0731 <models_llm_deepseek-v4-flash-0731>`
+     - chat, reasoning, hybrid, tools
+     - 1048576
+     - Official DeepSeek-V4-Flash release with enhanced agentic capabilities and an attached DSpark speculative decoding module.
+
    * - :ref:`deepseek-v4-pro <models_llm_deepseek-v4-pro>`
      - chat, reasoning, hybrid, tools
      - 163840
@@ -340,6 +345,16 @@ The following is a list of built-in LLM in Xinference:
      - chat, vision
      - 262144
      - Kimi K2.5 is an open-source, native multimodal agentic model built through continual pretraining on approximately 15 trillion mixed visual and text tokens atop Kimi-K2-Base. It seamlessly integrates vision and language understanding with advanced agentic capabilities, instant and thinking modes, as well as conversational and agentic paradigms.
+
+   * - :ref:`ling-3.0-flash <models_llm_ling-3.0-flash>`
+     - chat, tools, reasoning, hybrid
+     - 262144
+     - Ling-3.0-flash is a native hybrid-linear reasoning MoE model with 124B total parameters and 5.1B activated parameters per token.
+
+   * - :ref:`ling-3.0-tiny <models_llm_ling-3.0-tiny>`
+     - chat, tools, reasoning, hybrid
+     - 131072
+     - Ling-3.0-tiny is a lightweight hybrid-reasoning MoE model with 7.9B total parameters and 1.3B activated parameters per token.
 
    * - :ref:`llama-2 <models_llm_llama-2>`
      - generate
@@ -556,6 +571,11 @@ The following is a list of built-in LLM in Xinference:
      - 32768
      - Ovis (Open VISion) is a novel Multimodal Large Language Model (MLLM) architecture, designed to structurally align visual and textual embeddings.
 
+   * - :ref:`ovisocr2 <models_llm_ovisocr2>`
+     - chat, vision, reasoning, hybrid
+     - 262144
+     - OvisOCR2 is a compact 0.8B end-to-end model for page-level document parsing. It converts document page images into Markdown in natural reading order, including text, formulas, tables, and visual regions.
+
    * - :ref:`phi-2 <models_llm_phi-2>`
      - generate
      - 2048
@@ -705,6 +725,16 @@ The following is a list of built-in LLM in Xinference:
      - chat, vision, tools, reasoning, hybrid
      - 262144
      - Following the February release of the Qwen3.5 series, we're pleased to share the first open-weight variant of Qwen3.6. Built on direct feedback from the community, Qwen3.6 prioritizes stability and real-world utility, offering developers a more intuitive, responsive, and genuinely productive coding experience.
+
+   * - :ref:`qwen3.8 <models_llm_qwen3.8>`
+     - chat, vision, tools, reasoning, hybrid
+     - 262144
+     - Built on the architectural foundation of Qwen3.5, Qwen3.8 delivers substantial gains across coding, professional work, research, and long-horizon agentic tasks. Qwen3.8-27B brings these advances to a compact, deployment-friendly dense model: a native vision-language model that understands images and videos, with flexible thinking control.
+
+   * - :ref:`qwen3.8-max <models_llm_qwen3.8-max>`
+     - chat, tools, reasoning
+     - 262144
+     - Qwen3.8-2.4T-A95B is a text-only Mixture-of-Experts model with 2.4 trillion total parameters and 95 billion activated parameters, designed for coding, research, professional work, and long-horizon agentic tasks.
 
    * - :ref:`qwenlong-l1 <models_llm_qwenlong-l1>`
      - chat
@@ -900,6 +930,8 @@ The following is a list of built-in LLM in Xinference:
   
    deepseek-v4-flash
   
+   deepseek-v4-flash-0731
+
    deepseek-v4-pro
   
    deepseek-vl2
@@ -965,6 +997,10 @@ The following is a list of built-in LLM in Xinference:
    kat-v1
   
    kimi-k2.5
+  
+   ling-3.0-flash
+  
+   ling-3.0-tiny
   
    llama-2
   
@@ -1052,6 +1088,8 @@ The following is a list of built-in LLM in Xinference:
   
    ovis2
   
+   ovisocr2
+  
    phi-2
   
    phi-3-mini-128k-instruct
@@ -1112,6 +1150,10 @@ The following is a list of built-in LLM in Xinference:
   
    qwen3.6
   
+   qwen3.8
+
+   qwen3.8-max
+
    qwenlong-l1
   
    qwq-32b
@@ -1162,4 +1204,3 @@ The following is a list of built-in LLM in Xinference:
   
    yi-chat
   
-

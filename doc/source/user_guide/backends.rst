@@ -153,6 +153,7 @@ Currently, supported model includes:
 - ``cogagent``
 - ``glm-edge-chat``, ``glm4-chat``, ``glm4-chat-1m``
 - ``codegeex4``, ``glm-4v``
+- ``qwen3.8-max``
 - ``seallm_v2.5``
 - ``orion-chat``
 - ``qwen1.5-moe-chat``, ``qwen2-moe-instruct``
@@ -209,6 +210,10 @@ MLX
 `MLX <https://github.com/ml-explore/mlx-examples/tree/main/llms>`_ provides efficient runtime
 to run LLM on Apple silicon. It's recommended to use for Mac users when running on Apple silicon
 if the model has MLX format support.
+
+MLX can also serve supported audio models on Apple silicon. Whisper models,
+``F5-TTS``, and ``Kokoro-82M`` expose it through ``--model-engine MLX``; see
+:ref:`Audio engines <audio>`.
 
 
 .. _speculative_decoding:

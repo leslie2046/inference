@@ -284,6 +284,7 @@ VLLM_SUPPORTED_CHAT_MODELS = [
     "ChatGLMForConditionalGeneration",
     "GlmForCausalLM",
     "ChatGLMModel",
+    "Qwen3_5MoeForCausalLM",
 ]
 
 
@@ -397,7 +398,9 @@ def _update_vllm_supported_lists() -> None:
 
     if effective_version > version.parse("0.16.0"):
         _append_unique(
-            VLLM_SUPPORTED_MULTI_MODEL_LIST, "Qwen3_5MoeForConditionalGeneration"
+            VLLM_SUPPORTED_MULTI_MODEL_LIST,
+            "Qwen3_5ForConditionalGeneration",
+            "Qwen3_5MoeForConditionalGeneration",
         )
 
     if effective_version >= version.parse("0.19.0"):
@@ -1107,7 +1110,12 @@ class VLLMModel(LLM):
                 master_addr = self._address
             model_config.setdefault("master_addr", master_addr)  # type: ignore
             model_config.setdefault("master_port", get_next_port())  # type: ignore
-        model_config.setdefault("block_size", 16)
+        is_deepseek_v4 = "DeepseekV4ForCausalLM" in architectures
+        if is_deepseek_v4:
+            default_block_size = 128 if is_npu_available() else 256
+        else:
+            default_block_size = 16
+        model_config.setdefault("block_size", default_block_size)
         if VLLM_VERSION < version.parse("0.18.0"):
             model_config.setdefault("swap_space", 4)
         model_config.setdefault("gpu_memory_utilization", 0.90)
@@ -1937,6 +1945,13 @@ class VLLMChatModel(VLLMModel, ChatModelMixin):
         if llm_spec.model_format == "ggufv2":
             if not (VLLM_INSTALLED and VLLM_VERSION >= version.parse("0.8.2")):
                 return False, "ggufv2 support requires vLLM >= 0.8.2"
+        if (
+            llm_family.has_architecture("Qwen3_5MoeForCausalLM")
+            and VLLM_INSTALLED
+            and VLLM_VERSION < version.parse("0.27.0")
+            and not _virtual_env_allows_missing_vllm()
+        ):
+            return False, "Qwen3_5MoeForCausalLM requires vLLM >= 0.27.0"
         if not llm_family.matches_supported_architectures(VLLM_SUPPORTED_CHAT_MODELS):
             return (
                 False,

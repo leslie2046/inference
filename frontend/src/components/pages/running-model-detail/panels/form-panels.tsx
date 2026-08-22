@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { Plus, Trash2 } from 'lucide-react';
 
 import { Button } from '@/components/ui/button';
@@ -9,8 +9,10 @@ import { FormField } from '@/components/ui/form-field';
 import { FormList } from '@/components/ui/form-list';
 import { Input } from '@/components/ui/input';
 import { Select } from '@/components/ui/select';
+import { Slider } from '@/components/ui/slider';
 import { Switch } from '@/components/ui/switch';
 import { Textarea } from '@/components/ui/textarea';
+import { useWatch } from '@/hooks/use-form';
 import { ModelAbility } from '@/constants';
 import {
   SAMPLING_METHOD_OPTIONS,
@@ -18,8 +20,16 @@ import {
   OCR_MODEL_SIZE_OPTIONS,
 } from '@/constants/running';
 import type { FileUploadValue } from '@/types/common';
+import type { BaseFormFieldProps } from '@/types/form';
 
+import { AudioRecorderUpload } from '../components/audio-recorder-upload';
 import { ImageEditorCreateMask } from '../components/image-editor-create-mask';
+import {
+  INDEX_TTS_EMOTION_DIMENSIONS,
+  INDEX_TTS_EMOTION_MAX_TOTAL,
+  isIndexTTSEmotionModel,
+  parseIndexTTSEmotionVector,
+} from '../emotion-vector-utils';
 import type { CapabilityFormProps } from '../types';
 
 const DOCUMENT_BACKEND_OPTIONS = ['pipeline', 'vlm-auto-engine', 'hybrid-auto-engine'].map(
@@ -342,15 +352,11 @@ export function FirstLastFrameVideoPanel() {
   );
 }
 
-export function AudioToTextPanel() {
+export function AudioToTextPanel({ form }: CapabilityFormProps) {
   return (
     <>
       <FormField name="file" rules={[{ required: true }]}>
-        <FileUpload
-          accept="audio/*,video/*"
-          label="Upload or drop audio"
-          description="MP3, WAV, M4A, WebM..."
-        />
+        <AudioRecorderUpload form={form} />
       </FormField>
       <FormField name="language" label="Language" placeholder="e.g. en, zh">
         <Input />
@@ -377,35 +383,207 @@ export function SpeakerEmbeddingPanel() {
   );
 }
 
-export function SpeechPanel({ model }: CapabilityFormProps) {
+function EmotionVectorInput({ value, onChange, disabled, error }: BaseFormFieldProps<number[]>) {
+  const vector = INDEX_TTS_EMOTION_DIMENSIONS.map((_, index) => {
+    const item = value?.[index];
+    return typeof item === 'number' && Number.isFinite(item) ? item : 0;
+  });
+  const [localValues, setLocalValues] = useState<string[]>(() =>
+    vector.map((item) => String(item))
+  );
+
+  useEffect(() => {
+    setLocalValues((previousValues) =>
+      INDEX_TTS_EMOTION_DIMENSIONS.map((_, index) => {
+        const item = value?.[index];
+        const nextValue = typeof item === 'number' && Number.isFinite(item) ? item : 0;
+        const previousValue = previousValues[index];
+
+        return previousValue !== undefined && Number(previousValue) === nextValue
+          ? previousValue
+          : String(nextValue);
+      })
+    );
+  }, [value]);
+
+  const total = vector.reduce((sum, item) => sum + item, 0);
+  const totalExceeded = parseIndexTTSEmotionVector(vector) === undefined;
+
+  const updateDimension = (index: number, nextValue: number | string) => {
+    setLocalValues((previousValues) => {
+      const nextValues = [...previousValues];
+      nextValues[index] = String(nextValue);
+      return nextValues;
+    });
+
+    const parsedValue = Number(nextValue);
+    if (!Number.isFinite(parsedValue)) return;
+
+    const nextVector = [...vector];
+    nextVector[index] =
+      Math.round(Math.min(INDEX_TTS_EMOTION_MAX_TOTAL, Math.max(0, parsedValue)) * 100) / 100;
+    onChange?.(nextVector);
+  };
+
+  const normalizeDimension = (index: number) => {
+    setLocalValues((previousValues) => {
+      const nextValues = [...previousValues];
+      nextValues[index] = String(vector[index]);
+      return nextValues;
+    });
+  };
+
+  return (
+    <div
+      className={`space-y-3 rounded-lg border p-3 ${
+        error ? 'border-destructive' : 'border-border'
+      } ${disabled ? 'opacity-60' : ''}`}
+    >
+      {INDEX_TTS_EMOTION_DIMENSIONS.map(({ key, label }, index) => (
+        <div key={key} className="grid grid-cols-[88px_minmax(0,1fr)_64px] items-center gap-3">
+          <span className="truncate text-xs font-medium text-muted-foreground">{label}</span>
+          <Slider
+            aria-label={`${label} emotion weight`}
+            disabled={disabled}
+            min={0}
+            max={INDEX_TTS_EMOTION_MAX_TOTAL}
+            step={0.01}
+            value={[vector[index]]}
+            onValueChange={([nextValue]) => updateDimension(index, nextValue)}
+          />
+          <Input
+            aria-label={`${label} emotion weight value`}
+            className="h-8 px-2 text-right font-mono text-xs"
+            disabled={disabled}
+            error={error}
+            type="number"
+            min={0}
+            max={INDEX_TTS_EMOTION_MAX_TOTAL}
+            step={0.01}
+            value={localValues[index] ?? ''}
+            onChange={(event) => updateDimension(index, event.target.value)}
+            onBlur={() => normalizeDimension(index)}
+          />
+        </div>
+      ))}
+      <div
+        className={`flex justify-end text-xs font-medium ${
+          totalExceeded ? 'text-destructive' : 'text-muted-foreground'
+        }`}
+      >
+        Total: {total.toFixed(2)} / {INDEX_TTS_EMOTION_MAX_TOTAL.toFixed(2)}
+      </div>
+    </div>
+  );
+}
+
+export function SpeechPanel({ form, model }: CapabilityFormProps) {
+  const isMusicGeneration = model.model_ability.includes(ModelAbility.Text2music);
   const supportsVoiceCloning = model.model_ability.includes(ModelAbility.Text2audioVoiceCloning);
+  const supportsVoiceDesign = model.model_ability.includes(ModelAbility.Text2audioVoiceDesign);
+  const promptSpeech = useWatch('prompt_speech', form);
+  const hasPromptSpeech =
+    supportsVoiceCloning && Array.isArray(promptSpeech) && promptSpeech.length > 0;
+  const showPromptSpeech = supportsVoiceCloning;
+  const showPromptText = supportsVoiceCloning && (!supportsVoiceDesign || hasPromptSpeech);
+  const showVoiceInstruction = supportsVoiceDesign && !hasPromptSpeech;
+  const showInstruct = showVoiceInstruction || isMusicGeneration;
+  const instructLabel = isMusicGeneration ? 'Music description' : 'Voice Instruction';
+  const instructPlaceholder = isMusicGeneration
+    ? 'Describe the music to generate'
+    : 'Describe the voice to generate';
+  const supportsEmotionVector =
+    isIndexTTSEmotionModel(model.model_family, model.model_name) &&
+    model.model_ability.includes(ModelAbility.Text2audioEmotionControl);
+  const emotionVectorEnabled = Boolean(useWatch('use_emo_vector', form));
 
   return (
     <>
-      <FormField name="input" label="Text" rules={[{ required: true }]}>
+      <FormField
+        name="input"
+        label={isMusicGeneration ? 'Lyrics' : 'Text'}
+        rules={[{ required: true }]}
+      >
         <Textarea className="min-h-32" placeholder="Enter text to synthesize..." />
       </FormField>
-      <div className="grid grid-cols-2 gap-3">
-        <FormField name="voice" label="Voice" placeholder="Optional voice ID">
-          <Input />
-        </FormField>
-        <FormField name="speed" label="Speed" normalize={normalizeNumberInput}>
-          <Input type="number" min={0.5} max={2} step={0.1} />
-        </FormField>
-      </div>
-      {supportsVoiceCloning && (
-        <>
-          <FormField name="prompt_speech">
-            <FileUpload
-              accept="audio/*"
-              label="Prompt speech"
-              description="Reference audio for cloning"
-            />
+      {!isMusicGeneration && (
+        <div className="grid grid-cols-2 gap-3">
+          <FormField name="voice" label="Voice" placeholder="Optional voice ID">
+            <Input />
           </FormField>
-          <FormField name="prompt_text" label="Prompt Text">
-            <Textarea placeholder="Text spoken in the prompt audio" />
+          <FormField name="speed" label="Speed" normalize={normalizeNumberInput}>
+            <Input type="number" min={0.5} max={2} step={0.1} />
           </FormField>
-        </>
+        </div>
+      )}
+      {isMusicGeneration && (
+        <div className="grid grid-cols-2 gap-3">
+          <div className="flex items-end gap-2">
+            <FormField name="seed" label="Seed" normalize={normalizeNumberInput} className="flex-1">
+              <Input type="number" />
+            </FormField>
+            <Button
+              variant="outline"
+              size="icon"
+              aria-label="Generate random seed"
+              title="Generate random seed"
+              onClick={() => form.setFieldValue('seed', Math.floor(Math.random() * 2 ** 31))}
+            >
+              <span aria-hidden="true">🎲</span>
+            </Button>
+          </div>
+          <FormField name="duration" label="Duration (seconds)" normalize={normalizeNumberInput}>
+            <Input type="number" />
+          </FormField>
+        </div>
+      )}
+      {showPromptSpeech && (
+        <FormField name="prompt_speech">
+          <FileUpload
+            accept="audio/*"
+            label="Prompt speech"
+            description="Reference audio for cloning"
+          />
+        </FormField>
+      )}
+      {showPromptText && (
+        <FormField name="prompt_text" label="Prompt Text">
+          <Textarea placeholder="Text spoken in the prompt audio" />
+        </FormField>
+      )}
+      {showInstruct && (
+        <FormField
+          name="instruct"
+          label={instructLabel}
+          rules={[{ required: isMusicGeneration || showVoiceInstruction }]}
+        >
+          <Textarea placeholder={instructPlaceholder} />
+        </FormField>
+      )}
+      {supportsEmotionVector && (
+        <div className="space-y-3 rounded-lg bg-muted/30 p-3">
+          <FormField
+            name="use_emo_vector"
+            label="Emotion control"
+            valuePropName="checked"
+            layout="horizontal"
+          >
+            <Switch />
+          </FormField>
+          <FormField
+            name="emo_vector"
+            disabled={!emotionVectorEnabled}
+            rules={[
+              {
+                validator: (value) =>
+                  !emotionVectorEnabled || parseIndexTTSEmotionVector(value) !== undefined,
+                message: 'Use non-negative emotion values with a total no greater than 0.8.',
+              },
+            ]}
+          >
+            <EmotionVectorInput />
+          </FormField>
+        </div>
       )}
     </>
   );

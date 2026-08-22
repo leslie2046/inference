@@ -17,6 +17,8 @@ The following is a list of built-in image models in Xinference:
   
    deepseek-ocr
   
+   firered-image-edit-1.1
+  
    flux.1-dev
   
    flux.1-kontext-dev
@@ -29,13 +31,23 @@ The following is a list of built-in image models in Xinference:
   
    flux.2-klein-9b
   
+   glm-image
+
    got-ocr2_0
   
+   hidream-o1-image
+
+   hidream-o1-image-dev
+
+   hidream-o1-image-dev-2604
+
    hunyuandit-v1.2
   
    hunyuandit-v1.2-distilled
   
    hunyuanocr
+
+   ideogram4
   
    kolors
   
@@ -82,4 +94,3 @@ The following is a list of built-in image models in Xinference:
    z-image
   
    z-image-turbo
-  

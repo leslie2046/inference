@@ -12,12 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import hashlib
 import importlib.util
+import io
 import json
 import subprocess
 import sys
+from http.client import IncompleteRead
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
+
+from packaging.requirements import Requirement
 
 SCRIPT_DIR = Path(__file__).resolve().parents[1]
 REPO_ROOT = SCRIPT_DIR.parents[3]
@@ -54,6 +59,16 @@ def test_generate_package_list_classification():
     assert generator.classify_spec("pkg @ git+https://github.com/org/repo") == "git"
     assert generator.system_placeholder_name("#system_torch#") == "torch"
     assert generator.system_placeholder_name("#system_numpy# ; marker") == "numpy"
+    assert (
+        generator.normalize_mirror_spec("deepdoc-lib[gpu]~=0.2.2 ; has_cuda")
+        == "deepdoc-lib[gpu]~=0.2.2"
+    )
+    assert (
+        generator.normalize_mirror_spec("deepdoc-lib~=0.2.2 ; not has_cuda")
+        == "deepdoc-lib~=0.2.2"
+    )
+    standard_marker = 'decord2==3.4.0 ; platform_machine == "aarch64"'
+    assert generator.normalize_mirror_spec(standard_marker) == standard_marker
 
 
 def test_load_xinference_modules_restores_sys_modules():
@@ -162,6 +177,124 @@ def test_pip_download_forwards_package_build_environment(monkeypatch, tmp_path):
     )
 
     assert calls[0][1]["env"] is build_env
+
+
+def test_download_sdist_without_metadata_uses_simple_api(monkeypatch, tmp_path):
+    downloader = _load_script("download_packages")
+    content = b"source distribution"
+    digest = hashlib.sha256(content).hexdigest().upper()
+    simple_payload = json.dumps(
+        {
+            "files": [
+                {
+                    "filename": "flash_attn-2.8.3.tar.gz",
+                    "url": "../../files/flash_attn-2.8.3.tar.gz",
+                    "hashes": {"sha256": digest},
+                    "requires-python": ">=3.9",
+                    "yanked": False,
+                },
+                {
+                    "filename": "flash_attn-2.8.3.post1.tar.gz",
+                    "url": "../../files/flash_attn-2.8.3.post1.tar.gz",
+                    "hashes": {"sha256": digest},
+                    "requires-python": ">=3.9",
+                    "yanked": False,
+                },
+                {
+                    "filename": "flash_attn-2.9.0.tar.gz",
+                    "url": "../../files/flash_attn-2.9.0.tar.gz",
+                    "hashes": {"sha256": digest},
+                    "requires-python": ">=3.13",
+                    "yanked": False,
+                },
+            ]
+        }
+    ).encode()
+    urls = []
+
+    def fake_urlopen(request, timeout):
+        url = request.full_url if hasattr(request, "full_url") else request
+        urls.append((url, timeout))
+        if url.endswith("/simple/flash-attn/"):
+            assert "application/vnd.pypi.simple.v1+json" in request.headers["Accept"]
+            return io.BytesIO(simple_payload)
+        assert url.endswith("/files/flash_attn-2.8.3.post1.tar.gz")
+        return io.BytesIO(content)
+
+    monkeypatch.setattr(downloader, "urlopen", fake_urlopen)
+
+    result = downloader.download_sdist_without_metadata(
+        "flash-attn<2.9",
+        tmp_path,
+        index_url="https://example.invalid/simple",
+        python_version="3.12",
+    )
+
+    assert result == tmp_path / "flash_attn-2.8.3.post1.tar.gz"
+    assert result.read_bytes() == content
+    assert urls == [
+        ("https://example.invalid/simple/flash-attn/", 30),
+        ("https://example.invalid/files/flash_attn-2.8.3.post1.tar.gz", 60),
+    ]
+
+
+def test_download_sdist_without_metadata_rejects_malformed_simple_api(
+    monkeypatch, tmp_path
+):
+    downloader = _load_script("download_packages")
+    monkeypatch.setattr(
+        downloader, "urlopen", lambda *_args, **_kwargs: io.BytesIO(b"[]")
+    )
+
+    assert (
+        downloader.download_sdist_without_metadata(
+            "flash-attn",
+            tmp_path,
+            index_url="https://example.invalid/simple",
+            python_version="3.12",
+        )
+        is None
+    )
+
+
+def test_download_sdist_without_metadata_cleans_up_incomplete_download(
+    monkeypatch, tmp_path
+):
+    downloader = _load_script("download_packages")
+    content = b"source distribution"
+    simple_payload = json.dumps(
+        {
+            "files": [
+                {
+                    "filename": "flash_attn-2.8.3.post1.tar.gz",
+                    "url": "../../files/flash_attn-2.8.3.post1.tar.gz",
+                    "hashes": {"sha256": hashlib.sha256(content).hexdigest()},
+                    "requires-python": ">=3.9",
+                    "yanked": False,
+                }
+            ]
+        }
+    ).encode()
+
+    class BrokenResponse(io.BytesIO):
+        def read(self, *_args, **_kwargs):
+            raise IncompleteRead(b"partial")
+
+    responses = iter((io.BytesIO(simple_payload), BrokenResponse(content)))
+    monkeypatch.setattr(
+        downloader, "urlopen", lambda *_args, **_kwargs: next(responses)
+    )
+
+    assert (
+        downloader.download_sdist_without_metadata(
+            "flash-attn",
+            tmp_path,
+            index_url="https://example.invalid/simple",
+            python_version="3.12",
+        )
+        is None
+    )
+    assert not list(tmp_path.iterdir())
 
 
 def test_runtime_constraints_require_exact_pins(tmp_path):
@@ -303,6 +436,15 @@ def test_transformers_optional_dependencies_are_scoped_and_mirrored(
         assert package not in mirrored
 
     pin_entries = json.loads((out / "pins.json").read_text())
+    pin_specs = {item["spec"] for item in pin_entries}
+    assert "deepdoc-lib[gpu]~=0.2.2" in pin_specs
+    assert "deepdoc-lib~=0.2.2" in pin_specs
+    assert all("has_cuda" not in spec for spec in pin_specs)
+    assert 'decord==0.6.0 ; platform_machine == "x86_64"' in pin_specs
+    assert 'decord2==3.4.0 ; platform_machine == "aarch64"' in pin_specs
+    for spec in pin_specs:
+        Requirement(spec)
+
     model_pins = {item["spec"].split(";", 1)[0].strip().lower() for item in pin_entries}
     for package in (
         "qwen-vl-utils!=0.0.9",

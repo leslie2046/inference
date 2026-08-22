@@ -29,19 +29,19 @@ The following is a list of built-in audio models in Xinference:
   
    f5-tts
   
-   f5-tts-mlx
-  
+   fireredtts3
+
    fishspeech-1.5
   
    fun-asr-mlt-nano-2512
   
    fun-asr-nano-2512
   
+   indextts-2.5
+  
    indextts2
   
    kokoro-82m
-  
-   kokoro-82m-mlx
   
    kokoro-82m-v1.1-zh
   
@@ -63,6 +63,8 @@ The following is a list of built-in audio models in Xinference:
   
    melotts-spanish
   
+   minimax-music3
+
    paraformer-zh
   
    paraformer-zh-hotword
@@ -90,47 +92,27 @@ The following is a list of built-in audio models in Xinference:
    sensevoicesmall
   
    speech_campplus_sv_zh-cn_16k-common
-
+  
    speech_campplus_sv_zh_en_16k-common_advanced
-
+  
    voxcpm2
   
    whisper-base
   
-   whisper-base-mlx
-  
    whisper-base.en
-  
-   whisper-base.en-mlx
   
    whisper-large-v3
   
-   whisper-large-v3-mlx
-  
    whisper-large-v3-turbo
-  
-   whisper-large-v3-turbo-mlx
   
    whisper-medium
   
-   whisper-medium-mlx
-  
    whisper-medium.en
-  
-   whisper-medium.en-mlx
   
    whisper-small
   
-   whisper-small-mlx
-  
    whisper-small.en
-  
-   whisper-small.en-mlx
   
    whisper-tiny
   
-   whisper-tiny-mlx
-  
    whisper-tiny.en
-  
-   whisper-tiny.en-mlx

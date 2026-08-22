@@ -7,6 +7,7 @@ import {
   ImageUp,
   ListFilter,
   Mic,
+  Music2,
   Paintbrush,
   ScanText,
   Video,
@@ -32,6 +33,11 @@ import {
   TextToVideoPanel,
 } from './panels/form-panels';
 import { ResultPanels } from './panels/result-panels';
+import {
+  EMPTY_INDEX_TTS_EMOTION_VECTOR,
+  isIndexTTSEmotionModel,
+  parseIndexTTSEmotionVector,
+} from './emotion-vector-utils';
 import type { CapabilityConfig, TransformContext } from './types';
 import {
   appendIfPresent,
@@ -673,17 +679,43 @@ export const CAPABILITY_CONFIGS: Partial<Record<ModelAbility, CapabilityConfig>>
       speed: 1,
       prompt_speech: [],
       prompt_text: '',
+      instruct: '',
+      use_emo_vector: false,
+      emo_vector: [...EMPTY_INDEX_TTS_EMOTION_VECTOR],
     },
     formPanel: SpeechPanel,
     resultPanel: ResultPanels.Universal,
     responseType: 'blob',
-    transformValues: ({ modelUid, values }) => {
-      const promptSpeech = firstUpload(values, 'prompt_speech');
+    transformValues: ({ modelUid, model, values }) => {
+      const supportsVoiceCloning = model.model_ability.includes(
+        ModelAbility.Text2audioVoiceCloning
+      );
+      const supportsVoiceDesign = model.model_ability.includes(ModelAbility.Text2audioVoiceDesign);
+      const promptSpeech = supportsVoiceCloning ? firstUpload(values, 'prompt_speech') : undefined;
       const kwargs: Record<string, unknown> = {};
       const promptText = stringValue(values.prompt_text).trim();
+      const instruct = stringValue(values.instruct).trim();
 
-      if (promptText) {
+      if (promptSpeech) {
+        if (promptText) {
+          kwargs.prompt_text = promptText;
+        }
+      } else if (supportsVoiceDesign) {
+        if (instruct) {
+          kwargs.instruct = instruct;
+        }
+      } else if (promptText) {
         kwargs.prompt_text = promptText;
+      }
+
+      if (
+        isIndexTTSEmotionModel(model.model_family, model.model_name) &&
+        booleanValue(values.use_emo_vector)
+      ) {
+        const emotionVector = parseIndexTTSEmotionVector(values.emo_vector);
+        if (emotionVector) {
+          kwargs.emo_vector = emotionVector;
+        }
       }
 
       if (promptSpeech) {
@@ -710,5 +742,54 @@ export const CAPABILITY_CONFIGS: Partial<Record<ModelAbility, CapabilityConfig>>
         kwargs
       );
     },
+  },
+  [ModelAbility.Text2music]: {
+    ability: ModelAbility.Text2music,
+    label: 'Music Generation',
+    icon: Music2,
+    requestApi: '/v1/audio/speech',
+    codeExample: {
+      method: 'POST',
+      contentType: 'json',
+      fields: [
+        { key: 'model', required: true },
+        {
+          key: 'input',
+          required: true,
+          value: '[Verse]\nMorning light across the city\n[Chorus]\nSing it back to me',
+        },
+        {
+          key: 'kwargs',
+          required: true,
+          value: JSON.stringify({
+            instruct: 'Warm acoustic pop with intimate vocals',
+            seed: 7,
+            duration: 60,
+          }),
+        },
+        { key: 'voice', required: true, value: 'default' },
+        { key: 'response_format', required: true, value: 'wav' },
+      ],
+    },
+    initialValues: {
+      input: '',
+      instruct: '',
+      seed: 0,
+      duration: 60,
+    },
+    formPanel: SpeechPanel,
+    resultPanel: ResultPanels.Universal,
+    responseType: 'blob',
+    transformValues: ({ modelUid, values }) => ({
+      model: modelUid,
+      input: stringValue(values.input),
+      voice: 'default',
+      response_format: 'wav',
+      kwargs: JSON.stringify({
+        instruct: stringValue(values.instruct),
+        seed: numberValue(values.seed, 0),
+        duration: numberValue(values.duration, 60),
+      }),
+    }),
   },
 };

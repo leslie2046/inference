@@ -51,11 +51,49 @@ The Text-to-image API is supported with the following models in Xinference:
 * hunyuandit-v1.2-distilled
 * cogview4
 * Qwen-Image
+* GLM-Image
+* Ideogram4
+* HiDream-O1-Image
+* HiDream-O1-Image-Dev
+* HiDream-O1-Image-Dev-2604
 
 Image-to-image supported models:
 
 * Flux.1-Kontext-dev
 * Qwen-Image-Edit
+* GLM-Image
+* HiDream-O1-Image
+* HiDream-O1-Image-Dev
+
+
+HiDream-O1 runtime notes
+------------------------
+
+All three HiDream-O1 checkpoints are available from Hugging Face with revision
+``main`` and ModelScope with revision ``master``. They require an NVIDIA CUDA
+GPU and PyTorch 2.10 or newer. Flash Attention is optional; Xinference disables
+it by default for compatibility.
+
+.. list-table::
+   :widths: 30 15 55
+   :header-rows: 1
+
+   * - Model
+     - Default steps
+     - Usage and scheduler defaults
+   * - HiDream-O1-Image
+     - 50
+     - Text-to-image, instruction-based editing, and multiple reference images;
+       uses the official default scheduler.
+   * - HiDream-O1-Image-Dev
+     - 28
+     - Text-to-image, editing, and multiple reference images; single-reference
+       editing uses the flow-matching scheduler, while text-to-image and
+       multi-reference generation use the flash scheduler.
+   * - HiDream-O1-Image-Dev-2604
+     - 28
+     - Text-to-image only; uses the checkpoint's float32 loading and sampling
+       defaults.
 
 
 Image engines
@@ -69,6 +107,7 @@ or the ``vLLM`` engine
 for faster inference:
 
 * FLUX.1-dev
+* GLM-Image (SGLang only)
 * Qwen-Image
 * Qwen-Image-2512
 * Z-Image
@@ -93,6 +132,49 @@ then launch the model with ``--model-engine SGLang`` or
 
 Note that GGUF quantization, Lightning acceleration, LoRA and controlnet are
 only available on the ``diffusers`` engine.
+
+
+Ideogram4
+-------------------
+
+:ref:`Ideogram4 <models_builtin_ideogram4>` uses the NF4 checkpoint and
+requires an NVIDIA CUDA GPU. The checkpoint is distributed under the Ideogram
+4 Non-Commercial Model Agreement, and its repositories are gated. Accept the
+license and authenticate with the selected model hub before launching.
+
+Ideogram4 accepts plain text prompts, but serialized structured JSON captions
+provide the best quality and control.
+
+To download from ModelScope for an individual launch::
+
+   xinference launch --model-name Ideogram4 --model-type image --download_hub modelscope
+
+
+GLM-Image
+-------------------
+
+:ref:`GLM-Image <models_builtin_glm-image>` supports both text-to-image
+generation and single- or multi-reference image-to-image generation through
+the same ``GlmImagePipeline``. Output width and height must both be divisible
+by 32.
+
+The ``diffusers`` engine uses ``diffusers==0.38.0`` and
+``transformers==5.0.0``. Xinference installs these packages automatically when
+per-model virtual environments are enabled.
+
+The Hugging Face source is ``zai-org/GLM-Image`` at revision ``main``. The
+ModelScope source is ``ZhipuAI/GLM-Image`` at revision ``master``.
+
+To download from ModelScope for an individual launch::
+
+   xinference launch --model-name GLM-Image --model-type image --download_hub modelscope
+
+On Linux with NVIDIA GPUs, text-to-image generation can also use SGLang::
+
+   xinference launch --model-name GLM-Image --model-type image --model-engine SGLang
+
+The SGLang engine currently exposes only text-to-image generation. Use the
+default ``diffusers`` engine for image-to-image generation.
 
 
 Quickstart
