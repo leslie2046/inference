@@ -91,78 +91,6 @@
   },
   {
     "version": 2,
-    "context_length": 4096,
-    "model_name": "gorilla-openfunctions-v2",
-    "model_lang": [
-      "en"
-    ],
-    "model_ability": [
-      "chat"
-    ],
-    "model_description": "OpenFunctions is designed to extend Large Language Model (LLM) Chat Completion feature to formulate executable APIs call given natural language instructions and API context.",
-    "model_specs": [
-      {
-        "model_format": "pytorch",
-        "model_size_in_billions": 7,
-        "model_src": {
-          "huggingface": {
-            "quantizations": [
-              "none"
-            ],
-            "model_id": "gorilla-llm/gorilla-openfunctions-v2",
-            "model_revision": "0f91d705e64b77fb55e35a7eab5d03bf965c9b5c"
-          }
-        }
-      },
-      {
-        "model_format": "ggufv2",
-        "model_size_in_billions": 7,
-        "model_src": {
-          "huggingface": {
-            "quantizations": [
-              "Q2_K",
-              "Q3_K_L",
-              "Q3_K_M",
-              "Q3_K_S",
-              "Q4_0",
-              "Q4_K_M",
-              "Q4_K_S",
-              "Q5_K_M",
-              "Q5_K_S",
-              "Q6_K"
-            ],
-            "model_id": "gorilla-llm//gorilla-openfunctions-v2-GGUF",
-            "model_file_name_template": "gorilla-openfunctions-v2.{quantization}.gguf"
-          }
-        }
-      }
-    ],
-    "chat_template": "{% if not add_generation_prompt is defined %}\n{% set add_generation_prompt = false %}\n{% endif %}\n{%- set ns = namespace(found=false) -%}\n{%- for message in messages -%}\n    {%- if message['role'] == 'system' -%}\n        {%- set ns.found = true -%}\n    {%- endif -%}\n{%- endfor -%}\n{{'<｜begin▁of▁sentence｜>'}}{%- if not ns.found -%}\n{{'You are an AI programming assistant, utilizing the Gorilla LLM model, developed by Gorilla LLM, and you only answer questions related to computer science. For politically sensitive questions, security and privacy issues, and other non-computer science questions, you will refuse to answer\n'}}\n{%- endif %}\n{%- for message in messages %}\n    {%- if message['role'] == 'system' %}\n{{ message['content'] }}\n    {%- else %}\n        {%- if message['role'] == 'user' %}\n{{'### Instruction:\n' + message['content'] + '\n'}}\n        {%- else %}\n{{'### Response:\n' + message['content'] + '\n<|EOT|>\n'}}\n        {%- endif %}\n    {%- endif %}\n{%- endfor %}\n{% if add_generation_prompt %}\n{{'### Response:'}}\n{% endif %}",
-    "stop_token_ids": [
-      100015,
-      100001
-    ],
-    "stop": [
-      "<|EOT|>",
-      "<｜end▁of▁sentence｜>"
-    ],
-    "updated_at": 1769418471,
-    "featured": false,
-    "architectures": [
-      "LlamaForCausalLM"
-    ],
-    "model_type": "llama",
-    "virtualenv": {
-      "packages": [
-        "#transformers_dependencies# ; #engine# == \"Transformers\"",
-        "#llama_cpp_dependencies# ; #engine# == \"llama.cpp\"",
-        "#vllm_dependencies# ; #engine# == \"vllm\"",
-        "#system_numpy# ; #engine# == \"vllm\""
-      ]
-    }
-  },
-  {
-    "version": 2,
     "context_length": 1024,
     "model_name": "gpt-2",
     "model_lang": [
@@ -2517,7 +2445,7 @@
     "reasoning_end_tag": "</think>",
     "tool_parser": "qwen",
     "updated_at": 1769418487,
-    "featured": true,
+    "featured": false,
     "architectures": [
       "Qwen2ForCausalLM"
     ],
@@ -2674,98 +2602,6 @@
         "#mlx_dependencies# ; #engine# == \"MLX\"",
         "#vllm_dependencies# ; #engine# == \"vllm\"",
         "#system_numpy# ; #engine# == \"vllm\""
-      ]
-    }
-  },
-  {
-    "version": 2,
-    "context_length": 4096,
-    "model_name": "Skywork",
-    "model_lang": [
-      "en",
-      "zh"
-    ],
-    "model_ability": [
-      "generate"
-    ],
-    "model_description": "Skywork is a series of large models developed by the Kunlun Group · Skywork team.",
-    "model_specs": [
-      {
-        "model_format": "pytorch",
-        "model_size_in_billions": 13,
-        "model_src": {
-          "huggingface": {
-            "quantizations": [
-              "none"
-            ],
-            "model_id": "skywork/Skywork-13B-base",
-            "model_revision": "bc35915066fbbf15b77a1a4a74e9b574ab167816"
-          },
-          "modelscope": {
-            "quantizations": [
-              "none"
-            ],
-            "model_id": "skywork/Skywork-13B-base",
-            "model_revision": "master"
-          }
-        }
-      }
-    ],
-    "updated_at": 1769418489,
-    "featured": false,
-    "architectures": [
-      "SkyworkForCausalLM"
-    ],
-    "model_type": "skywork",
-    "virtualenv": {
-      "packages": [
-        "#transformers_dependencies# ; #engine# == \"Transformers\""
-      ]
-    }
-  },
-  {
-    "version": 2,
-    "context_length": 4096,
-    "model_name": "Skywork-Math",
-    "model_lang": [
-      "en",
-      "zh"
-    ],
-    "model_ability": [
-      "generate"
-    ],
-    "model_description": "Skywork is a series of large models developed by the Kunlun Group · Skywork team.",
-    "model_specs": [
-      {
-        "model_format": "pytorch",
-        "model_size_in_billions": 13,
-        "model_src": {
-          "huggingface": {
-            "quantizations": [
-              "none"
-            ],
-            "model_id": "skywork/Skywork-13B-Math",
-            "model_revision": "70d1740208c8ba39f9ba250b22117ec25311ab33"
-          },
-          "modelscope": {
-            "quantizations": [
-              "none"
-            ],
-            "model_id": "skywork/Skywork-13B-Math",
-            "model_revision": "master"
-          }
-        }
-      }
-    ],
-    "updated_at": 1769418490,
-    "featured": false,
-    "architectures": [
-      "SkyworkForCausalLM"
-    ],
-    "model_type": "skywork",
-    "virtualenv": {
-      "packages": [
-        "#transformers_dependencies# ; #engine# == \"Transformers\""
       ]
     }
   },
@@ -4722,107 +4558,6 @@
         "#sglang_dependencies# ; #engine# == \"sglang\"",
         "#vllm_dependencies# ; #engine# == \"vllm\"",
         "#system_numpy# ; #engine# == \"vllm\""
-      ]
-    }
-  },
-  {
-    "version": 2,
-    "context_length": 8194,
-    "model_name": "codeshell",
-    "model_lang": [
-      "en",
-      "zh"
-    ],
-    "model_ability": [
-      "generate"
-    ],
-    "model_description": "CodeShell is a multi-language code LLM developed by the Knowledge Computing Lab of Peking University. ",
-    "model_specs": [
-      {
-        "model_format": "pytorch",
-        "model_size_in_billions": 7,
-        "model_src": {
-          "huggingface": {
-            "quantizations": [
-              "none"
-            ],
-            "model_id": "WisdomShell/CodeShell-7B",
-            "model_revision": "1c79ab7fd316a62ab41d764facd3548a23fa5dee"
-          },
-          "modelscope": {
-            "quantizations": [
-              "none"
-            ],
-            "model_id": "WisdomShell/CodeShell-7B",
-            "model_revision": "master"
-          }
-        }
-      }
-    ],
-    "updated_at": 1769418505,
-    "featured": false,
-    "architectures": [
-      "CodeShellForCausalLM"
-    ],
-    "model_type": "kclgpt",
-    "virtualenv": {
-      "packages": [
-        "#transformers_dependencies# ; #engine# == \"Transformers\""
-      ]
-    }
-  },
-  {
-    "version": 2,
-    "context_length": 8194,
-    "model_name": "codeshell-chat",
-    "model_lang": [
-      "en",
-      "zh"
-    ],
-    "model_ability": [
-      "chat"
-    ],
-    "model_description": "CodeShell is a multi-language code LLM developed by the Knowledge Computing Lab of Peking University.",
-    "model_specs": [
-      {
-        "model_format": "pytorch",
-        "model_size_in_billions": 7,
-        "model_src": {
-          "huggingface": {
-            "quantizations": [
-              "none"
-            ],
-            "model_id": "WisdomShell/CodeShell-7B-Chat",
-            "model_revision": "3cb06f589b7b1e2f8e728c77280b1114191d24de"
-          },
-          "modelscope": {
-            "quantizations": [
-              "none"
-            ],
-            "model_id": "WisdomShell/CodeShell-7B-Chat",
-            "model_revision": "master"
-          }
-        }
-      }
-    ],
-    "chat_template": "{% for item in messages %}{% if item['role'] == 'user' %}{{ '## human: ' + item['content'] + '|<end>|' }}{% elif item['role'] == 'assistant' %}{{ '## assistant: ' + item['content'] + '|<end>|' }}{% endif %}{% endfor %}{{ '## assistant: ' }}",
-    "stop_token_ids": [
-      70000
-    ],
-    "stop": [
-      "<|endoftext|>",
-      "|||",
-      "|<end>|"
-    ],
-    "updated_at": 1769418506,
-    "featured": false,
-    "architectures": [
-      "CodeShellForCausalLM"
-    ],
-    "model_type": "codeshell",
-    "virtualenv": {
-      "packages": [
-        "#transformers_dependencies# ; #engine# == \"Transformers\""
       ]
     }
   },
@@ -19183,7 +18918,7 @@
     },
     "tool_parser": "qwen",
     "updated_at": 1769418571,
-    "featured": true,
+    "featured": false,
     "architectures": [
       "Qwen3ForCausalLM"
     ],
@@ -22229,382 +21964,6 @@
   },
   {
     "version": 2,
-    "context_length": 100000,
-    "model_name": "wizardcoder-python-v1.0",
-    "model_lang": [
-      "en"
-    ],
-    "model_ability": [
-      "chat"
-    ],
-    "model_specs": [
-      {
-        "model_format": "pytorch",
-        "model_size_in_billions": 13,
-        "model_src": {
-          "huggingface": {
-            "quantizations": [
-              "none"
-            ],
-            "model_id": "WizardLMTeam/WizardCoder-Python-13B-V1.0",
-            "model_revision": "5ac6748b1f5a4c282107ddc7d3b69fdc4a686d75"
-          },
-          "modelscope": {
-            "quantizations": [
-              "none"
-            ],
-            "model_id": "AI-ModelScope/WizardCoder-Python-13B-V1.0",
-            "model_revision": "v1.0.0"
-          }
-        }
-      },
-      {
-        "model_format": "pytorch",
-        "model_size_in_billions": 34,
-        "model_src": {
-          "huggingface": {
-            "quantizations": [
-              "none"
-            ],
-            "model_id": "WizardLMTeam/WizardCoder-Python-34B-V1.0",
-            "model_revision": "897fc6d9e12136c68c441b2350d015902c144b20"
-          },
-          "modelscope": {
-            "quantizations": [
-              "none"
-            ],
-            "model_id": "AI-ModelScope/WizardCoder-Python-34B-V1.0",
-            "model_revision": "v1.0.0"
-          }
-        }
-      },
-      {
-        "model_format": "ggufv2",
-        "model_size_in_billions": 7,
-        "model_src": {
-          "huggingface": {
-            "quantizations": [
-              "Q2_K",
-              "Q3_K_L",
-              "Q3_K_M",
-              "Q3_K_S",
-              "Q4_0",
-              "Q4_K_M",
-              "Q4_K_S",
-              "Q5_0",
-              "Q5_K_M",
-              "Q5_K_S",
-              "Q6_K",
-              "Q8_0"
-            ],
-            "model_id": "TheBloke/WizardCoder-Python-7B-V1.0-GGUF",
-            "model_file_name_template": "wizardcoder-python-7b-v1.0.{quantization}.gguf"
-          }
-        }
-      },
-      {
-        "model_format": "ggufv2",
-        "model_size_in_billions": 13,
-        "model_src": {
-          "huggingface": {
-            "quantizations": [
-              "Q2_K",
-              "Q3_K_L",
-              "Q3_K_M",
-              "Q3_K_S",
-              "Q4_0",
-              "Q4_K_M",
-              "Q4_K_S",
-              "Q5_0",
-              "Q5_K_M",
-              "Q5_K_S",
-              "Q6_K",
-              "Q8_0"
-            ],
-            "model_id": "TheBloke/WizardCoder-Python-13B-V1.0-GGUF",
-            "model_file_name_template": "wizardcoder-python-13b-v1.0.{quantization}.gguf"
-          }
-        }
-      },
-      {
-        "model_format": "ggufv2",
-        "model_size_in_billions": 34,
-        "model_src": {
-          "huggingface": {
-            "quantizations": [
-              "Q2_K",
-              "Q3_K_L",
-              "Q3_K_M",
-              "Q3_K_S",
-              "Q4_0",
-              "Q4_K_M",
-              "Q4_K_S",
-              "Q5_0",
-              "Q5_K_M",
-              "Q5_K_S",
-              "Q6_K",
-              "Q8_0"
-            ],
-            "model_id": "TheBloke/WizardCoder-Python-34B-V1.0-GGUF",
-            "model_file_name_template": "wizardcoder-python-34b-v1.0.{quantization}.gguf"
-          }
-        }
-      }
-    ],
-    "chat_template": "{% for item in messages %}{% if loop.first and item['role'] == 'system' %}{{ item['content'] + '\n\n### ' }}{% elif loop.first %}{{ 'Below is an instruction that describes a task. Write a response that appropriately completes the request.\n\n### ' }}{% endif %}{% if item['role'] == 'user' %}{{ 'Instruction: ' + item['content'] + '\n\n### ' }}{% elif item['role'] == 'assistant' %}{{ 'Response: ' + item['content'] + '\n\n### ' }}{% endif %}{% endfor %}{% if add_generation_prompt %}{{ 'Response: Let\\'s think step by step.' }}{% endif %}",
-    "stop_token_ids": [
-      2
-    ],
-    "stop": [
-      "</s>"
-    ],
-    "updated_at": 1769418580,
-    "featured": false,
-    "architectures": [
-      "LlamaForCausalLM"
-    ],
-    "model_type": "llama",
-    "virtualenv": {
-      "packages": [
-        "#transformers_dependencies# ; #engine# == \"Transformers\"",
-        "#llama_cpp_dependencies# ; #engine# == \"llama.cpp\"",
-        "#vllm_dependencies# ; #engine# == \"vllm\"",
-        "#system_numpy# ; #engine# == \"vllm\""
-      ]
-    }
-  },
-  {
-    "version": 2,
-    "context_length": 2048,
-    "model_name": "wizardmath-v1.0",
-    "model_lang": [
-      "en"
-    ],
-    "model_ability": [
-      "chat"
-    ],
-    "model_description": "WizardMath is an open-source LLM trained by fine-tuning Llama2 with Evol-Instruct, specializing in math.",
-    "model_specs": [
-      {
-        "model_format": "pytorch",
-        "model_size_in_billions": 7,
-        "model_src": {
-          "huggingface": {
-            "quantizations": [
-              "none"
-            ],
-            "model_id": "WizardLMTeam/WizardMath-7B-V1.0",
-            "model_revision": "825a586f260d6c583b8aa9ceab6cdfaa3d9a4ddc"
-          },
-          "modelscope": {
-            "quantizations": [
-              "none"
-            ],
-            "model_id": "Xorbits/WizardMath-7B-V1.0",
-            "model_revision": "v1.0.0"
-          }
-        }
-      },
-      {
-        "model_format": "pytorch",
-        "model_size_in_billions": 70,
-        "model_src": {
-          "huggingface": {
-            "quantizations": [
-              "none"
-            ],
-            "model_id": "WizardLMTeam/WizardMath-70B-V1.0",
-            "model_revision": "4dd9f3fcd8c056561d67ec59ae011f7c146aebd2"
-          }
-        }
-      }
-    ],
-    "chat_template": "{% for item in messages %}{% if loop.first and item['role'] == 'system' %}{{ item['content'] + '\n\n### ' }}{% elif loop.first %}{{ 'Below is an instruction that describes a task. Write a response that appropriately completes the request.\n\n### ' }}{% endif %}{% if item['role'] == 'user' %}{{ 'Instruction: ' + item['content'] + '\n\n### ' }}{% elif item['role'] == 'assistant' %}{{ 'Response: ' + item['content'] + '\n\n### ' }}{% endif %}{% endfor %}{% if add_generation_prompt %}{{ 'Response: Let\\'s think step by step.' }}{% endif %}",
-    "stop_token_ids": [
-      2
-    ],
-    "stop": [
-      "</s>"
-    ],
-    "updated_at": 1769418581,
-    "featured": false,
-    "architectures": [
-      "LlamaForCausalLM"
-    ],
-    "model_type": "llama",
-    "virtualenv": {
-      "packages": [
-        "#transformers_dependencies# ; #engine# == \"Transformers\"",
-        "#vllm_dependencies# ; #engine# == \"vllm\"",
-        "#system_numpy# ; #engine# == \"vllm\""
-      ]
-    }
-  },
-  {
-    "version": 2,
-    "context_length": 2048,
-    "model_name": "xverse",
-    "model_lang": [
-      "en",
-      "zh"
-    ],
-    "model_ability": [
-      "generate"
-    ],
-    "model_description": "XVERSE is a multilingual large language model, independently developed by Shenzhen Yuanxiang Technology.",
-    "model_specs": [
-      {
-        "model_format": "pytorch",
-        "model_size_in_billions": 7,
-        "model_src": {
-          "huggingface": {
-            "quantizations": [
-              "none"
-            ],
-            "model_id": "xverse/XVERSE-7B",
-            "model_revision": "3778b254def675586e9218ccb15b78d6ef66a3a7"
-          },
-          "modelscope": {
-            "quantizations": [
-              "none"
-            ],
-            "model_id": "xverse/XVERSE-7B",
-            "model_revision": "master"
-          }
-        }
-      },
-      {
-        "model_format": "pytorch",
-        "model_size_in_billions": 13,
-        "model_src": {
-          "huggingface": {
-            "quantizations": [
-              "none"
-            ],
-            "model_id": "xverse/XVERSE-13B",
-            "model_revision": "11ac840dda17af81046614229fdd0c658afff747"
-          },
-          "modelscope": {
-            "quantizations": [
-              "none"
-            ],
-            "model_id": "xverse/XVERSE-13B",
-            "model_revision": "master"
-          }
-        }
-      },
-      {
-        "model_format": "pytorch",
-        "model_size_in_billions": 65,
-        "model_src": {
-          "huggingface": {
-            "quantizations": [
-              "none"
-            ],
-            "model_id": "xverse/XVERSE-65B",
-            "model_revision": "7f1b7394f74c630f50612a19ba90bd021c373989"
-          },
-          "modelscope": {
-            "quantizations": [
-              "none"
-            ],
-            "model_id": "xverse/XVERSE-65B",
-            "model_revision": "master"
-          }
-        }
-      }
-    ],
-    "updated_at": 1769418582,
-    "featured": false,
-    "architectures": [
-      "XverseForCausalLM"
-    ],
-    "model_type": "xverse",
-    "virtualenv": {
-      "packages": [
-        "#transformers_dependencies# ; #engine# == \"Transformers\"",
-        "#vllm_dependencies# ; #engine# == \"vllm\"",
-        "#system_numpy# ; #engine# == \"vllm\""
-      ]
-    }
-  },
-  {
-    "version": 2,
-    "context_length": 2048,
-    "model_name": "xverse-chat",
-    "model_lang": [
-      "en",
-      "zh"
-    ],
-    "model_ability": [
-      "chat"
-    ],
-    "model_description": "XVERSEB-Chat is the aligned version of model XVERSE.",
-    "model_specs": [
-      {
-        "model_format": "pytorch",
-        "model_size_in_billions": 7,
-        "model_src": {
-          "huggingface": {
-            "quantizations": [
-              "none"
-            ],
-            "model_id": "xverse/XVERSE-7B-Chat",
-            "model_revision": "60acc8c453c067b54df88be98bfdf60585ab5441"
-          },
-          "modelscope": {
-            "quantizations": [
-              "none"
-            ],
-            "model_id": "xverse/XVERSE-7B-Chat",
-            "model_revision": "master"
-          }
-        }
-      },
-      {
-        "model_format": "pytorch",
-        "model_size_in_billions": 13,
-        "model_src": {
-          "huggingface": {
-            "quantizations": [
-              "none"
-            ],
-            "model_id": "xverse/XVERSE-13B-Chat",
-            "model_revision": "1e4944aaa1d8c8d0cdca28bb8e3a003303d0781b"
-          },
-          "modelscope": {
-            "quantizations": [
-              "none"
-            ],
-            "model_id": "xverse/XVERSE-13B-Chat",
-            "model_revision": "master"
-          }
-        }
-      }
-    ],
-    "chat_template": "{% for item in messages %}{% if loop.first and item['role'] == 'system' %}{{ '<|system|> \n' + item['content'] }}{% endif %}{% if item['role'] == 'user' %}{{ '<|user|> \n' + item['content'] }}{% elif item['role'] == 'assistant' %}{{ '<|assistant|> \n' + item['content'] }}{% endif %}{% endfor %}{% if add_generation_prompt %}{{ '<|assistant|>' }}{% endif %}",
-    "stop_token_ids": [
-      3
-    ],
-    "stop": [
-      "<|endoftext|>"
-    ],
-    "updated_at": 1769418583,
-    "featured": false,
-    "architectures": [
-      "XverseForCausalLM"
-    ],
-    "model_type": "xverse",
-    "virtualenv": {
-      "packages": [
-        "#transformers_dependencies# ; #engine# == \"Transformers\"",
-        "#vllm_dependencies# ; #engine# == \"vllm\"",
-        "#system_numpy# ; #engine# == \"vllm\""
-      ]
-    }
-  },
-  {
-    "version": 2,
     "context_length": 32768,
     "model_name": "qwenLong-l1",
     "model_lang": [
@@ -23367,7 +22726,7 @@
         "#system_numpy# ; #engine# == \"vllm\""
       ]
     },
-    "featured": true,
+    "featured": false,
     "architectures": [
       "Glm4MoeForCausalLM"
     ],
@@ -24765,7 +24124,7 @@
     ],
     "tool_parser": "qwen",
     "updated_at": 1784394365,
-    "featured": true,
+    "featured": false,
     "architectures": [
       "Qwen3VLMoeForConditionalGeneration"
     ],
@@ -26039,7 +25398,7 @@
       ]
     },
     "tool_parser": "deepseek-r1",
-    "featured": true,
+    "featured": false,
     "updated_at": 1770205932
   },
   {
@@ -26186,7 +25545,7 @@
       ],
       "index_strategy": "unsafe-best-match"
     },
-    "featured": true,
+    "featured": false,
     "architectures": [
       "Glm4MoeForCausalLM"
     ],
@@ -31398,7 +30757,7 @@
       "<|im_end|>"
     ],
     "tool_parser": "qwen",
-    "featured": false,
+    "featured": true,
     "updated_at": 1786815199
   },
   {
@@ -33338,7 +32697,7 @@
         "#llama_cpp_dependencies# ; #engine# == \"llama.cpp\""
       ]
     },
-    "featured": false,
+    "featured": true,
     "updated_at": 1781600152
   },
   {
@@ -33487,7 +32846,7 @@
         "#system_numpy# ; #engine# == \"vllm\""
       ]
     },
-    "featured": false,
+    "featured": true,
     "updated_at": 1786099285
   },
   {
@@ -33671,7 +33030,7 @@
         "#llama_cpp_dependencies# ; #engine# == \"llama.cpp\""
       ]
     },
-    "featured": true,
+    "featured": false,
     "updated_at": 1781520055
   },
   {
@@ -33773,7 +33132,7 @@
         "#llama_cpp_dependencies# ; #engine# == \"llama.cpp\""
       ]
     },
-    "featured": true,
+    "featured": false,
     "updated_at": 1781520056
   },
   {
@@ -33851,7 +33210,7 @@
         "#sglang_dependencies# ; #engine# == \"sglang\""
       ]
     },
-    "featured": true,
+    "featured": false,
     "updated_at": 1781520058
   },
   {
@@ -34610,7 +33969,7 @@
         "#llama_cpp_dependencies# ; #engine# == \"llama.cpp\""
       ]
     },
-    "featured": false,
+    "featured": true,
     "updated_at": 1786072259
   },
   {
@@ -34921,5 +34280,884 @@
     },
     "featured": false,
     "updated_at": 1786731484
+  },
+  {
+    "model_name": "Ornith-1.5-35B-A3B",
+    "model_description": "Ornith-1.5-35B-A3B is a 35B-total / 3B-activated Mixture-of-Experts multimodal model built on the Qwen3.5 MoE architecture (Qwen3_5MoeForConditionalGeneration), supporting text, image, and video understanding with reasoning and tool-use capabilities.",
+    "context_length": 262144,
+    "model_lang": [
+      "en",
+      "zh"
+    ],
+    "model_ability": [
+      "chat",
+      "vision",
+      "tools",
+      "reasoning",
+      "hybrid"
+    ],
+    "model_specs": [
+      {
+        "model_size_in_billions": 35,
+        "activated_size_in_billions": 3,
+        "model_format": "pytorch",
+        "model_src": {
+          "modelscope": {
+            "model_id": "ornith-ai/Ornith-1.5-35B-A3B",
+            "quantizations": [
+              "none"
+            ]
+          }
+        }
+      }
+    ],
+    "version": 2,
+    "virtualenv": {
+      "packages": [
+        "sglang>=0.5.9 ; #engine# == \"sglang\"",
+        "transformers>=5.8.1 ; #engine# == \"Transformers\"",
+        "qwen-vl-utils!=0.0.9 ; #engine# == \"Transformers\"",
+        "qwen_omni_utils ; #engine# == \"vllm\"",
+        "#system_numpy# ; #engine# == \"vllm\"",
+        "vllm==0.21.0 ; #engine# == \"vllm\"",
+        "ninja ; #engine# == \"vllm\"",
+        "#llama_cpp_dependencies# ; #engine# == \"llama.cpp\""
+      ]
+    },
+    "architectures": [
+      "Qwen3_5MoeForConditionalGeneration"
+    ],
+    "chat_template": "{%- set image_count = namespace(value=0) %}\n{%- set video_count = namespace(value=0) %}\n{%- macro render_content(content, do_vision_count, is_system_content=false) %}\n    {%- if content is string %}\n        {{- content }}\n    {%- elif content is iterable and content is not mapping %}\n        {%- for item in content %}\n            {%- if 'image' in item or 'image_url' in item or item.type == 'image' %}\n                {%- if is_system_content %}\n                    {{- raise_exception('System message cannot contain images.') }}\n                {%- endif %}\n                {%- if do_vision_count %}\n                    {%- set image_count.value = image_count.value + 1 %}\n                {%- endif %}\n                {%- if add_vision_id %}\n                    {{- 'Picture ' ~ image_count.value ~ ': ' }}\n                {%- endif %}\n                {{- '<|vision_start|><|image_pad|><|vision_end|>' }}\n            {%- elif 'video' in item or item.type == 'video' %}\n                {%- if is_system_content %}\n                    {{- raise_exception('System message cannot contain videos.') }}\n                {%- endif %}\n                {%- if do_vision_count %}\n                    {%- set video_count.value = video_count.value + 1 %}\n                {%- endif %}\n                {%- if add_vision_id %}\n                    {{- 'Video ' ~ video_count.value ~ ': ' }}\n                {%- endif %}\n                {{- '<|vision_start|><|video_pad|><|vision_end|>' }}\n            {%- elif 'text' in item %}\n                {{- item.text }}\n            {%- else %}\n                {{- raise_exception('Unexpected item type in content.') }}\n            {%- endif %}\n        {%- endfor %}\n    {%- elif content is none or content is undefined %}\n        {{- '' }}\n    {%- else %}\n        {{- raise_exception('Unexpected content type.') }}\n    {%- endif %}\n{%- endmacro %}\n{%- if not messages %}\n    {{- raise_exception('No messages provided.') }}\n{%- endif %}\n{%- if tools and tools is iterable and tools is not mapping %}\n    {{- '<|im_start|>system\\n' }}\n    {{- \"# Tools\\n\\nYou have access to the following functions:\\n\\n<tools>\" }}\n    {%- for tool in tools %}\n        {{- \"\\n\" }}\n        {{- tool | tojson }}\n    {%- endfor %}\n    {{- \"\\n</tools>\" }}\n    {{- '\\n\\nIf you choose to call a function ONLY reply in the following format with NO suffix:\\n\\n<tool_call>\\n<function=example_function_name>\\n<parameter=example_parameter_1>\\nvalue_1\\n</parameter>\\n<parameter=example_parameter_2>\\nThis is the value for the second parameter\\nthat can span\\nmultiple lines\\n</parameter>\\n</function>\\n</tool_call>\\n\\n<IMPORTANT>\\nReminder:\\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\\n- Required parameters MUST be specified\\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\\n</IMPORTANT>' }}\n    {%- if messages[0].role == 'system' %}\n        {%- set content = render_content(messages[0].content, false, true)|trim %}\n        {%- if content %}\n            {{- '\\n\\n' + content }}\n        {%- endif %}\n    {%- endif %}\n    {{- '<|im_end|>\\n' }}\n{%- else %}\n    {%- if messages[0].role == 'system' %}\n        {%- set content = render_content(messages[0].content, false, true)|trim %}\n        {{- '<|im_start|>system\\n' + content + '<|im_end|>\\n' }}\n    {%- endif %}\n{%- endif %}\n{%- set ns = namespace(multi_step_tool=true, last_query_index=messages|length - 1) %}\n{%- for message in messages[::-1] %}\n    {%- set index = (messages|length - 1) - loop.index0 %}\n    {%- if ns.multi_step_tool and message.role == \"user\" %}\n        {%- set content = render_content(message.content, false)|trim %}\n        {%- if not(content.startswith('<tool_response>') and content.endswith('</tool_response>')) %}\n            {%- set ns.multi_step_tool = false %}\n            {%- set ns.last_query_index = index %}\n        {%- endif %}\n    {%- endif %}\n{%- endfor %}\n{%- if ns.multi_step_tool %}\n    {{- raise_exception('No user query found in messages.') }}\n{%- endif %}\n{%- for message in messages %}\n    {%- set content = render_content(message.content, true)|trim %}\n    {%- if message.role == \"system\" %}\n        {%- if not loop.first %}\n            {{- raise_exception('System message must be at the beginning.') }}\n        {%- endif %}\n    {%- elif message.role == \"user\" %}\n        {{- '<|im_start|>' + message.role + '\\n' + content + '<|im_end|>' + '\\n' }}\n    {%- elif message.role == \"assistant\" %}\n        {%- set reasoning_content = '' %}\n        {%- if message.reasoning_content is string %}\n            {%- set reasoning_content = message.reasoning_content %}\n        {%- else %}\n            {%- if '</think>' in content %}\n                {%- set reasoning_content = content.split('</think>')[0].rstrip('\\n').split('<think>')[-1].lstrip('\\n') %}\n                {%- set content = content.split('</think>')[-1].lstrip('\\n') %}\n            {%- endif %}\n        {%- endif %}\n        {%- set reasoning_content = reasoning_content|trim %}\n        {%- if loop.index0 > ns.last_query_index %}\n            {{- '<|im_start|>' + message.role + '\\n<think>\\n' + reasoning_content + '\\n</think>\\n\\n' + content }}\n        {%- else %}\n            {{- '<|im_start|>' + message.role + '\\n' + content }}\n        {%- endif %}\n        {%- if message.tool_calls and message.tool_calls is iterable and message.tool_calls is not mapping %}\n            {%- for tool_call in message.tool_calls %}\n                {%- if tool_call.function is defined %}\n                    {%- set tool_call = tool_call.function %}\n                {%- endif %}\n                {%- if loop.first %}\n                    {%- if content|trim %}\n                        {{- '\\n\\n<tool_call>\\n<function=' + tool_call.name + '>\\n' }}\n                    {%- else %}\n                        {{- '<tool_call>\\n<function=' + tool_call.name + '>\\n' }}\n                    {%- endif %}\n                {%- else %}\n                    {{- '\\n<tool_call>\\n<function=' + tool_call.name + '>\\n' }}\n                {%- endif %}\n                {%- if tool_call.arguments is defined %}\n                    {%- for args_name, args_value in tool_call.arguments|items %}\n                        {{- '<parameter=' + args_name + '>\\n' }}\n                        {%- set args_value = args_value | tojson | safe if args_value is mapping or (args_value is sequence and args_value is not string) else args_value | string %}\n                        {{- args_value }}\n                        {{- '\\n</parameter>\\n' }}\n                    {%- endfor %}\n                {%- endif %}\n                {{- '</function>\\n</tool_call>' }}\n            {%- endfor %}\n        {%- endif %}\n        {{- '<|im_end|>\\n' }}\n    {%- elif message.role == \"tool\" %}\n        {%- if loop.previtem and loop.previtem.role != \"tool\" %}\n            {{- '<|im_start|>user' }}\n        {%- endif %}\n        {{- '\\n<tool_response>\\n' }}\n        {{- content }}\n        {{- '\\n</tool_response>' }}\n        {%- if not loop.last and loop.nextitem.role != \"tool\" %}\n            {{- '<|im_end|>\\n' }}\n        {%- elif loop.last %}\n            {{- '<|im_end|>\\n' }}\n        {%- endif %}\n    {%- else %}\n        {{- raise_exception('Unexpected message role.') }}\n    {%- endif %}\n{%- endfor %}\n{%- if add_generation_prompt %}\n    {{- '<|im_start|>assistant\\n' }}\n    {%- if enable_thinking is defined and enable_thinking is false %}\n        {{- '<think>\\n\\n</think>\\n\\n' }}\n    {%- else %}\n        {{- '<think>\\n' }}\n    {%- endif %}\n{%- endif %}",
+    "stop_token_ids": [
+      248044,
+      248046
+    ],
+    "reasoning_start_tag": "<think>",
+    "reasoning_end_tag": "</think>",
+    "stop": [
+      "<|endoftext|>",
+      "<|im_end|>"
+    ],
+    "tool_parser": "qwen",
+    "featured": false,
+    "updated_at": 1787287927
+  },
+  {
+    "model_name": "glm-5.2",
+    "model_description": "We're introducing GLM-5.2, our latest flagship model for long-horizon tasks",
+    "context_length": 1048576,
+    "model_lang": [
+      "en",
+      "zh"
+    ],
+    "model_ability": [
+      "chat",
+      "tools",
+      "reasoning",
+      "hybrid"
+    ],
+    "model_specs": [
+      {
+        "model_size_in_billions": 753,
+        "model_format": "pytorch",
+        "model_src": {
+          "huggingface": {
+            "model_id": "zai-org/GLM-5.2",
+            "quantizations": [
+              "none"
+            ]
+          },
+          "modelscope": {
+            "model_id": "ZhipuAI/GLM-5.2",
+            "quantizations": [
+              "none"
+            ]
+          }
+        }
+      },
+      {
+        "model_size_in_billions": 753,
+        "model_format": "fp8",
+        "model_src": {
+          "huggingface": {
+            "model_id": "zai-org/GLM-5.2-FP8",
+            "quantizations": [
+              "FP8"
+            ]
+          },
+          "modelscope": {
+            "model_id": "ZhipuAI/GLM-5.2-FP8",
+            "quantizations": [
+              "FP8"
+            ]
+          }
+        }
+      },
+      {
+        "model_size_in_billions": 753,
+        "model_format": "ggufv2",
+        "model_src": {
+          "huggingface": {
+            "model_id": "unsloth/GLM-5.2-GGUF",
+            "model_file_name_template": "GLM-5.2-{quantization}.gguf",
+            "model_file_name_split_template": "{quantization}/GLM-5.2-{quantization}-{part}.gguf",
+            "quantizations": [
+              "BF16",
+              "Q8_0",
+              "UD-IQ1_M",
+              "UD-IQ1_S",
+              "UD-IQ2_M",
+              "UD-IQ2_XXS",
+              "UD-IQ3_S",
+              "UD-IQ3_XXS",
+              "UD-IQ4_NL",
+              "UD-IQ4_XS",
+              "UD-Q2_K_XL",
+              "UD-Q3_K_M",
+              "UD-Q3_K_XL",
+              "UD-Q4_K_M",
+              "UD-Q4_K_S",
+              "UD-Q4_K_XL",
+              "UD-Q5_K_M",
+              "UD-Q5_K_S",
+              "UD-Q5_K_XL",
+              "UD-Q6_K",
+              "UD-Q6_K_XL",
+              "UD-Q8_K_XL"
+            ],
+            "quantization_parts": {
+              "BF16": [
+                "00001-of-00033",
+                "00002-of-00033",
+                "00003-of-00033",
+                "00004-of-00033",
+                "00005-of-00033",
+                "00006-of-00033",
+                "00007-of-00033",
+                "00008-of-00033",
+                "00009-of-00033",
+                "00010-of-00033",
+                "00011-of-00033",
+                "00012-of-00033",
+                "00013-of-00033",
+                "00014-of-00033",
+                "00015-of-00033",
+                "00016-of-00033",
+                "00017-of-00033",
+                "00018-of-00033",
+                "00019-of-00033",
+                "00020-of-00033",
+                "00021-of-00033",
+                "00022-of-00033",
+                "00023-of-00033",
+                "00024-of-00033",
+                "00025-of-00033",
+                "00026-of-00033",
+                "00027-of-00033",
+                "00028-of-00033",
+                "00029-of-00033",
+                "00030-of-00033",
+                "00031-of-00033",
+                "00032-of-00033",
+                "00033-of-00033"
+              ],
+              "Q8_0": [
+                "00001-of-00017",
+                "00002-of-00017",
+                "00003-of-00017",
+                "00004-of-00017",
+                "00005-of-00017",
+                "00006-of-00017",
+                "00007-of-00017",
+                "00008-of-00017",
+                "00009-of-00017",
+                "00010-of-00017",
+                "00011-of-00017",
+                "00012-of-00017",
+                "00013-of-00017",
+                "00014-of-00017",
+                "00015-of-00017",
+                "00016-of-00017",
+                "00017-of-00017"
+              ],
+              "UD-IQ1_M": [
+                "00001-of-00006",
+                "00002-of-00006",
+                "00003-of-00006",
+                "00004-of-00006",
+                "00005-of-00006",
+                "00006-of-00006"
+              ],
+              "UD-IQ1_S": [
+                "00001-of-00006",
+                "00002-of-00006",
+                "00003-of-00006",
+                "00004-of-00006",
+                "00005-of-00006",
+                "00006-of-00006"
+              ],
+              "UD-IQ2_M": [
+                "00001-of-00006",
+                "00002-of-00006",
+                "00003-of-00006",
+                "00004-of-00006",
+                "00005-of-00006",
+                "00006-of-00006"
+              ],
+              "UD-IQ2_XXS": [
+                "00001-of-00006",
+                "00002-of-00006",
+                "00003-of-00006",
+                "00004-of-00006",
+                "00005-of-00006",
+                "00006-of-00006"
+              ],
+              "UD-IQ3_S": [
+                "00001-of-00008",
+                "00002-of-00008",
+                "00003-of-00008",
+                "00004-of-00008",
+                "00005-of-00008",
+                "00006-of-00008",
+                "00007-of-00008",
+                "00008-of-00008"
+              ],
+              "UD-IQ3_XXS": [
+                "00001-of-00007",
+                "00002-of-00007",
+                "00003-of-00007",
+                "00004-of-00007",
+                "00005-of-00007",
+                "00006-of-00007",
+                "00007-of-00007"
+              ],
+              "UD-IQ4_NL": [
+                "00001-of-00009",
+                "00002-of-00009",
+                "00003-of-00009",
+                "00004-of-00009",
+                "00005-of-00009",
+                "00006-of-00009",
+                "00007-of-00009",
+                "00008-of-00009",
+                "00009-of-00009"
+              ],
+              "UD-IQ4_XS": [
+                "00001-of-00009",
+                "00002-of-00009",
+                "00003-of-00009",
+                "00004-of-00009",
+                "00005-of-00009",
+                "00006-of-00009",
+                "00007-of-00009",
+                "00008-of-00009",
+                "00009-of-00009"
+              ],
+              "UD-Q2_K_XL": [
+                "00001-of-00007",
+                "00002-of-00007",
+                "00003-of-00007",
+                "00004-of-00007",
+                "00005-of-00007",
+                "00006-of-00007",
+                "00007-of-00007"
+              ],
+              "UD-Q3_K_M": [
+                "00001-of-00009",
+                "00002-of-00009",
+                "00003-of-00009",
+                "00004-of-00009",
+                "00005-of-00009",
+                "00006-of-00009",
+                "00007-of-00009",
+                "00008-of-00009",
+                "00009-of-00009"
+              ],
+              "UD-Q3_K_XL": [
+                "00001-of-00009",
+                "00002-of-00009",
+                "00003-of-00009",
+                "00004-of-00009",
+                "00005-of-00009",
+                "00006-of-00009",
+                "00007-of-00009",
+                "00008-of-00009",
+                "00009-of-00009"
+              ],
+              "UD-Q4_K_M": [
+                "00001-of-00011",
+                "00002-of-00011",
+                "00003-of-00011",
+                "00004-of-00011",
+                "00005-of-00011",
+                "00006-of-00011",
+                "00007-of-00011",
+                "00008-of-00011",
+                "00009-of-00011",
+                "00010-of-00011",
+                "00011-of-00011"
+              ],
+              "UD-Q4_K_S": [
+                "00001-of-00010",
+                "00002-of-00010",
+                "00003-of-00010",
+                "00004-of-00010",
+                "00005-of-00010",
+                "00006-of-00010",
+                "00007-of-00010",
+                "00008-of-00010",
+                "00009-of-00010",
+                "00010-of-00010"
+              ],
+              "UD-Q4_K_XL": [
+                "00001-of-00011",
+                "00002-of-00011",
+                "00003-of-00011",
+                "00004-of-00011",
+                "00005-of-00011",
+                "00006-of-00011",
+                "00007-of-00011",
+                "00008-of-00011",
+                "00009-of-00011",
+                "00010-of-00011",
+                "00011-of-00011"
+              ],
+              "UD-Q5_K_M": [
+                "00001-of-00013",
+                "00002-of-00013",
+                "00003-of-00013",
+                "00004-of-00013",
+                "00005-of-00013",
+                "00006-of-00013",
+                "00007-of-00013",
+                "00008-of-00013",
+                "00009-of-00013",
+                "00010-of-00013",
+                "00011-of-00013",
+                "00012-of-00013",
+                "00013-of-00013"
+              ],
+              "UD-Q5_K_S": [
+                "00001-of-00012",
+                "00002-of-00012",
+                "00003-of-00012",
+                "00004-of-00012",
+                "00005-of-00012",
+                "00006-of-00012",
+                "00007-of-00012",
+                "00008-of-00012",
+                "00009-of-00012",
+                "00010-of-00012",
+                "00011-of-00012",
+                "00012-of-00012"
+              ],
+              "UD-Q5_K_XL": [
+                "00001-of-00013",
+                "00002-of-00013",
+                "00003-of-00013",
+                "00004-of-00013",
+                "00005-of-00013",
+                "00006-of-00013",
+                "00007-of-00013",
+                "00008-of-00013",
+                "00009-of-00013",
+                "00010-of-00013",
+                "00011-of-00013",
+                "00012-of-00013",
+                "00013-of-00013"
+              ],
+              "UD-Q6_K": [
+                "00001-of-00014",
+                "00002-of-00014",
+                "00003-of-00014",
+                "00004-of-00014",
+                "00005-of-00014",
+                "00006-of-00014",
+                "00007-of-00014",
+                "00008-of-00014",
+                "00009-of-00014",
+                "00010-of-00014",
+                "00011-of-00014",
+                "00012-of-00014",
+                "00013-of-00014",
+                "00014-of-00014"
+              ],
+              "UD-Q6_K_XL": [
+                "00001-of-00016",
+                "00002-of-00016",
+                "00003-of-00016",
+                "00004-of-00016",
+                "00005-of-00016",
+                "00006-of-00016",
+                "00007-of-00016",
+                "00008-of-00016",
+                "00009-of-00016",
+                "00010-of-00016",
+                "00011-of-00016",
+                "00012-of-00016",
+                "00013-of-00016",
+                "00014-of-00016",
+                "00015-of-00016",
+                "00016-of-00016"
+              ],
+              "UD-Q8_K_XL": [
+                "00001-of-00018",
+                "00002-of-00018",
+                "00003-of-00018",
+                "00004-of-00018",
+                "00005-of-00018",
+                "00006-of-00018",
+                "00007-of-00018",
+                "00008-of-00018",
+                "00009-of-00018",
+                "00010-of-00018",
+                "00011-of-00018",
+                "00012-of-00018",
+                "00013-of-00018",
+                "00014-of-00018",
+                "00015-of-00018",
+                "00016-of-00018",
+                "00017-of-00018",
+                "00018-of-00018"
+              ]
+            }
+          },
+          "modelscope": {
+            "model_id": "unsloth/GLM-5.2-GGUF",
+            "model_file_name_template": "GLM-5.2-{quantization}.gguf",
+            "model_file_name_split_template": "{quantization}/GLM-5.2-{quantization}-{part}.gguf",
+            "quantizations": [
+              "BF16",
+              "Q8_0",
+              "UD-IQ1_M",
+              "UD-IQ1_S",
+              "UD-IQ2_M",
+              "UD-IQ2_XXS",
+              "UD-IQ3_S",
+              "UD-IQ3_XXS",
+              "UD-IQ4_NL",
+              "UD-IQ4_XS",
+              "UD-Q2_K_XL",
+              "UD-Q3_K_M",
+              "UD-Q3_K_XL",
+              "UD-Q4_K_M",
+              "UD-Q4_K_S",
+              "UD-Q4_K_XL",
+              "UD-Q5_K_M",
+              "UD-Q5_K_S",
+              "UD-Q5_K_XL",
+              "UD-Q6_K",
+              "UD-Q6_K_XL",
+              "UD-Q8_K_XL"
+            ],
+            "quantization_parts": {
+              "BF16": [
+                "00001-of-00033",
+                "00002-of-00033",
+                "00003-of-00033",
+                "00004-of-00033",
+                "00005-of-00033",
+                "00006-of-00033",
+                "00007-of-00033",
+                "00008-of-00033",
+                "00009-of-00033",
+                "00010-of-00033",
+                "00011-of-00033",
+                "00012-of-00033",
+                "00013-of-00033",
+                "00014-of-00033",
+                "00015-of-00033",
+                "00016-of-00033",
+                "00017-of-00033",
+                "00018-of-00033",
+                "00019-of-00033",
+                "00020-of-00033",
+                "00021-of-00033",
+                "00022-of-00033",
+                "00023-of-00033",
+                "00024-of-00033",
+                "00025-of-00033",
+                "00026-of-00033",
+                "00027-of-00033",
+                "00028-of-00033",
+                "00029-of-00033",
+                "00030-of-00033",
+                "00031-of-00033",
+                "00032-of-00033",
+                "00033-of-00033"
+              ],
+              "Q8_0": [
+                "00001-of-00017",
+                "00002-of-00017",
+                "00003-of-00017",
+                "00004-of-00017",
+                "00005-of-00017",
+                "00006-of-00017",
+                "00007-of-00017",
+                "00008-of-00017",
+                "00009-of-00017",
+                "00010-of-00017",
+                "00011-of-00017",
+                "00012-of-00017",
+                "00013-of-00017",
+                "00014-of-00017",
+                "00015-of-00017",
+                "00016-of-00017",
+                "00017-of-00017"
+              ],
+              "UD-IQ1_M": [
+                "00001-of-00006",
+                "00002-of-00006",
+                "00003-of-00006",
+                "00004-of-00006",
+                "00005-of-00006",
+                "00006-of-00006"
+              ],
+              "UD-IQ1_S": [
+                "00001-of-00006",
+                "00002-of-00006",
+                "00003-of-00006",
+                "00004-of-00006",
+                "00005-of-00006",
+                "00006-of-00006"
+              ],
+              "UD-IQ2_M": [
+                "00001-of-00006",
+                "00002-of-00006",
+                "00003-of-00006",
+                "00004-of-00006",
+                "00005-of-00006",
+                "00006-of-00006"
+              ],
+              "UD-IQ2_XXS": [
+                "00001-of-00006",
+                "00002-of-00006",
+                "00003-of-00006",
+                "00004-of-00006",
+                "00005-of-00006",
+                "00006-of-00006"
+              ],
+              "UD-IQ3_S": [
+                "00001-of-00008",
+                "00002-of-00008",
+                "00003-of-00008",
+                "00004-of-00008",
+                "00005-of-00008",
+                "00006-of-00008",
+                "00007-of-00008",
+                "00008-of-00008"
+              ],
+              "UD-IQ3_XXS": [
+                "00001-of-00007",
+                "00002-of-00007",
+                "00003-of-00007",
+                "00004-of-00007",
+                "00005-of-00007",
+                "00006-of-00007",
+                "00007-of-00007"
+              ],
+              "UD-IQ4_NL": [
+                "00001-of-00009",
+                "00002-of-00009",
+                "00003-of-00009",
+                "00004-of-00009",
+                "00005-of-00009",
+                "00006-of-00009",
+                "00007-of-00009",
+                "00008-of-00009",
+                "00009-of-00009"
+              ],
+              "UD-IQ4_XS": [
+                "00001-of-00009",
+                "00002-of-00009",
+                "00003-of-00009",
+                "00004-of-00009",
+                "00005-of-00009",
+                "00006-of-00009",
+                "00007-of-00009",
+                "00008-of-00009",
+                "00009-of-00009"
+              ],
+              "UD-Q2_K_XL": [
+                "00001-of-00007",
+                "00002-of-00007",
+                "00003-of-00007",
+                "00004-of-00007",
+                "00005-of-00007",
+                "00006-of-00007",
+                "00007-of-00007"
+              ],
+              "UD-Q3_K_M": [
+                "00001-of-00009",
+                "00002-of-00009",
+                "00003-of-00009",
+                "00004-of-00009",
+                "00005-of-00009",
+                "00006-of-00009",
+                "00007-of-00009",
+                "00008-of-00009",
+                "00009-of-00009"
+              ],
+              "UD-Q3_K_XL": [
+                "00001-of-00009",
+                "00002-of-00009",
+                "00003-of-00009",
+                "00004-of-00009",
+                "00005-of-00009",
+                "00006-of-00009",
+                "00007-of-00009",
+                "00008-of-00009",
+                "00009-of-00009"
+              ],
+              "UD-Q4_K_M": [
+                "00001-of-00011",
+                "00002-of-00011",
+                "00003-of-00011",
+                "00004-of-00011",
+                "00005-of-00011",
+                "00006-of-00011",
+                "00007-of-00011",
+                "00008-of-00011",
+                "00009-of-00011",
+                "00010-of-00011",
+                "00011-of-00011"
+              ],
+              "UD-Q4_K_S": [
+                "00001-of-00010",
+                "00002-of-00010",
+                "00003-of-00010",
+                "00004-of-00010",
+                "00005-of-00010",
+                "00006-of-00010",
+                "00007-of-00010",
+                "00008-of-00010",
+                "00009-of-00010",
+                "00010-of-00010"
+              ],
+              "UD-Q4_K_XL": [
+                "00001-of-00011",
+                "00002-of-00011",
+                "00003-of-00011",
+                "00004-of-00011",
+                "00005-of-00011",
+                "00006-of-00011",
+                "00007-of-00011",
+                "00008-of-00011",
+                "00009-of-00011",
+                "00010-of-00011",
+                "00011-of-00011"
+              ],
+              "UD-Q5_K_M": [
+                "00001-of-00013",
+                "00002-of-00013",
+                "00003-of-00013",
+                "00004-of-00013",
+                "00005-of-00013",
+                "00006-of-00013",
+                "00007-of-00013",
+                "00008-of-00013",
+                "00009-of-00013",
+                "00010-of-00013",
+                "00011-of-00013",
+                "00012-of-00013",
+                "00013-of-00013"
+              ],
+              "UD-Q5_K_S": [
+                "00001-of-00012",
+                "00002-of-00012",
+                "00003-of-00012",
+                "00004-of-00012",
+                "00005-of-00012",
+                "00006-of-00012",
+                "00007-of-00012",
+                "00008-of-00012",
+                "00009-of-00012",
+                "00010-of-00012",
+                "00011-of-00012",
+                "00012-of-00012"
+              ],
+              "UD-Q5_K_XL": [
+                "00001-of-00013",
+                "00002-of-00013",
+                "00003-of-00013",
+                "00004-of-00013",
+                "00005-of-00013",
+                "00006-of-00013",
+                "00007-of-00013",
+                "00008-of-00013",
+                "00009-of-00013",
+                "00010-of-00013",
+                "00011-of-00013",
+                "00012-of-00013",
+                "00013-of-00013"
+              ],
+              "UD-Q6_K": [
+                "00001-of-00014",
+                "00002-of-00014",
+                "00003-of-00014",
+                "00004-of-00014",
+                "00005-of-00014",
+                "00006-of-00014",
+                "00007-of-00014",
+                "00008-of-00014",
+                "00009-of-00014",
+                "00010-of-00014",
+                "00011-of-00014",
+                "00012-of-00014",
+                "00013-of-00014",
+                "00014-of-00014"
+              ],
+              "UD-Q6_K_XL": [
+                "00001-of-00016",
+                "00002-of-00016",
+                "00003-of-00016",
+                "00004-of-00016",
+                "00005-of-00016",
+                "00006-of-00016",
+                "00007-of-00016",
+                "00008-of-00016",
+                "00009-of-00016",
+                "00010-of-00016",
+                "00011-of-00016",
+                "00012-of-00016",
+                "00013-of-00016",
+                "00014-of-00016",
+                "00015-of-00016",
+                "00016-of-00016"
+              ],
+              "UD-Q8_K_XL": [
+                "00001-of-00018",
+                "00002-of-00018",
+                "00003-of-00018",
+                "00004-of-00018",
+                "00005-of-00018",
+                "00006-of-00018",
+                "00007-of-00018",
+                "00008-of-00018",
+                "00009-of-00018",
+                "00010-of-00018",
+                "00011-of-00018",
+                "00012-of-00018",
+                "00013-of-00018",
+                "00014-of-00018",
+                "00015-of-00018",
+                "00016-of-00018",
+                "00017-of-00018",
+                "00018-of-00018"
+              ]
+            }
+          }
+        }
+      },
+      {
+        "model_size_in_billions": 753,
+        "model_format": "mlx",
+        "model_src": {
+          "huggingface": {
+            "model_id": "mlx-community/GLM-5.2-{quantization}",
+            "quantizations": [
+              "4bit",
+              "mxfp4"
+            ]
+          },
+          "modelscope": {
+            "model_id": "mlx-community/GLM-5.2-{quantization}",
+            "quantizations": [
+              "4bit",
+              "mxfp4"
+            ]
+          }
+        }
+      }
+    ],
+    "architectures": [
+      "GlmMoeDsaForCausalLM"
+    ],
+    "chat_template": "[gMASK]<sop>\n{%- set effective_reasoning_effort = 'high' if reasoning_effort is defined and reasoning_effort == 'high' else 'max' -%}\n{%- if (enable_thinking is not defined or enable_thinking) and effective_reasoning_effort is not none -%}<|system|>Reasoning Effort: {{ effective_reasoning_effort | capitalize }}{%- endif -%}\n{%- if tools -%}\n{%- macro tool_to_json(tool) -%}\n    {%- set ns_tool = namespace(first=true) -%}\n    {{ '{' -}}\n    {%- for k, v in tool.items() -%}\n        {%- if k != 'defer_loading' and k != 'strict' -%}\n            {%- if not ns_tool.first -%}{{- ', ' -}}{%- endif -%}\n            {%- set ns_tool.first = false -%}\n            \"{{ k }}\": {{ v | tojson(ensure_ascii=False) }}\n        {%- endif -%}\n    {%- endfor -%}\n    {{- '}' -}}\n{%- endmacro -%}\n<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{% for tool in tools %}\n{%- if 'function' in tool -%}\n    {%- set tool = tool['function'] -%}\n{%- endif -%}\n{% if tool.defer_loading is not defined or not tool.defer_loading %}\n{{ tool_to_json(tool) }}\n{% endif %}\n{% endfor %}\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call>{%- endif -%}\n{%- macro visible_text(content) -%}\n    {%- if content is string -%}\n        {{- content }}\n    {%- elif content is iterable and content is not mapping -%}\n        {%- for item in content -%}\n            {%- if item is mapping and item.type == 'text' -%}\n                {{- item.text }}\n            {%- elif item is string -%}\n                {{- item }}\n            {%- elif item is mapping and item.type in ['image', 'image_url', 'video', 'video_url', 'audio', 'audio_url', 'input_audio'] -%}\n                {%- set media_type = item.type | replace('_url', '') | replace('input_', '') -%}\n                {{- \"<reminder>You are unable to process this \" ~ media_type ~ \" because you don't have multi-modal input ability. Try different methods.</reminder>\" }}\n            {%- endif -%}\n        {%- endfor -%}\n    {%- else -%}\n        {{- content }}\n    {%- endif -%}\n{%- endmacro -%}\n{%- set ns = namespace(last_user_index=-1) -%}\n{%- for m in messages %}\n    {%- if m.role == 'user' %}\n        {%- set ns.last_user_index = loop.index0 -%}\n    {%- endif %}\n{%- endfor %}\n{%- for m in messages -%}\n{%- if m.role == 'user' -%}<|user|>{{ visible_text(m.content) }}\n{%- elif m.role == 'assistant' -%}\n<|assistant|>\n{%- set content = visible_text(m.content) %}\n{%- if m.reasoning_content is string %}\n    {%- set reasoning_content = m.reasoning_content %}\n{%- elif '</think>' in content %}\n    {%- set reasoning_content = content.split('</think>')[0].split('<think>')[-1] %}\n    {%- set content = content.split('</think>')[-1] %}\n{%- endif %}\n{%- if ((clear_thinking is defined and not clear_thinking) or loop.index0 > ns.last_user_index) and reasoning_content is defined -%}\n{{ '<think>' + reasoning_content +  '</think>'}}\n{%- else -%}\n{{ '<think></think>' }}\n{%- endif -%}\n{%- if content.strip() -%}\n{{ content.strip() }}\n{%- endif -%}\n{% if m.tool_calls %}\n{% for tc in m.tool_calls %}\n{%- if tc.function %}\n    {%- set tc = tc.function %}\n{%- endif %}\n{{- '<tool_call>' + tc.name -}}\n{% set _args = tc.arguments %}{% for k, v in _args.items() %}<arg_key>{{ k }}</arg_key><arg_value>{{ v | tojson(ensure_ascii=False) if v is not string else v }}</arg_value>{% endfor %}</tool_call>{% endfor %}\n{% endif %}\n{%- elif m.role == 'tool' -%}\n{%- if loop.first or (messages[loop.index0 - 1].role != \"tool\") %}\n    {{- '<|observation|>' -}}\n{%- endif %}\n{%- if m.content is string -%}\n    {{- '<tool_response>' + m.content + '</tool_response>' -}}\n{%- elif m.content is iterable and m.content is not mapping and m.content and m.content.0.type == \"tool_reference\" -%}\n    {{- '<tool_response><tools>\\n' -}}\n    {% for tr in m.content %}\n        {%- for tool in tools -%}\n            {%- if 'function' in tool -%}\n                {%- set tool = tool['function'] -%}\n            {%- endif -%}\n            {%- if tool.name == tr.name -%}\n                {{- tool_to_json(tool) + '\\n' -}}\n            {%- endif -%}\n        {%- endfor -%}\n    {%- endfor -%}\n    {{- '</tools></tool_response>' -}}\n{%- elif m.content is iterable and m.content is not mapping and m.content and m.content.0 is mapping and m.content.0.output is defined -%}\n    {%- for tr in m.content -%}\n        {{- '<tool_response>' + tr.output + '</tool_response>' -}}\n    {%- endfor -%}\n{%- else -%}\n    {{- '<tool_response>' + visible_text(m.content) + '</tool_response>' -}}\n{% endif -%}\n{%- elif m.role == 'system' -%}\n<|system|>{{ visible_text(m.content) }}\n{%- endif -%}\n{%- endfor -%}\n{%- if add_generation_prompt -%}\n    <|assistant|>{{- '<think></think>' if (enable_thinking is defined and not enable_thinking) else '<think>' -}}\n{%- endif -%}\n",
+    "stop_token_ids": [
+      154820,
+      154827,
+      154829
+    ],
+    "stop": [
+      "<|endoftext|>"
+    ],
+    "tool_parser": "glm5",
+    "reasoning_start_tag": "<think>",
+    "reasoning_end_tag": "</think>",
+    "version": 2,
+    "virtualenv": {
+      "packages": [
+        "#transformers_dependencies# ; #engine# == \"Transformers\"",
+        "#mlx_dependencies# ; #engine# == \"MLX\"",
+        "#vllm_dependencies# ; #engine# == \"vllm\"",
+        "#sglang_dependencies# ; #engine# == \"sglang\"",
+        "#system_numpy# ; #engine# == \"vllm\"",
+        "#llama_cpp_dependencies# ; #engine# == \"llama.cpp\""
+      ]
+    },
+    "featured": false,
+    "updated_at": 1787308415
+  },
+  {
+    "model_name": "Ornith-1.5-397B",
+    "model_description": "Ornith-1.5-397B is a 397B-total Mixture-of-Experts multimodal model built on the Qwen3.5 MoE architecture (Qwen3_5MoeForConditionalGeneration), supporting text, image, and video understanding with reasoning and tool-use capabilities.",
+    "context_length": 262144,
+    "model_lang": [
+      "en",
+      "zh"
+    ],
+    "model_ability": [
+      "chat",
+      "vision",
+      "tools",
+      "reasoning",
+      "hybrid"
+    ],
+    "model_specs": [
+      {
+        "model_size_in_billions": 397,
+        "model_format": "pytorch",
+        "model_src": {
+          "modelscope": {
+            "model_id": "ornith-ai/Ornith-1.5-397B",
+            "quantizations": [
+              "none"
+            ]
+          }
+        }
+      }
+    ],
+    "version": 2,
+    "virtualenv": {
+      "packages": [
+        "sglang>=0.5.9 ; #engine# == \"sglang\"",
+        "qwen-vl-utils!=0.0.9 ; #engine# == \"sglang\"",
+        "transformers>=5.8.1 ; #engine# == \"Transformers\"",
+        "qwen-vl-utils!=0.0.9 ; #engine# == \"Transformers\"",
+        "qwen_omni_utils ; #engine# == \"vllm\"",
+        "#system_numpy# ; #engine# == \"vllm\"",
+        "vllm==0.21.0 ; #engine# == \"vllm\"",
+        "ninja ; #engine# == \"vllm\"",
+        "#llama_cpp_dependencies# ; #engine# == \"llama.cpp\""
+      ]
+    },
+    "architectures": [
+      "Qwen3_5MoeForConditionalGeneration"
+    ],
+    "chat_template": "{%- set image_count = namespace(value=0) %}\n{%- set video_count = namespace(value=0) %}\n{%- macro render_content(content, do_vision_count, is_system_content=false) %}\n    {%- if content is string %}\n        {{- content }}\n    {%- elif content is iterable and content is not mapping %}\n        {%- for item in content %}\n            {%- if 'image' in item or 'image_url' in item or item.type == 'image' %}\n                {%- if is_system_content %}\n                    {{- raise_exception('System message cannot contain images.') }}\n                {%- endif %}\n                {%- if do_vision_count %}\n                    {%- set image_count.value = image_count.value + 1 %}\n                {%- endif %}\n                {%- if add_vision_id %}\n                    {{- 'Picture ' ~ image_count.value ~ ': ' }}\n                {%- endif %}\n                {{- '<|vision_start|><|image_pad|><|vision_end|>' }}\n            {%- elif 'video' in item or item.type == 'video' %}\n                {%- if is_system_content %}\n                    {{- raise_exception('System message cannot contain videos.') }}\n                {%- endif %}\n                {%- if do_vision_count %}\n                    {%- set video_count.value = video_count.value + 1 %}\n                {%- endif %}\n                {%- if add_vision_id %}\n                    {{- 'Video ' ~ video_count.value ~ ': ' }}\n                {%- endif %}\n                {{- '<|vision_start|><|video_pad|><|vision_end|>' }}\n            {%- elif 'text' in item %}\n                {{- item.text }}\n            {%- else %}\n                {{- raise_exception('Unexpected item type in content.') }}\n            {%- endif %}\n        {%- endfor %}\n    {%- elif content is none or content is undefined %}\n        {{- '' }}\n    {%- else %}\n        {{- raise_exception('Unexpected content type.') }}\n    {%- endif %}\n{%- endmacro %}\n{%- if not messages %}\n    {{- raise_exception('No messages provided.') }}\n{%- endif %}\n{%- if tools and tools is iterable and tools is not mapping %}\n    {{- '<|im_start|>system\\n' }}\n    {{- \"# Tools\\n\\nYou have access to the following functions:\\n\\n<tools>\" }}\n    {%- for tool in tools %}\n        {{- \"\\n\" }}\n        {{- tool | tojson }}\n    {%- endfor %}\n    {{- \"\\n</tools>\" }}\n    {{- '\\n\\nIf you choose to call a function ONLY reply in the following format with NO suffix:\\n\\n<tool_call>\\n<function=example_function_name>\\n<parameter=example_parameter_1>\\nvalue_1\\n</parameter>\\n<parameter=example_parameter_2>\\nThis is the value for the second parameter\\nthat can span\\nmultiple lines\\n</parameter>\\n</function>\\n</tool_call>\\n\\n<IMPORTANT>\\nReminder:\\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\\n- Required parameters MUST be specified\\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\\n</IMPORTANT>' }}\n    {%- if messages[0].role == 'system' %}\n        {%- set content = render_content(messages[0].content, false, true)|trim %}\n        {%- if content %}\n            {{- '\\n\\n' + content }}\n        {%- endif %}\n    {%- endif %}\n    {{- '<|im_end|>\\n' }}\n{%- else %}\n    {%- if messages[0].role == 'system' %}\n        {%- set content = render_content(messages[0].content, false, true)|trim %}\n        {{- '<|im_start|>system\\n' + content + '<|im_end|>\\n' }}\n    {%- endif %}\n{%- endif %}\n{%- set ns = namespace(multi_step_tool=true, last_query_index=messages|length - 1) %}\n{%- for message in messages[::-1] %}\n    {%- set index = (messages|length - 1) - loop.index0 %}\n    {%- if ns.multi_step_tool and message.role == \"user\" %}\n        {%- set content = render_content(message.content, false)|trim %}\n        {%- if not(content.startswith('<tool_response>') and content.endswith('</tool_response>')) %}\n            {%- set ns.multi_step_tool = false %}\n            {%- set ns.last_query_index = index %}\n        {%- endif %}\n    {%- endif %}\n{%- endfor %}\n{%- if ns.multi_step_tool %}\n    {{- raise_exception('No user query found in messages.') }}\n{%- endif %}\n{%- for message in messages %}\n    {%- set content = render_content(message.content, true)|trim %}\n    {%- if message.role == \"system\" %}\n        {%- if not loop.first %}\n            {{- raise_exception('System message must be at the beginning.') }}\n        {%- endif %}\n    {%- elif message.role == \"user\" %}\n        {{- '<|im_start|>' + message.role + '\\n' + content + '<|im_end|>' + '\\n' }}\n    {%- elif message.role == \"assistant\" %}\n        {%- set reasoning_content = '' %}\n        {%- if message.reasoning_content is string %}\n            {%- set reasoning_content = message.reasoning_content %}\n        {%- else %}\n            {%- if '</think>' in content %}\n                {%- set reasoning_content = content.split('</think>')[0].rstrip('\\n').split('<think>')[-1].lstrip('\\n') %}\n                {%- set content = content.split('</think>')[-1].lstrip('\\n') %}\n            {%- endif %}\n        {%- endif %}\n        {%- set reasoning_content = reasoning_content|trim %}\n        {%- if loop.index0 > ns.last_query_index %}\n            {{- '<|im_start|>' + message.role + '\\n<think>\\n' + reasoning_content + '\\n</think>\\n\\n' + content }}\n        {%- else %}\n            {{- '<|im_start|>' + message.role + '\\n' + content }}\n        {%- endif %}\n        {%- if message.tool_calls and message.tool_calls is iterable and message.tool_calls is not mapping %}\n            {%- for tool_call in message.tool_calls %}\n                {%- if tool_call.function is defined %}\n                    {%- set tool_call = tool_call.function %}\n                {%- endif %}\n                {%- if loop.first %}\n                    {%- if content|trim %}\n                        {{- '\\n\\n<tool_call>\\n<function=' + tool_call.name + '>\\n' }}\n                    {%- else %}\n                        {{- '<tool_call>\\n<function=' + tool_call.name + '>\\n' }}\n                    {%- endif %}\n                {%- else %}\n                    {{- '\\n<tool_call>\\n<function=' + tool_call.name + '>\\n' }}\n                {%- endif %}\n                {%- if tool_call.arguments is defined %}\n                    {%- for args_name, args_value in tool_call.arguments|items %}\n                        {{- '<parameter=' + args_name + '>\\n' }}\n                        {%- set args_value = args_value | tojson | safe if args_value is mapping or (args_value is sequence and args_value is not string) else args_value | string %}\n                        {{- args_value }}\n                        {{- '\\n</parameter>\\n' }}\n                    {%- endfor %}\n                {%- endif %}\n                {{- '</function>\\n</tool_call>' }}\n            {%- endfor %}\n        {%- endif %}\n        {{- '<|im_end|>\\n' }}\n    {%- elif message.role == \"tool\" %}\n        {%- if loop.previtem and loop.previtem.role != \"tool\" %}\n            {{- '<|im_start|>user' }}\n        {%- endif %}\n        {{- '\\n<tool_response>\\n' }}\n        {{- content }}\n        {{- '\\n</tool_response>' }}\n        {%- if not loop.last and loop.nextitem.role != \"tool\" %}\n            {{- '<|im_end|>\\n' }}\n        {%- elif loop.last %}\n            {{- '<|im_end|>\\n' }}\n        {%- endif %}\n    {%- else %}\n        {{- raise_exception('Unexpected message role.') }}\n    {%- endif %}\n{%- endfor %}\n{%- if add_generation_prompt %}\n    {{- '<|im_start|>assistant\\n' }}\n    {%- if enable_thinking is defined and enable_thinking is false %}\n        {{- '<think>\\n\\n</think>\\n\\n' }}\n    {%- else %}\n        {{- '<think>\\n' }}\n    {%- endif %}\n{%- endif %}",
+    "stop_token_ids": [
+      248044,
+      248046
+    ],
+    "reasoning_start_tag": "<think>",
+    "reasoning_end_tag": "</think>",
+    "stop": [
+      "<|endoftext|>",
+      "<|im_end|>"
+    ],
+    "tool_parser": "qwen",
+    "featured": false,
+    "updated_at": 1787303700
   }
 ]

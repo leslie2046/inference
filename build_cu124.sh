@@ -9,12 +9,12 @@ fi
 version=$1
 shift
 
-image_repository=${IMAGE_REPOSITORY:-leslie2046/xinference}
+image_repository=${IMAGE_REPOSITORY:-localhost:6000/leslie2046/xinference}
 image="${image_repository}:${version}-cu124"
 # Keep a rolling tag so inline layer metadata can be reused across versions.
 cache_image=${CACHE_IMAGE:-${image_repository}:buildcache-cu124}
 # An explicitly empty PROXY_URL disables the private-network default.
-proxy_url=${PROXY_URL-http://192.168.0.188:21026}
+#proxy_url=${PROXY_URL-http://192.168.0.188:21026}
 
 build_args=(
   --progress=plain
@@ -27,12 +27,12 @@ build_args=(
   --file xinference/deploy/docker/Dockerfile.cu124
 )
 
-if [[ -n "$proxy_url" ]]; then
-  build_args+=(
-    --build-arg "http_proxy=$proxy_url"
-    --build-arg "https_proxy=$proxy_url"
-  )
-fi
+#if [[ -n "$proxy_url" ]]; then
+#  build_args+=(
+#    --build-arg "http_proxy=$proxy_url"
+#    --build-arg "https_proxy=$proxy_url"
+#  )
+#fi
 
 if [[ -n "${PIP_INDEX:-}" ]]; then
   build_args+=(--build-arg "PIP_INDEX=$PIP_INDEX")

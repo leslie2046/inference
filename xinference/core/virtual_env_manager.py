@@ -12,14 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import logging
 import os
 import re
 import shutil
 import subprocess
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
-from ..constants import XINFERENCE_VIRTUAL_ENV_DIR
+from ..constants import (
+    XINFERENCE_VIRTUAL_ENV_DIR,
+    XINFERENCE_VIRTUAL_ENV_FIND_LINKS_ALLOWED_ROOTS,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1034,10 +1039,442 @@ def ensure_sglang_inherited_packages_compatible_post_install(
         )
 
 
+def _as_uv_option_values(value: Any) -> List[str]:
+    if not value:
+        return []
+    return [value] if isinstance(value, str) else list(value)
+
+
+def build_uv_source_options(
+    conf: Dict[str, Any],
+    *,
+    public_index_urls: Optional[List[str]] = None,
+    allow_public_install: bool = True,
+) -> List[str]:
+    """Build uv source options from the virtualenv install configuration.
+
+    Post-install hooks invoke ``uv`` directly, so they must explicitly reuse the
+    same package sources as the main virtualenv installation. Administrator-
+    supplied public indexes are appended as fallbacks only when public installs
+    are allowed.
+    """
+    options: List[str] = []
+    index_url = conf.get("index_url")
+    extra_index_urls = _as_uv_option_values(conf.get("extra_index_url"))
+
+    # uv gives every --index / --extra-index-url entry higher priority than
+    # --default-index / --index-url. Keep the configured sources in their
+    # original effective order (extra indexes before index_url), then place the
+    # hook-specific public indexes after all of them. The final public index is
+    # the default index so it is a true lowest-priority fallback.
+    configured_index_urls = [*extra_index_urls]
+    if index_url:
+        configured_index_urls.append(index_url)
+    configured_url_set = set(configured_index_urls)
+    public_fallback_urls = (
+        [
+            url
+            for url in (public_index_urls or [])
+            if url and url not in configured_url_set
+        ]
+        if allow_public_install
+        else []
+    )
+
+    default_index_url: Optional[str]
+    if public_fallback_urls:
+        priority_index_urls = configured_index_urls + public_fallback_urls[:-1]
+        default_index_url = public_fallback_urls[-1]
+    elif not allow_public_install and configured_index_urls:
+        # Avoid uv's implicit PyPI default during a configured-source-only
+        # attempt. Keep the final configured URL as the explicit default while
+        # preserving the effective priority of the preceding URLs.
+        priority_index_urls = configured_index_urls[:-1]
+        default_index_url = configured_index_urls[-1]
+    else:
+        # Preserve uv's existing configured-source semantics when no public
+        # fallback is added: extra_index_url entries outrank index_url.
+        priority_index_urls = extra_index_urls
+        default_index_url = index_url
+
+    for url in priority_index_urls:
+        options += ["--index", url]
+    if default_index_url:
+        options += ["--default-index", default_index_url]
+
+    find_links = _as_uv_option_values(conf.get("find_links"))
+    for link in find_links:
+        options += ["--find-links", link]
+    # ``--find-links`` supplements registry indexes; it does not disable uv's
+    # implicit default index. A configured-source-only attempt must therefore
+    # opt out explicitly when find-links is the only configured source.
+    if not allow_public_install and find_links and not configured_index_urls:
+        options.append("--no-index")
+    for host in _as_uv_option_values(conf.get("trusted_host")):
+        options += ["--trusted-host", host]
+
+    # ``unsafe-best-match`` queries every index even after a configured source
+    # provides the pinned package. An unavailable hook-specific public fallback
+    # would therefore still fail the whole install. Use first-index semantics
+    # whenever a public fallback is appended so configured sources remain
+    # authoritative; otherwise preserve the caller's existing strategy.
+    index_strategy = (
+        "first-index"
+        if configured_index_urls and public_fallback_urls
+        else conf.get("index_strategy")
+    )
+    if index_strategy:
+        options += ["--index-strategy", index_strategy]
+    return options
+
+
+def is_flash_attn_requirement(spec: str) -> bool:
+    """Return whether *spec* targets the flash-attn distribution."""
+    from packaging.requirements import InvalidRequirement, Requirement
+    from packaging.utils import canonicalize_name
+
+    try:
+        requirement = Requirement(spec)
+    except InvalidRequirement:
+        return False
+    return canonicalize_name(requirement.name) == "flash-attn"
+
+
+_SUBPROCESS_OUTPUT_LIMIT = 2048
+
+
+def _format_subprocess_output(output: Any) -> str:
+    """Prepare bounded subprocess output for logs and user-facing errors."""
+    if not isinstance(output, str) or not output:
+        return "<empty>"
+
+    sanitized = output.strip()
+    sanitized = re.sub(r"(?i)([a-z][a-z0-9+.-]*://)[^/@\s]+@", r"\1***@", sanitized)
+    sanitized = re.sub(
+        r"(?i)\b(password|passwd|token|api[-_]?key|access[-_]?key)=" r"([^&\s]+)",
+        r"\1=***",
+        sanitized,
+    )
+    sanitized = re.sub(r"(?i)(\bBearer\s+)[^\s,;]+", r"\1***", sanitized)
+    sanitized = sanitized.replace("\r", "\\r").replace("\n", "\\n")
+    if len(sanitized) > _SUBPROCESS_OUTPUT_LIMIT:
+        sanitized = sanitized[:_SUBPROCESS_OUTPUT_LIMIT] + "...<truncated>"
+    return sanitized or "<empty>"
+
+
+def _validate_flash_attn_install(
+    virtual_env_manager: Any, flash_attn_packages: List[str]
+) -> bool:
+    """Validate flash-attn metadata and CUDA imports in a fresh venv process."""
+    from packaging.requirements import InvalidRequirement, Requirement
+
+    python_path = resolve_virtualenv_python_path(virtual_env_manager)
+    if not python_path:
+        logger.warning("flash-attn validation has no virtualenv Python")
+        return False
+
+    validation_script = """
+import importlib.metadata as metadata
+import json
+import pathlib
+import sys
+
+prefix = pathlib.Path(sys.prefix).resolve()
+distribution = metadata.distribution("flash-attn")
+distribution_path = pathlib.Path(distribution.locate_file("")).resolve()
+if prefix != distribution_path and prefix not in distribution_path.parents:
+    raise RuntimeError(
+        f"flash-attn distribution resolved outside the model virtualenv: "
+        f"{distribution_path}"
+    )
+
+import flash_attn
+from flash_attn import flash_attn_func
+
+module_path = pathlib.Path(flash_attn.__file__).resolve()
+if prefix != module_path and prefix not in module_path.parents:
+    raise RuntimeError(
+        f"flash_attn module resolved outside the model virtualenv: {module_path}"
+    )
+if not callable(flash_attn_func):
+    raise RuntimeError("flash_attn.flash_attn_func is not callable")
+
+print(json.dumps({"version": distribution.version}, sort_keys=True))
+"""
+    env = os.environ.copy()
+    for variable in ("VIRTUAL_ENV", "PYTHONPATH", "PYTHONHOME"):
+        env.pop(variable, None)
+    try:
+        result = subprocess.run(
+            [python_path, "-c", validation_script],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+    except OSError:
+        logger.warning("flash-attn validation process could not be started")
+        return False
+    if result.returncode != 0:
+        logger.warning(
+            "flash-attn validation failed in %s with exit code %s. "
+            "stdout=%r, stderr=%r",
+            virtual_env_manager.env_path,
+            result.returncode,
+            _format_subprocess_output(result.stdout),
+            _format_subprocess_output(result.stderr),
+        )
+        return False
+
+    try:
+        payload = json.loads(result.stdout.strip().splitlines()[-1])
+        installed_version = str(payload["version"])
+    except (IndexError, KeyError, TypeError, ValueError):
+        logger.warning(
+            "flash-attn validation returned invalid metadata in %s",
+            virtual_env_manager.env_path,
+        )
+        return False
+
+    for spec in flash_attn_packages:
+        try:
+            requirement = Requirement(spec)
+        except InvalidRequirement:
+            logger.warning("Invalid flash-attn requirement during validation: %s", spec)
+            return False
+        if requirement.specifier and not requirement.specifier.contains(
+            installed_version, prereleases=True
+        ):
+            logger.warning(
+                "Installed flash-attn %s does not satisfy %s",
+                installed_version,
+                spec,
+            )
+            return False
+
+    logger.info(
+        "flash-attn %s import and version validation succeeded in %s",
+        installed_version,
+        virtual_env_manager.env_path,
+    )
+    return True
+
+
+def apply_flash_attn_wheel_post_install(
+    model_name: Optional[str],
+    flash_attn_packages: List[str],
+    virtual_env_manager: Any,
+    conf: Dict[str, Any],
+    cuda_available: bool,
+) -> None:
+    """Install Jina's flash-attn requirement from configured Wheel sources."""
+    if (
+        model_name != "jina-embeddings-v3"
+        or not cuda_available
+        or not flash_attn_packages
+    ):
+        return
+
+    python_path = resolve_virtualenv_python_path(virtual_env_manager)
+    if not python_path:
+        raise RuntimeError("flash-attn post-install has no virtualenv Python")
+
+    if not conf.get("find_links"):
+        if not _validate_flash_attn_install(virtual_env_manager, flash_attn_packages):
+            logger.warning(
+                "flash-attn is not installed or invalid for %s, and no Find "
+                "Links source was configured. The model will use PyTorch "
+                "native attention (higher GPU memory usage).",
+                model_name,
+            )
+        return
+
+    uv_path = None
+    if hasattr(virtual_env_manager, "_get_uv_path"):
+        try:
+            uv_path = virtual_env_manager._get_uv_path()
+        except Exception:
+            pass
+    if not uv_path:
+        uv_path = shutil.which("uv") or "uv"
+
+    command = [
+        uv_path,
+        "pip",
+        "install",
+        "--python",
+        python_path,
+        "--no-deps",
+        "--reinstall",
+        "--only-binary=:all:",
+        *build_uv_source_options(conf),
+        *flash_attn_packages,
+    ]
+    try:
+        result = subprocess.run(command, check=False, capture_output=True, text=True)
+    except OSError as exc:
+        raise RuntimeError(
+            "flash-attn Wheel installation could not be started"
+        ) from exc
+    if result.returncode != 0:
+        stdout = _format_subprocess_output(result.stdout)
+        stderr = _format_subprocess_output(result.stderr)
+        logger.error(
+            "flash-attn Wheel installation failed for %s with exit code %s. "
+            "stdout=%r, stderr=%r",
+            flash_attn_packages,
+            result.returncode,
+            stdout,
+            stderr,
+        )
+        raise RuntimeError(
+            f"flash-attn Wheel installation failed for {flash_attn_packages} "
+            f"with exit code {result.returncode}. stdout={stdout!r}, stderr={stderr!r}"
+        )
+
+    if not _validate_flash_attn_install(virtual_env_manager, flash_attn_packages):
+        raise RuntimeError(
+            "flash-attn Wheel installation completed, but fresh-process "
+            "version/path/CUDA import validation failed."
+        )
+
+
+def validate_virtual_env_find_links(
+    find_links: Optional[List[str]],
+    allowed_roots: Optional[tuple[str, ...]] = None,
+) -> List[str]:
+    """Validate request-level local wheel directories on the worker."""
+    if find_links is None:
+        return []
+    if not isinstance(find_links, list):
+        raise ValueError("virtual_env_find_links must be a list of local paths")
+
+    roots = (
+        XINFERENCE_VIRTUAL_ENV_FIND_LINKS_ALLOWED_ROOTS
+        if allowed_roots is None
+        else tuple(os.path.realpath(root) for root in allowed_roots)
+    )
+    if not roots:
+        raise ValueError(
+            "Request-level virtualenv find-links are disabled on this worker"
+        )
+
+    result: List[str] = []
+    seen = set()
+    for raw_path in find_links:
+        if not isinstance(raw_path, str):
+            raise ValueError("virtual_env_find_links entries must be strings")
+        path = raw_path.strip()
+        if not path:
+            continue
+        if re.match(r"^[A-Za-z][A-Za-z0-9+.-]*://", path):
+            raise ValueError(
+                "virtual_env_find_links only accepts absolute local directories"
+            )
+        if not os.path.isabs(path):
+            raise ValueError(f"virtual_env_find_links path must be absolute: {path!r}")
+        try:
+            canonical_path = str(Path(path).resolve(strict=True))
+        except (OSError, RuntimeError) as exc:
+            raise ValueError(
+                f"virtual_env_find_links path does not exist: {path!r}"
+            ) from exc
+        if not os.path.isdir(canonical_path):
+            raise ValueError(
+                f"virtual_env_find_links path is not a directory: {path!r}"
+            )
+        if not os.access(canonical_path, os.R_OK | os.X_OK):
+            raise ValueError(f"virtual_env_find_links path is not readable: {path!r}")
+
+        contained = False
+        for root in roots:
+            try:
+                contained = os.path.normcase(
+                    os.path.commonpath([canonical_path, root])
+                ) == os.path.normcase(root)
+            except ValueError:
+                contained = False
+            if contained:
+                break
+        if not contained:
+            raise ValueError(
+                f"virtual_env_find_links path is outside the configured allowed roots: {path!r}"
+            )
+
+        key = os.path.normcase(canonical_path)
+        if key not in seen:
+            seen.add(key)
+            result.append(canonical_path)
+    return result
+
+
+def merge_virtual_env_find_links(
+    configured: Optional[Union[str, List[str]]], requested: List[str]
+) -> Optional[List[str]]:
+    values = _as_uv_option_values(configured) + requested
+    if not values:
+        return None
+    return list(dict.fromkeys(values))
+
+
+def _has_configured_package_source(conf: Dict[str, Any]) -> bool:
+    return any(conf.get(key) for key in ("index_url", "extra_index_url", "find_links"))
+
+
+def _run_uv_install_with_source_fallback(
+    base_cmd: List[str],
+    packages: List[str],
+    conf: Dict[str, Any],
+    *,
+    public_index_urls: Optional[List[str]] = None,
+    allow_public_install: bool = True,
+) -> subprocess.CompletedProcess:
+    """Run uv with configured sources before consulting public fallbacks."""
+    source_conf = conf
+    if (
+        allow_public_install
+        and public_index_urls
+        and _has_configured_package_source(conf)
+    ):
+        configured_cmd = base_cmd + build_uv_source_options(
+            conf, allow_public_install=False
+        )
+        result = subprocess.run(
+            configured_cmd + packages,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            return result
+        logger.info(
+            "Post-install requirements were not satisfied by configured package "
+            "sources; retrying with the allowed public fallback"
+        )
+        # Retry against the hook-specific fallback independently. With uv's
+        # first-index semantics, retaining a configured index that contains the
+        # project at a different version would prevent the fallback from ever
+        # being considered.
+        source_conf = {}
+
+    cmd = base_cmd + build_uv_source_options(
+        source_conf,
+        public_index_urls=public_index_urls,
+        allow_public_install=allow_public_install,
+    )
+    return subprocess.run(
+        cmd + packages,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+
 def ensure_flashinfer_cubin_matches_post_install(
     model_engine: Optional[str],
     virtual_env_manager: Any,
     allow_public_install: bool = True,
+    conf: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Keep FlashInfer's Python package and cubin package on the same version.
 
@@ -1072,7 +1509,8 @@ def ensure_flashinfer_cubin_matches_post_install(
         cubin_version or "not installed",
     )
 
-    if allow_public_install:
+    conf = conf or {}
+    if allow_public_install or _has_configured_package_source(conf):
         uv_path = None
         if hasattr(virtual_env_manager, "_get_uv_path"):
             try:
@@ -1090,12 +1528,15 @@ def ensure_flashinfer_cubin_matches_post_install(
             str(virtual_env_manager.env_path),
             "--no-deps",
             "--upgrade",
-            "--index-url",
-            FLASHINFER_CUBIN_WHEEL_URL,
-            f"flashinfer-cubin=={python_version}",
         ]
         try:
-            result = subprocess.run(cmd, check=False, capture_output=True, text=True)
+            result = _run_uv_install_with_source_fallback(
+                cmd,
+                [f"flashinfer-cubin=={python_version}"],
+                conf,
+                public_index_urls=[FLASHINFER_CUBIN_WHEEL_URL],
+                allow_public_install=allow_public_install,
+            )
             if result.returncode == 0:
                 repaired_version = _get_virtualenv_distribution_version(
                     virtual_env_manager, "flashinfer-cubin"
@@ -1152,6 +1593,7 @@ def apply_flashinfer_aot_post_install(
     virtual_env_manager: Any,
     conf: Dict[str, Any],
     cuda_version: Optional[str] = None,
+    allow_public_install: bool = True,
 ) -> None:
     """Post-install hook: force-upgrade flashinfer to AOT versions for sm_120.
 
@@ -1178,14 +1620,12 @@ def apply_flashinfer_aot_post_install(
         list(architectures or []),
     )
 
-    extra_urls = conf.get("extra_index_url") or []
-    if isinstance(extra_urls, str):
-        extra_urls = [extra_urls]
-    extra_urls = (
-        list(extra_urls) + [FLASHINFER_AOT_WHEEL_URL]
-        if extra_urls
-        else [FLASHINFER_AOT_WHEEL_URL]
-    )
+    if not allow_public_install and not _has_configured_package_source(conf):
+        logger.info(
+            "Skipping the FlashInfer AOT post-install because public installs "
+            "are disabled and no package source is configured"
+        )
+        return
 
     # Resolve uv path with a fallback. ``_get_uv_path`` is a private method
     # on xoscar's VirtualEnvManager and could be renamed/removed in future
@@ -1209,12 +1649,14 @@ def apply_flashinfer_aot_post_install(
         "--upgrade",
         "--color=always",
     ]
-    for url in extra_urls:
-        cmd += ["--extra-index-url", url]
-    cmd += FLASHINFER_AOT_PACKAGES
-
     try:
-        result = subprocess.run(cmd, check=False, capture_output=True, text=True)
+        result = _run_uv_install_with_source_fallback(
+            cmd,
+            FLASHINFER_AOT_PACKAGES,
+            conf,
+            public_index_urls=[FLASHINFER_AOT_WHEEL_URL],
+            allow_public_install=allow_public_install,
+        )
         if result.returncode == 0:
             logger.info(
                 "Post-install: flashinfer AOT upgrade SUCCEEDED — "

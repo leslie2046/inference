@@ -6,7 +6,14 @@ import { useGlobal } from '@/contexts/global-context';
 import { useMenuAuth } from '@/hooks/use-menu-auth';
 
 interface PermissionGuardProps {
-  scope: 'monitor:view' | 'logs:list' | 'models:register';
+  scope:
+    | 'monitor:view'
+    | 'logs:list'
+    | 'models:register'
+    | 'routers:list'
+    | 'routers:read'
+    | 'routers:write'
+    | 'routers:operate';
   children: React.ReactNode;
 }
 
@@ -27,6 +34,17 @@ export function PermissionGuard({ scope, children }: PermissionGuardProps) {
     );
   }
 
+  const isRouterScope = scope.startsWith('routers:');
+  if (isRouterScope && clusterUIConfig?.token_router_enabled === false) {
+    return (
+      <div className="flex min-h-[60vh] flex-col items-center justify-center gap-4 text-muted-foreground">
+        <ShieldAlert className="h-16 w-16" />
+        <h2 className="text-xl font-semibold">{t('tokenRouter.featureDisabled')}</h2>
+        <p className="text-sm">{t('tokenRouter.featureDisabledDescription')}</p>
+      </div>
+    );
+  }
+
   // When auth_advanced is disabled, all pages are accessible
   if (!clusterUIConfig?.auth_advanced) {
     return <>{children}</>;
@@ -41,6 +59,10 @@ export function PermissionGuard({ scope, children }: PermissionGuardProps) {
     'monitor:view': auth.hasMonitorView,
     'logs:list': auth.hasLogsList,
     'models:register': auth.canRegisterModel,
+    'routers:list': auth.hasRouterList,
+    'routers:read': auth.hasRouterRead,
+    'routers:write': auth.canWriteRouters,
+    'routers:operate': auth.canOperateRouters,
   };
 
   if (scopeMap[scope]) {

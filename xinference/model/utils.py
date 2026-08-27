@@ -21,12 +21,14 @@ import math
 import os
 import random
 import re
+import stat
 import sys
 import threading
 from abc import ABC, abstractmethod
 from contextvars import ContextVar
 from copy import deepcopy
 from json import JSONDecodeError
+from numbers import Integral
 from pathlib import Path
 from typing import (
     TYPE_CHECKING,
@@ -63,6 +65,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 IS_NEW_HUGGINGFACE_HUB: bool = huggingface_hub.__version__ >= "0.23.0"
+CACHE_SOURCE_MANIFEST = "__cache_source_paths.json"
+_CACHE_SOURCE_MANIFEST_LOCK = threading.Lock()
 _ENGINE_MARKER_RE = re.compile(
     r"#(?:engine|model_engine)#\s*==\s*[\"']([^\"']+)[\"']",
     re.IGNORECASE,
@@ -798,11 +802,101 @@ def download_from_csghub() -> bool:
     return False
 
 
+def get_cache_source_paths(cache_dir: str) -> Set[str]:
+    """Return canonical source files recorded for a Xinference cache."""
+    manifest_path = os.path.join(cache_dir, CACHE_SOURCE_MANIFEST)
+    try:
+        manifest_stat = os.lstat(manifest_path)
+        if not stat.S_ISREG(manifest_stat.st_mode):
+            logger.warning(
+                "Ignoring non-regular cache source manifest: %s", manifest_path
+            )
+            return set()
+
+        open_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        manifest_fd = os.open(manifest_path, open_flags)
+        with os.fdopen(manifest_fd, "r", encoding="utf-8") as manifest_file:
+            opened_stat = os.fstat(manifest_file.fileno())
+            if not stat.S_ISREG(opened_stat.st_mode) or (
+                opened_stat.st_dev,
+                opened_stat.st_ino,
+            ) != (manifest_stat.st_dev, manifest_stat.st_ino):
+                logger.warning(
+                    "Ignoring replaced cache source manifest: %s", manifest_path
+                )
+                return set()
+            manifest = json.load(manifest_file)
+    except FileNotFoundError:
+        return set()
+    except (JSONDecodeError, OSError, TypeError, ValueError) as exc:
+        logger.warning(
+            "Failed to read cache source manifest %s: %s", manifest_path, exc
+        )
+        return set()
+
+    if not isinstance(manifest, dict) or manifest.get("version") != 1:
+        logger.warning("Invalid cache source manifest: %s", manifest_path)
+        return set()
+
+    source_paths = manifest.get("source_paths")
+    if not isinstance(source_paths, list):
+        logger.warning("Invalid cache source manifest: %s", manifest_path)
+        return set()
+
+    return {
+        os.path.realpath(source_path)
+        for source_path in source_paths
+        if isinstance(source_path, str) and os.path.isabs(source_path)
+    }
+
+
+def _record_cache_source_path(cache_dir: str, source_path: str) -> None:
+    """Atomically retain source provenance for symlink-to-copy fallbacks."""
+    cache_dir = os.path.abspath(cache_dir)
+    source_path = os.path.realpath(source_path)
+    try:
+        if os.path.commonpath([source_path, cache_dir]) == cache_dir:
+            # Helpers such as ``merge_cached_files`` may link one cache file to
+            # another. The cache directory already owns both paths.
+            return
+    except ValueError:
+        # Different Windows drives cannot share a common path.
+        pass
+
+    manifest_path = os.path.join(cache_dir, CACHE_SOURCE_MANIFEST)
+    with _CACHE_SOURCE_MANIFEST_LOCK:
+        source_paths = get_cache_source_paths(cache_dir)
+        if source_path in source_paths:
+            return
+        source_paths.add(source_path)
+
+        os.makedirs(cache_dir, exist_ok=True)
+        temp_path = f"{manifest_path}.{os.getpid()}.{threading.get_ident()}.tmp"
+        try:
+            with open(temp_path, "w", encoding="utf-8") as manifest_file:
+                json.dump(
+                    {"version": 1, "source_paths": sorted(source_paths)},
+                    manifest_file,
+                )
+            os.replace(temp_path, manifest_path)
+        finally:
+            try:
+                os.remove(temp_path)
+            except FileNotFoundError:
+                pass
+
+
 def symlink_local_file(path: str, local_dir: str, relpath: str) -> str:
     from huggingface_hub.file_download import _create_symlink
 
     # cross-platform transcription of filename, to be used as a local file path.
     relative_filename = os.path.join(*relpath.split("/"))
+    if os.path.normcase(os.path.normpath(relative_filename)) == os.path.normcase(
+        CACHE_SOURCE_MANIFEST
+    ):
+        raise ValueError(
+            f"Cannot use reserved cache metadata filename: {CACHE_SOURCE_MANIFEST}"
+        )
     if os.name == "nt":
         if relative_filename.startswith("..\\") or "\\..\\" in relative_filename:
             raise ValueError(
@@ -823,6 +917,8 @@ def symlink_local_file(path: str, local_dir: str, relpath: str) -> str:
     os.makedirs(os.path.dirname(local_dir_filepath), exist_ok=True)
     real_blob_path = os.path.realpath(path)
     _create_symlink(real_blob_path, local_dir_filepath, new_blob=False)
+    if not os.path.islink(local_dir_filepath):
+        _record_cache_source_path(local_dir, real_blob_path)
     return local_dir_filepath
 
 
@@ -830,6 +926,14 @@ def create_symlink(download_dir: str, cache_dir: str):
     for subdir, dirs, files in os.walk(download_dir):
         for file in files:
             relpath = os.path.relpath(os.path.join(subdir, file), download_dir)
+            if os.path.normcase(os.path.normpath(relpath)) == os.path.normcase(
+                CACHE_SOURCE_MANIFEST
+            ):
+                logger.warning(
+                    "Ignoring downloaded file with reserved cache metadata name: %s",
+                    os.path.join(subdir, file),
+                )
+                continue
             symlink_local_file(os.path.join(subdir, file), cache_dir, relpath)
 
 
@@ -1029,6 +1133,24 @@ def set_all_random_seed(seed: int):
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
+
+MAX_MEDIA_SEED = 2**31 - 1
+
+
+def resolve_media_seed(seed: Any) -> Optional[int]:
+    """Validate a media seed and replace -1 with a fresh random value."""
+    if seed is None:
+        return None
+    if isinstance(seed, bool) or not isinstance(seed, Integral):
+        raise ValueError("Seed must be an integer")
+
+    value = int(seed)
+    if value == -1:
+        return random.SystemRandom().randrange(MAX_MEDIA_SEED + 1)
+    if value < 0 or value > MAX_MEDIA_SEED:
+        raise ValueError(f"Seed must be -1 or between 0 and {MAX_MEDIA_SEED}")
+    return value
 
 
 _cancellable_downloaders_var: ContextVar[Tuple["CancellableDownloader", ...]] = (

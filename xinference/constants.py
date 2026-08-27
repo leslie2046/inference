@@ -12,8 +12,54 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
+import math
 import os
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+
+def parse_env_bool(name: str, default: bool) -> bool:
+    """Parse a boolean environment variable without accepting ambiguous values."""
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    normalized = raw.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(
+        f"{name} must be one of true/false, 1/0, yes/no, or on/off; got {raw!r}"
+    )
+
+
+def parse_env_float(name: str, default: float) -> float:
+    """Parse a finite float environment variable with a safe fallback."""
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = float(raw)
+    except (TypeError, ValueError, OverflowError):
+        logger.warning(
+            "Environment variable %s is invalid (got %r); using default %s",
+            name,
+            raw,
+            default,
+        )
+        return default
+    if not math.isfinite(value):
+        logger.warning(
+            "Environment variable %s must be finite (got %r); using default %s",
+            name,
+            raw,
+            default,
+        )
+        return default
+    return value
+
 
 XINFERENCE_ENV_ENDPOINT = "XINFERENCE_ENDPOINT"
 XINFERENCE_ENV_MODEL_SRC = "XINFERENCE_MODEL_SRC"
@@ -43,6 +89,9 @@ XINFERENCE_ENV_TEXT_TO_IMAGE_BATCHING_SIZE = "XINFERENCE_TEXT_TO_IMAGE_BATCHING_
 XINFERENCE_ENV_VIRTUAL_ENV = "XINFERENCE_ENABLE_VIRTUAL_ENV"
 XINFERENCE_ENV_VIRTUAL_ENV_SKIP_INSTALLED = "XINFERENCE_VIRTUAL_ENV_SKIP_INSTALLED"
 XINFERENCE_ENV_VIRTUAL_ENV_OFFLINE_INSTALL = "XINFERENCE_VIRTUAL_ENV_OFFLINE_INSTALL"
+XINFERENCE_ENV_VIRTUAL_ENV_FIND_LINKS_ALLOWED_ROOTS = (
+    "XINFERENCE_VIRTUAL_ENV_FIND_LINKS_ALLOWED_ROOTS"
+)
 XINFERENCE_ENV_SSE_PING_ATTEMPTS_SECONDS = "XINFERENCE_SSE_PING_ATTEMPTS_SECONDS"
 XINFERENCE_ENV_MAX_TOKENS = "XINFERENCE_MAX_TOKENS"
 XINFERENCE_ENV_ALLOWED_IPS = "XINFERENCE_ALLOWED_IPS"
@@ -68,6 +117,18 @@ XINFERENCE_ENV_OTEL_MAX_EXPORT_BATCH_SIZE = "XINFERENCE_OTEL_MAX_EXPORT_BATCH_SI
 XINFERENCE_ENV_OTEL_METRIC_EXPORT_INTERVAL = "XINFERENCE_OTEL_METRIC_EXPORT_INTERVAL"
 XINFERENCE_ENV_OTEL_BATCH_EXPORT_TIMEOUT = "XINFERENCE_OTEL_BATCH_EXPORT_TIMEOUT"
 XINFERENCE_ENV_OTEL_METRIC_EXPORT_TIMEOUT = "XINFERENCE_OTEL_METRIC_EXPORT_TIMEOUT"
+
+
+def _parse_virtual_env_find_links_allowed_roots(
+    raw_value: str | None, xinference_home: str
+) -> tuple[str, ...]:
+    if raw_value is None:
+        raw_value = os.path.join(xinference_home, "wheels")
+    return tuple(
+        os.path.realpath(root.strip())
+        for root in raw_value.split(os.pathsep)
+        if root.strip()
+    )
 
 
 def get_xinference_home() -> str:
@@ -227,16 +288,35 @@ XINFERENCE_MONITOR_CONFIG_DB_PATH = os.environ.get(
     os.path.join(XINFERENCE_HOME, "monitor_config.db"),
 )
 
-XINFERENCE_TOKEN_ROUTER_ENABLED = os.environ.get(
-    "XINFERENCE_TOKEN_ROUTER_ENABLED", "false"
-).lower() in {"1", "true", "yes", "on"}
+XINFERENCE_TOKEN_ROUTER_ENABLED = parse_env_bool(
+    "XINFERENCE_TOKEN_ROUTER_ENABLED", True
+)
+
+XINFERENCE_TOKENIZER_ASSET_CONFIG = os.environ.get(
+    "XINFERENCE_TOKENIZER_ASSET_CONFIG", ""
+)
 
 XINFERENCE_TOKEN_ROUTER_DB_PATH = os.environ.get(
     "XINFERENCE_TOKEN_ROUTER_DB_PATH",
     os.path.join(XINFERENCE_HOME, "token_routers.db"),
 )
-XINFERENCE_TOKEN_ROUTER_HEARTBEAT_TIMEOUT_SECONDS = float(
-    os.environ.get("XINFERENCE_TOKEN_ROUTER_HEARTBEAT_TIMEOUT_SECONDS", "90")
+XINFERENCE_TOKEN_ROUTER_HEARTBEAT_TIMEOUT_SECONDS = parse_env_float(
+    "XINFERENCE_TOKEN_ROUTER_HEARTBEAT_TIMEOUT_SECONDS", 90.0
+)
+XINFERENCE_TOKEN_ROUTER_AGENT_SUSPECT_SECONDS = parse_env_float(
+    "XINFERENCE_TOKEN_ROUTER_AGENT_SUSPECT_SECONDS", 30.0
+)
+XINFERENCE_TOKEN_ROUTER_AGENT_OFFLINE_SECONDS = parse_env_float(
+    "XINFERENCE_TOKEN_ROUTER_AGENT_OFFLINE_SECONDS", 45.0
+)
+XINFERENCE_TOKEN_ROUTER_AGENT_MONITOR_SECONDS = parse_env_float(
+    "XINFERENCE_TOKEN_ROUTER_AGENT_MONITOR_SECONDS", 5.0
+)
+XINFERENCE_TOKEN_ROUTER_STALE_RETENTION_SECONDS = parse_env_float(
+    "XINFERENCE_TOKEN_ROUTER_STALE_RETENTION_SECONDS", 300.0
+)
+XINFERENCE_TOKENIZER_ASSET_CONFIG = os.environ.get(
+    "XINFERENCE_TOKENIZER_ASSET_CONFIG", ""
 )
 
 # Whether to allow models to run their own bundled code (transformers /
@@ -270,6 +350,12 @@ XINFERENCE_AUDIT_ES_INDEX = os.environ.get(
 )
 
 XINFERENCE_VIRTUAL_ENV_DIR = os.path.join(XINFERENCE_HOME, "virtualenv")
+XINFERENCE_VIRTUAL_ENV_FIND_LINKS_ALLOWED_ROOTS = (
+    _parse_virtual_env_find_links_allowed_roots(
+        os.getenv(XINFERENCE_ENV_VIRTUAL_ENV_FIND_LINKS_ALLOWED_ROOTS),
+        XINFERENCE_HOME,
+    )
+)
 XINFERENCE_CSG_ENDPOINT = str(
     os.environ.get(XINFERENCE_ENV_CSG_ENDPOINT, "https://hub-stg.opencsg.com/")
 )
