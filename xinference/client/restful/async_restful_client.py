@@ -18,7 +18,11 @@ from urllib.parse import quote
 
 import aiohttp
 
-from ..common import async_streaming_response_iterator, convert_float_to_int_or_str
+from ..common import (
+    async_streaming_response_iterator,
+    convert_float_to_int_or_str,
+    encode_world_reference,
+)
 
 if TYPE_CHECKING:
     from ...types import (
@@ -795,6 +799,52 @@ class AsyncRESTfulVideoModelHandle(AsyncRESTfulModelHandle):
         return response_data
 
 
+class AsyncRESTfulWorldModelHandle(AsyncRESTfulModelHandle):
+    async def generate(
+        self,
+        prompt: str,
+        image: Optional[Union[str, bytes]] = None,
+        video: Optional[Union[str, bytes]] = None,
+        generation_config: Optional[Dict[str, Any]] = None,
+        **model_kwargs,
+    ) -> "VideoList":
+        """Generate a world video from text and an optional image or video."""
+        if image is not None and video is not None:
+            raise ValueError("Only one of image and video may be provided")
+        encoded_image = (
+            await asyncio.to_thread(encode_world_reference, image, "image/png")
+            if image is not None
+            else None
+        )
+        encoded_video = (
+            await asyncio.to_thread(encode_world_reference, video, "video/mp4")
+            if video is not None
+            else None
+        )
+        request_body = {
+            "model": self._model_uid,
+            "prompt": prompt,
+            "image": encoded_image,
+            "video": encoded_video,
+            "generation_config": generation_config or {},
+            "extra_body": model_kwargs,
+        }
+        response = await self.session.post(
+            f"{self._base_url}/v1/worlds/generations",
+            json=request_body,
+            headers=self.auth_headers,
+            timeout=self.timeout,
+        )
+        if response.status != 200:
+            raise RuntimeError(
+                "Failed to generate the world, detail: "
+                f"{await _get_error_string(response)}"
+            )
+        response_data = await response.json()
+        await _release_response(response)
+        return response_data
+
+
 class AsyncRESTfulGenerateModelHandle(AsyncRESTfulModelHandle):
     async def generate(
         self,
@@ -1361,7 +1411,7 @@ class AsyncClient:
         model_type: str
             type of model.
         model_engine: Optional[str]
-            Specify the inference engine of the model when launching LLM.
+            Specify the inference engine to use when launching the model.
         model_uid: str
             UID of model, auto generate a UUID if is None.
         model_size_in_billions: Optional[Union[int, str, float]]
@@ -1540,15 +1590,18 @@ class AsyncClient:
     async def add_model_replica(
         self,
         model_uid: str,
-        replica_config: Optional[dict] = None,
+        replica_config: Optional[Union[dict, List[dict]]] = None,
+        replica: int = 1,
+        model_engine: Optional[str] = None,
+        n_gpu: Optional[Union[int, str]] = None,
     ) -> dict:
-        """Add a new replica to a running model (scale-up).
+        """Add one or more replicas to a running model (scale-up).
 
         Parameters
         ----------
         model_uid : str
             The UID of the running model to extend.
-        replica_config : Optional[dict]
+        replica_config : Optional[Union[dict, List[dict]]]
             Optional single-device placement config, e.g.::
 
                 {
@@ -1559,16 +1612,29 @@ class AsyncClient:
                 }
 
             Omit to let the supervisor auto-select a worker and GPU.
+        replica : int
+            Number of replicas to add, default is 1.
+        model_engine : Optional[str]
+            Override the model engine for the new replicas only.
+        n_gpu : Optional[Union[int, str]]
+            Override GPU usage for the new replicas. Use 0 for CPU or ``"auto"``.
 
         Returns
         -------
         dict
-            ``{"replica_id": int, "replica_model_uid": str, "worker_address": str}``
+            A single-replica result, or ``{"replica": int, "replicas": list}``
+            when more than one replica is requested.
         """
         url = f"{self.base_url}/v1/models/{model_uid}/replicas"
         payload: Dict[str, Any] = {}
         if replica_config is not None:
             payload["replica_config"] = replica_config
+        if replica != 1:
+            payload["replica"] = replica
+        if model_engine is not None:
+            payload["model_engine"] = model_engine
+        if n_gpu is not None:
+            payload["n_gpu"] = n_gpu
         response = await self.session.post(url, json=payload, headers=self._headers)
         if response.status != 200:
             raise RuntimeError(
@@ -1744,6 +1810,10 @@ class AsyncClient:
             )
         elif desc["model_type"] == "video":
             return AsyncRESTfulVideoModelHandle(
+                model_uid, self.base_url, auth_headers=self._headers
+            )
+        elif desc["model_type"] == "world":
+            return AsyncRESTfulWorldModelHandle(
                 model_uid, self.base_url, auth_headers=self._headers
             )
         elif desc["model_type"] == "flexible":

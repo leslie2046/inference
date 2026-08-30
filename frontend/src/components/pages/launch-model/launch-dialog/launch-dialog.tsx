@@ -47,6 +47,7 @@ import {
   toOptionValue,
   transformFetchToForm,
   transformFormToFetch,
+  validateReplicaPlacement,
   normalizeProgress,
   normalizeReplicaStatuses,
   isEmptyLaunchValue,
@@ -341,14 +342,25 @@ export default function LaunchDialog({
     };
   }, [gpuAvailable, modelType, form]);
 
-  const downloadHubOptions = useMemo(
-    () =>
-      ['auto', 'none', ...(model?.download_hubs || [])].map((item) => ({
-        label: item,
-        value: item,
-      })),
-    [model?.download_hubs]
-  );
+  const downloadHubOptions = useMemo(() => {
+    const engineHubs = Array.from(
+      new Set(
+        (model?.modelSpecs || [])
+          .filter(
+            (spec) =>
+              !modelEngineValue ||
+              toOptionValue(spec.model_engine).toLowerCase() === modelEngineValue.toLowerCase()
+          )
+          .map((spec) => toOptionValue(spec.model_hub))
+          .filter(Boolean)
+      )
+    );
+    const availableHubs = engineHubs.length > 0 ? engineHubs : model?.download_hubs || [];
+    return ['auto', 'none', ...availableHubs].map((item) => ({
+      label: item,
+      value: item,
+    }));
+  }, [model?.download_hubs, model?.modelSpecs, modelEngineValue]);
 
   const workerIpFieldProps = useMemo(
     () => ({
@@ -444,7 +456,13 @@ export default function LaunchDialog({
     if (!isCustomPlacement) return;
     const current =
       (form.getFieldValue('replica_config') as
-        Array<{ replica_uid?: string; worker_ip: string; gpu_idx: string }> | undefined) ?? [];
+        | Array<{
+            replica_uid?: string;
+            worker_ip: string;
+            gpu_idx: string;
+            n_gpu?: number | 'auto';
+          }>
+        | undefined) ?? [];
     if (current.length === replicaValue) return;
     const next = Array.from(
       { length: replicaValue },
@@ -1130,12 +1148,125 @@ export default function LaunchDialog({
         content: <CollapsibleConfig form={form} modelType={modelType} />,
       },
     ],
+    [ModelType.World]: [
+      {
+        name: 'model_uid',
+        type: 'input',
+        label: t('launchModel.modelUid'),
+        placeholder: t('launchModel.modelUidPlaceholder'),
+      },
+      {
+        name: 'model_engine',
+        type: 'select',
+        label: t('launchModel.modelEngine'),
+        rules: [{ required: true }],
+        fieldProps: { options: modelEngineOptions },
+      },
+      {
+        name: 'replica',
+        type: 'input',
+        label: t('launchModel.replica'),
+        rules: [
+          {
+            pattern: /^[1-9]\d*$/,
+            message: t('launchModel.enterIntegerGreaterThanZero'),
+          },
+        ],
+        fieldProps: { type: 'number', min: 1 },
+      },
+      ...replicaPlacementFields,
+      {
+        name: 'n_gpu',
+        type: 'select',
+        label: t('launchModel.nGPUDevice'),
+        fieldProps: nGpuFieldProps,
+      },
+      {
+        name: 'gpu_idx',
+        type: 'input',
+        label: t('launchModel.GPUIdx'),
+        placeholder: t('launchModel.GPUIdxPlaceholder'),
+        rules: [
+          {
+            pattern: GPU_IDX_PATTERN,
+            message: t('launchModel.enterCommaSeparatedNumbers'),
+          },
+        ],
+        show: nGpuValue === 'GPU',
+      },
+      {
+        name: 'download_hub',
+        type: 'select',
+        label: t('launchModel.downloadHub'),
+        placeholder: t('launchModel.downloadHubPlaceholder'),
+        fieldProps: { options: downloadHubOptions },
+      },
+      {
+        name: 'request_limits',
+        type: 'input',
+        label: t('launchModel.requestLimits'),
+        placeholder: t('launchModel.requestLimitsPlaceholder'),
+        rules: [
+          {
+            pattern: /^[1-9]\d*$/,
+            message: t('launchModel.enterIntegerGreaterThanZero'),
+          },
+        ],
+        fieldProps: { type: 'number', min: 1 },
+        normalize: (v) => (v === '' ? undefined : Number(v)),
+      },
+      {
+        name: 'worker_ip',
+        type: 'multi-select',
+        label: t('launchModel.workerIp'),
+        placeholder: t('launchModel.workerIpPlaceholder'),
+        colSpan: 2,
+        fieldProps: workerIpFieldProps,
+        normalize: (v) => v || undefined,
+      },
+      {
+        name: 'model_path',
+        type: 'input',
+        label: t('launchModel.modelPath'),
+        placeholder: t('launchModel.modelPathPlaceholder'),
+        colSpan: 2,
+      },
+      {
+        name: 'collapsibleConfig',
+        type: 'custom',
+        colSpan: 2,
+        content: <CollapsibleConfig form={form} modelType={modelType} />,
+      },
+    ],
     [ModelType.Video]: [
       {
         name: 'model_uid',
         type: 'input',
         label: t('launchModel.modelUid'),
         placeholder: t('launchModel.modelUidPlaceholder'),
+      },
+      {
+        name: 'model_engine',
+        type: 'select',
+        label: t('launchModel.modelEngine'),
+        fieldProps: { options: modelEngineOptions },
+        show: !!modelEngineOptions.length,
+      },
+      {
+        name: 'model_format',
+        type: 'select',
+        label: t('launchModel.modelFormat'),
+        disabled: !modelEngineValue,
+        fieldProps: { options: modelFormatOptions },
+        show: !!modelFormatOptions.length,
+      },
+      {
+        name: 'quantization',
+        type: 'select',
+        label: t('launchModel.quantization'),
+        disabled: !modelFormatValue,
+        fieldProps: { options: quantizationOptions },
+        show: !!quantizationOptions.length,
       },
       {
         name: 'replica',
@@ -1243,6 +1374,7 @@ export default function LaunchDialog({
         type: 'switch',
         valuePropName: 'checked',
         tooltip: t('launchModel.CPUOffloadTip'),
+        show: !modelEngineValue || modelEngineValue.toLowerCase() === 'diffusers',
       },
       {
         name: 'collapsibleConfig',
@@ -1329,11 +1461,11 @@ export default function LaunchDialog({
     ],
   };
 
-  // In custom placement mode (LLM only for now), hide the legacy global
-  // placement fields — they are mutually exclusive with replica_config and
-  // would only confuse the operator if shown alongside the per-replica editor.
+  // In custom placement mode, hide the legacy global placement fields. Each
+  // replica currently binds to exactly one worker, so n_worker is not editable.
   const currentLaunchFields = (modelTypeFields[modelType] || []).filter(
-    (field) => !isCustomPlacement || !['n_gpu', 'gpu_idx', 'worker_ip'].includes(field.name)
+    (field) =>
+      !isCustomPlacement || !['n_worker', 'n_gpu', 'gpu_idx', 'worker_ip'].includes(field.name)
   );
   // required fields is filled in
   const isReady = currentLaunchFields
@@ -1460,26 +1592,14 @@ export default function LaunchDialog({
   };
 
   const handleLaunch = async (values: FormValues) => {
-    if (values.replica_placement_mode === 'custom') {
-      const rows = Array.isArray(values.replica_config) ? values.replica_config : [];
-      const replicaCount = Number(values.replica) || 1;
-      const gpuIndexPattern = GPU_IDX_PATTERN;
-      const hasInvalidPlacement =
-        rows.length !== replicaCount ||
-        rows.some((row) => {
-          const gpuIndexes = String(row?.gpu_idx ?? '').trim();
-          return !row?.worker_ip || (gpuIndexes !== '' && !gpuIndexPattern.test(gpuIndexes));
-        });
-      if (hasInvalidPlacement) {
-        toast.error(t('launchModel.replicaPlacementIncomplete'));
-        return;
-      }
-
-      const aliases = rows.map((row) => String(row?.replica_uid ?? '').trim()).filter(Boolean);
-      if (new Set(aliases).size !== aliases.length) {
-        toast.error(t('launchModel.replicaAliasDuplicate'));
-        return;
-      }
+    const placementError = validateReplicaPlacement(values);
+    if (placementError === 'incomplete') {
+      toast.error(t('launchModel.replicaPlacementIncomplete'));
+      return;
+    }
+    if (placementError === 'duplicate-alias') {
+      toast.error(t('launchModel.replicaAliasDuplicate'));
+      return;
     }
 
     const newValues = transformFormToFetch(values);

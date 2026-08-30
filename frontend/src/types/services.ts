@@ -113,13 +113,17 @@ export interface ReplicaItem {
 }
 
 export interface AddReplicaRequest {
-  replica_config?: {
+  replica: number;
+  model_engine?: string;
+  n_gpu?: number | 'auto';
+  replica_config?: Array<{
     replica_uid?: string;
     devices: Array<{
       worker_ip?: string;
+      n_gpu?: number | 'auto';
       gpu_idx?: number[];
     }>;
-  };
+  }>;
 }
 
 export interface AddReplicaResponse {
@@ -442,7 +446,7 @@ export interface TokenizerAssetBinding {
   observed_revision: string;
   observed_fingerprint: string;
   local_path: string;
-  binding_mode: 'manual' | 'on_demand' | 'legacy';
+  binding_mode: 'manual' | 'on_demand';
   owner_type: string;
   owner_id: string;
   generation: number;
@@ -462,7 +466,6 @@ export interface TokenRouterNode {
   managed_labels: Record<string, unknown>;
   tokenizer_asset_bindings: TokenizerAssetBinding[];
   capabilities: {
-    tokenizer_assets?: string[];
     [key: string]: unknown;
   };
   software_version: string;

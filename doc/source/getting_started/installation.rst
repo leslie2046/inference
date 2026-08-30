@@ -9,6 +9,29 @@ If you aim to serve all supported models, you can install all the necessary depe
 
    pip install "xinference[all]"
 
+Token Router
+~~~~~~~~~~~~
+The Token Router Runtime and Router Agent can be installed separately from
+the model-serving backends::
+
+   pip install "xinference[router]"
+
+When installing Xinference from a source checkout, use::
+
+   uv pip install -e ".[router]"
+
+The ``router`` extra provides the dependencies required by the Token Router
+Runtime and Router Agent. The ``all`` extra includes the ``router`` extra.
+
+The Supervisor can use the base installation::
+
+   pip install xinference
+
+Installing the package creates the ``xinference-router`` and
+``xinference-router-agent`` commands. The extra controls dependency
+installation; it does not start any Supervisor, Worker, Router, or Router
+Agent process.
+
 .. versionchanged:: v1.8.1
 
    Due to irreconcilable package dependency conflicts between vLLM and sglang, we have removed sglang from the all extra. If you want to use sglang, please install it separately via ``pip install 'xinference[sglang]'``.
@@ -100,6 +123,7 @@ Currently, supported models include:
 - ``GLM-4.7-Flash``
 - ``glm-5``, ``glm-5.1``, ``glm-5.2``
 - ``DeepSeek-V4-Flash``, ``DeepSeek-V4-Flash-0731``, ``DeepSeek-V4-Pro``
+- ``Hy-MT2-1.8B``, ``Hy-MT2-7B``, ``Hy-MT2-30B-A3B``
 .. vllm_end
 
 To install Xinference and vLLM::

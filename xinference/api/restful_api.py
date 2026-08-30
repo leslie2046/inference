@@ -108,10 +108,14 @@ from .schemas import (
     TextToImageRequest,
     TextToVideoRequest,
     UpdateModelRequest,
+    WorldGenerationRequest,
 )
 from .utils import get_request_route_path, require_model
 
 logger = logging.getLogger(__name__)
+
+# One base64-encoded 512 MiB media reference plus bounded JSON/config overhead.
+_MAX_WORLD_REQUEST_BYTES = ((512 * 1024 * 1024 + 2) // 3) * 4 + 1024 * 1024
 
 _TOKEN_ROUTER_HOP_BY_HOP_HEADERS = {
     "connection",
@@ -1521,40 +1525,91 @@ class RESTfulAPI(CancelMixin):
     async def add_model_replica(
         self, model_uid: str, payload: Optional[dict[str, Any]] = None
     ) -> JSONResponse:
-        """Add a single new replica to a running model (scale-up).
+        """Add one or more replicas to a running model (scale-up).
 
-        Accepts an optional ``replica_config`` with a single device entry to
-        pin the new replica to a specific worker / GPU.  When omitted the
-        supervisor auto-selects the least-loaded worker.
+        ``replica`` controls how many replicas are added. ``model_engine`` and
+        ``n_gpu`` may override those launch settings for the new replicas only.
+        An optional ``replica_config`` dict applies to every new replica, while
+        a list can provide individual placement for each one.
         """
         try:
             payload = payload or {}
-            replica_config_raw = payload.get("replica_config", None)
-            replica_config: Optional[ReplicaConfig] = None
-            if replica_config_raw is not None:
-                if not isinstance(replica_config_raw, dict):
+            replica = payload.get("replica", 1)
+            if isinstance(replica, bool) or not isinstance(replica, int) or replica < 1:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Invalid replica: expected a positive integer.",
+                )
+
+            model_engine = payload.get("model_engine")
+            if model_engine is not None:
+                if not isinstance(model_engine, str) or not model_engine.strip():
                     raise HTTPException(
                         status_code=400,
-                        detail="Invalid replica_config: expected a dict with a single device entry.",
+                        detail="Invalid model_engine: expected a non-empty string.",
+                    )
+                model_engine = model_engine.strip()
+
+            n_gpu = payload.get("n_gpu")
+            if (
+                n_gpu is not None
+                and n_gpu != "auto"
+                and (isinstance(n_gpu, bool) or not isinstance(n_gpu, int) or n_gpu < 0)
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Invalid n_gpu: expected a non-negative integer or 'auto'.",
+                )
+
+            replica_config_raw = payload.get("replica_config", None)
+            replica_configs: Optional[List[ReplicaConfig]] = None
+            if replica_config_raw is not None:
+                raw_configs = (
+                    replica_config_raw
+                    if isinstance(replica_config_raw, list)
+                    else [replica_config_raw] * replica
+                )
+                if len(raw_configs) != replica or any(
+                    not isinstance(config, dict) for config in raw_configs
+                ):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            "Invalid replica_config: expected a dict or a list "
+                            "with one entry per requested replica."
+                        ),
                     )
                 try:
-                    replica_config = ReplicaConfig.from_dict(replica_config_raw)
+                    replica_configs = [
+                        ReplicaConfig.from_dict(config) for config in raw_configs
+                    ]
                 except Exception as e:
                     raise HTTPException(
                         status_code=400,
                         detail=f"Invalid replica_config: {e}",
                     )
-                if len(replica_config.devices) != 1:
+                if any(len(config.devices) != 1 for config in replica_configs):
                     raise HTTPException(
                         status_code=400,
-                        detail="replica_config must contain exactly one device entry for scale-up.",
+                        detail=(
+                            "Each replica_config must contain exactly one device "
+                            "entry for scale-up."
+                        ),
                     )
 
-            result = await (await self._get_supervisor_ref()).add_model_replica(
+            results = await (
+                await self._get_supervisor_ref()
+            ).add_model_replicas_with_config(
                 model_uid=model_uid,
-                replica_config=replica_config,
+                replica=replica,
+                replica_configs=replica_configs,
+                model_engine=model_engine,
+                n_gpu=n_gpu,
             )
-            return JSONResponse(content=result)
+            if replica == 1:
+                # Preserve the existing response shape for older callers.
+                return JSONResponse(content=results[0])
+            return JSONResponse(content={"replica": replica, "replicas": results})
         except HTTPException:
             raise
         except ValueError as ve:
@@ -3146,6 +3201,99 @@ class RESTfulAPI(CancelMixin):
             self.handle_request_limit_error(e)
             raise HTTPException(status_code=500, detail=str(e))
 
+    async def create_world(self, request: Request) -> Response:
+        try:
+            content_length = request.headers.get("content-length")
+            if content_length is not None:
+                try:
+                    if int(content_length) > _MAX_WORLD_REQUEST_BYTES:
+                        raise HTTPException(
+                            status_code=413,
+                            detail="World generation request is too large",
+                        )
+                except ValueError:
+                    raise HTTPException(
+                        status_code=400, detail="Invalid Content-Length header"
+                    ) from None
+
+            raw_body = bytearray()
+            async for chunk in request.stream():
+                if len(raw_body) + len(chunk) > _MAX_WORLD_REQUEST_BYTES:
+                    raise HTTPException(
+                        status_code=413, detail="World generation request is too large"
+                    )
+                raw_body.extend(chunk)
+            body = WorldGenerationRequest.parse_obj(json.loads(raw_body))
+        except (TypeError, ValueError) as e:
+            raise HTTPException(status_code=400, detail=f"Invalid request body: {e}")
+        model_uid = body.model
+        self._set_trace_model(model_uid)
+        self._set_trace_model_type("world")
+        self._check_model_access(request, model_uid, "world")
+        if body.image is not None and body.video is not None:
+            raise HTTPException(
+                status_code=400,
+                detail="Only one of image and video may be provided",
+            )
+        for media_type, reference in (("image", body.image), ("video", body.video)):
+            if reference is None:
+                continue
+            header, separator, _ = reference.partition(",")
+            if (
+                not separator
+                or not header.startswith(f"data:{media_type}/")
+                or ";base64" not in header
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"World generation {media_type} must be a base64 data URL. "
+                        "Use the Xinference client to encode local files."
+                    ),
+                )
+
+        model_ref = await require_model(
+            self._get_supervisor_ref, model_uid, self._report_error_event
+        )
+        generation_config = dict(body.generation_config)
+        model_kwargs = dict(body.extra_body)
+        kwargs_request_id = model_kwargs.pop("request_id", None)
+        config_request_id = generation_config.pop("request_id", None)
+        request_id = kwargs_request_id or config_request_id or uuid.uuid4().hex
+        try:
+            self._add_running_task(request_id)
+            result = await model_ref.world_generate(
+                prompt=body.prompt,
+                image=body.image,
+                video=body.video,
+                generation_config=generation_config,
+                model_kwargs=model_kwargs,
+                request_id=request_id,
+            )
+            return Response(content=result, media_type="application/json")
+        except asyncio.CancelledError:
+            if request_id:
+                try:
+                    await asyncio.shield(model_ref.abort_request(request_id))
+                except Exception:
+                    logger.exception(
+                        "Failed to stop cancelled world request %s", request_id
+                    )
+            err_str = f"The request has been cancelled: {request_id or 'unknown'}"
+            logger.error(err_str)
+            await self._report_error_event(model_uid, err_str)
+            raise HTTPException(status_code=409, detail=err_str)
+        except ValueError as e:
+            logger.error(e, exc_info=True)
+            await self._report_error_event(model_uid, str(e))
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            e = await self._get_model_last_error(model_ref.uid, e)
+            logger.error(e, exc_info=True)
+            await self._report_error_event(model_uid, str(e))
+            self.handle_request_limit_error(e)
+            raise HTTPException(status_code=500, detail=str(e))
+
     @staticmethod
     def _coerce_chat_template_kwargs(value: Any) -> dict:
         if not value:
@@ -3335,6 +3483,7 @@ class RESTfulAPI(CancelMixin):
             GEMMA_TOOL_CALL_FAMILY,
             GLM4_TOOL_CALL_FAMILY,
             GLM5_TOOL_CALL_FAMILY,
+            KIMI_K3_TOOL_CALL_FAMILY,
             LLAMA3_TOOL_CALL_FAMILY,
             QWEN_TOOL_CALL_FAMILY,
         )
@@ -3351,6 +3500,7 @@ class RESTfulAPI(CancelMixin):
             | LLAMA3_TOOL_CALL_FAMILY
             | QWEN_TOOL_CALL_FAMILY
             | GLM5_TOOL_CALL_FAMILY
+            | KIMI_K3_TOOL_CALL_FAMILY
         )
         if model_family not in total_call_family:
             if body.tools:
