@@ -110,7 +110,9 @@ Text to audio (TTS)
 
 **Models supporting voice design** (natural-language voice description):
 
+* :ref:`Breeze-TTS-2 <models_builtin_breeze-tts-2>`
 * :ref:`FireRedTTS3-Instruct <models_builtin_fireredtts3-instruct>`
+* :ref:`Qwen3-TTS-12Hz-1.7B-VoiceDesign <models_builtin_qwen3-tts-12hz-1.7b-voicedesign>`
 
 Music generation
 ~~~~~~~~~~~~~~~~
@@ -126,6 +128,7 @@ Speaker embeddings
 
 **Models supporting voice cloning** (requires reference audio):
 
+* :ref:`Breeze-TTS-2 <models_builtin_breeze-tts-2>`
 * :ref:`CosyVoice-300M <models_builtin_cosyvoice-300m>`
 * :ref:`CosyVoice 2.0 <models_builtin_cosyvoice2-0.5b>`
 * :ref:`FishSpeech-1.5 <models_builtin_fishspeech-1.5>`
@@ -365,6 +368,70 @@ Speech API use non-stream by default as
     The output will be an audio binary.
 
 
+.. _breeze_tts_2_speech:
+
+Breeze-TTS-2 Usage
+~~~~~~~~~~~~~~~~~~
+
+``Breeze-TTS-2`` supports English and Chinese voice design, voice cloning,
+voice direction, and native streaming. It requires Linux and an NVIDIA CUDA
+GPU. The model weights and self-hosted outputs are licensed for research and
+non-commercial use only; review the upstream
+`BreezeBlue model license <https://huggingface.co/BreezeBlue/Breeze-TTS-2/blob/main/LICENSE>`_
+before launching the model.
+
+For voice design, omit ``prompt_speech`` and pass a natural-language voice
+description in ``instruct``. For voice cloning, pass reference audio bytes in
+``prompt_speech`` and their exact transcript in ``prompt_text``. Voice direction
+combines all three fields: ``prompt_speech``, ``prompt_text``, and ``instruct``.
+``cfg_scale`` defaults to 1; the upstream project recommends 4 when stronger
+instruction following is needed. ``seed`` defaults to 42. The model does not
+support the OpenAI ``speed`` or preset ``voice`` controls.
+
+``instruct``, ``prompt_text``, ``cfg_scale``, and ``seed`` use the existing
+Speech API ``kwargs`` channel; raw REST requests encode ``kwargs`` as a JSON
+string. ``prompt_speech`` is sent as a multipart file. The Xinference sync and
+async clients handle both forms through their ``speech`` method.
+
+.. code-block:: python
+
+    from xinference.client import Client
+
+    client = Client("http://<XINFERENCE_HOST>:<XINFERENCE_PORT>")
+    model = client.get_model("<MODEL_UID>")
+
+    # Voice design
+    designed_voice = model.speech(
+        input="Welcome aboard. Your journey begins now.",
+        voice="",
+        response_format="wav",
+        instruct="A warm, thoughtful young woman with a calm delivery.",
+        cfg_scale=4,
+        seed=42,
+    )
+
+    # Voice cloning or voice direction
+    with open("reference.wav", "rb") as reference_file:
+        reference_audio = reference_file.read()
+    directed_voice = model.speech(
+        input="We need to discuss what happened last night.",
+        voice="",
+        response_format="wav",
+        prompt_speech=reference_audio,
+        prompt_text="This is the exact transcript of the reference audio.",
+        instruct="Speak slowly with a restrained, serious tone.",
+        cfg_scale=4,
+        seed=42,
+    )
+
+Set ``stream=True`` to receive encoded audio chunks from the model's native
+streaming runtime. CUDA Graph acceleration can be enabled at launch with
+``--fast_all true`` or with the individual ``fast_text_encoder``,
+``fast_backbone_prefill``, ``fast_backbone_decode``, ``fast_depth_decoder``,
+and ``fast_codec`` model options. These modes increase startup work and GPU
+memory use.
+
+
 .. _ace_step1_5_speech:
 
 ACE-Step1.5 Usage
@@ -378,7 +445,8 @@ generating an instrumental track.
 ``duration`` defaults to 60 seconds. It accepts ``-1`` for model-selected
 duration or a value from 10 through 600 seconds. ``seed=-1`` selects a random
 seed; non-negative integers provide reproducible generation. Supported output
-formats are ``aac``, ``flac``, ``mp3``, ``opus``, ``wav``, and ``wav32``.
+formats are ``aac``, ``flac``, ``mp3``, ``ogg``, ``opus``, ``wav``, and
+``wav32``.
 Generation is non-streaming, ``speed`` must be ``1.0``, and ``voice`` must be
 ``default``, an empty string, or null.
 
@@ -392,7 +460,8 @@ same ``kwargs`` channel.
 When the LM is loaded, ``thinking=false`` disables audio-code reasoning by
 default. An explicitly enabled ``use_cot_caption``, ``use_cot_language``, or
 ``use_cot_metas`` still uses the LM for that planning step. MP3, AAC, and Opus
-output require a working FFmpeg installation.
+output require a working FFmpeg installation. OGG output is generated as WAV
+and then encoded as OGG/Vorbis with libsndfile.
 
 Raw REST requests encode ``kwargs`` as a JSON string. The Xinference sync and
 async clients accept these names through their existing ``**kwargs`` argument.
@@ -446,14 +515,16 @@ put tags such as ``[Verse]`` and ``[Chorus]`` on their own lines.
 through 360 and its default is 60. Xinference passes it directly to the
 Diffusers pipeline as ``audio_duration``. The model may emit an end-of-audio
 token and finish before the limit.
-The initial integration only accepts ``response_format=wav``, ``stream=false``,
-``speed=1.0``, and ``voice`` set to ``default``, an empty string, or null.
+Supported output formats are ``flac``, ``mp3``, ``ogg``, and ``wav``; WAV is
+the default. Generation requires ``stream=false``, ``speed=1.0``, and
+``voice`` set to ``default``, an empty string, or null.
 Inference requires NVIDIA CUDA. Sampling steps and classifier-free guidance
 remain at the Diffusers defaults and are not request parameters.
 
 Xinference preserves the Diffusers pipeline's native 44.1 kHz stereo samples.
 It wraps them in an IEEE-float WAV container without resampling or integer PCM
-quantization.
+quantization. FLAC, MP3, and OGG responses are encoded from those samples
+with libsndfile.
 
 ``instruct``, ``seed``, and ``duration`` are model options passed through the
 existing ``kwargs`` channel rather than additional Speech API parameters. Raw
