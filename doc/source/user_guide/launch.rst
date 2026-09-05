@@ -6,6 +6,61 @@ Model Launching Instructions
 
 This document aims to provide a functional overview of model launching.
 
+Download without launching
+==========================
+
+Open a model's deployment dialog and choose **Download only** beside the
+**Deploy** button. It downloads the same model artifacts used by deployment,
+but does not reserve GPUs, create model subprocesses, install a virtual
+environment, or load a model into memory.
+
+The REST endpoint is ``POST /v1/cache/models``. Supply ``cache_uid`` when the
+client needs to query progress or cancel the operation while the POST request
+is still running.
+
+.. code-block:: bash
+
+    curl -X POST http://127.0.0.1:9997/v1/cache/models \
+      -H 'Content-Type: application/json' \
+      -d '{
+        "cache_uid": "download-qwen",
+        "model_name": "qwen2.5-instruct",
+        "model_type": "LLM",
+        "model_engine": "transformers",
+        "model_format": "pytorch",
+        "model_size_in_billions": "0_5",
+        "quantization": "none"
+      }'
+
+Progress and cancellation use the same ``cache_uid``:
+
+.. code-block:: bash
+
+    curl http://127.0.0.1:9997/v1/cache/models/download-qwen/progress
+    curl -X POST http://127.0.0.1:9997/v1/cache/models/download-qwen/cancel
+
+Cache-only downloads can also be paused and resumed:
+
+.. code-block:: bash
+
+    curl -X POST http://127.0.0.1:9997/v1/downloads/download-qwen/pause
+    curl -X POST http://127.0.0.1:9997/v1/downloads/download-qwen/resume
+
+Xinference persists unfinished cache-only download tasks. If the supervisor or
+worker stops unexpectedly, an active task is shown as ``interrupted`` after
+restart and can be resumed with the same endpoint. Resume reuses files already
+present in the model hub cache. Byte-range continuation of a partially written
+file depends on the selected hub client; otherwise that incomplete file is
+downloaded again.
+
+``GET /v1/downloads`` lists active, paused, interrupted, and failed downloads.
+Pause and resume apply to cache-only downloads. A model launch that happens to
+be downloading still uses the launch cancellation endpoint because pausing a
+launch would also need to preserve its runtime allocation state.
+
+In a distributed deployment, ``worker_ip`` can select the worker whose local
+cache receives the files. If it is omitted, the supervisor selects one worker.
+
 Replica
 =======
 

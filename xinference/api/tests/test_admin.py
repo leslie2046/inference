@@ -20,7 +20,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from fastapi import HTTPException
 
-from xinference.api.routers import admin
+from xinference.api.routers import admin, models
 from xinference.core.virtual_env_manager import VirtualEnvConflictError
 
 
@@ -42,6 +42,23 @@ def mock_supervisor():
     )
     supervisor.abort_cluster = AsyncMock(return_value=True)
     supervisor.list_cached_models = AsyncMock(return_value=[])
+    supervisor.cache_builtin_model = AsyncMock(
+        return_value={"cache_uid": "cache-1", "model_name": "qwen"}
+    )
+    supervisor.get_cache_builtin_model_progress_details = AsyncMock(
+        return_value={"progress": 0.5, "stage": "downloading"}
+    )
+    supervisor.cancel_cache_builtin_model = AsyncMock()
+    supervisor.delete_cache_builtin_model = AsyncMock(
+        return_value={"removed_bytes": 1024}
+    )
+    supervisor.pause_cache_builtin_model = AsyncMock(
+        return_value={"cache_uid": "cache-1", "status": "paused"}
+    )
+    supervisor.resume_cache_builtin_model = AsyncMock(
+        return_value={"cache_uid": "cache-1", "status": "resuming"}
+    )
+    supervisor.list_model_downloads = AsyncMock(return_value=[])
     supervisor.list_deletable_models = AsyncMock(return_value=[])
     supervisor.confirm_and_remove_model = AsyncMock(return_value=True)
     supervisor.list_virtual_envs = AsyncMock(return_value=[])
@@ -128,6 +145,40 @@ async def test_is_cluster_authenticated_returns_auth_flag(mock_api):
     assert _json_body(response) == {"auth": False}
 
 
+@pytest.mark.parametrize("is_auth", [False, True])
+def test_cache_model_reuses_launch_model_permission(is_auth):
+    def capture_routes(register_routes):
+        captured = {}
+
+        def add_api_route(path, endpoint, methods=None, **kwargs):
+            captured[(path, tuple(methods or []))] = kwargs
+
+        api = MagicMock()
+        api._router.add_api_route.side_effect = add_api_route
+        api._auth_service = MagicMock()
+        api.is_authenticated.return_value = is_auth
+        register_routes(api)
+        return captured
+
+    model_routes = capture_routes(models.register_routes)
+    admin_routes = capture_routes(admin.register_routes)
+    launch_dependencies = model_routes[("/v1/models", ("POST",))]["dependencies"]
+    cache_dependencies = admin_routes[("/v1/cache/models", ("POST",))]["dependencies"]
+    download_delete_dependencies = admin_routes[
+        ("/v1/downloads/{cache_uid}", ("DELETE",))
+    ]["dependencies"]
+
+    if not is_auth:
+        assert launch_dependencies is None
+        assert cache_dependencies is None
+        assert download_delete_dependencies is None
+        return
+
+    assert launch_dependencies[0].scopes == ["models:write"]
+    assert cache_dependencies[0].scopes == launch_dependencies[0].scopes
+    assert download_delete_dependencies[0].scopes == ["cache:delete"]
+
+
 @pytest.mark.asyncio
 async def test_get_cluster_device_info_returns_data(mock_api, mock_supervisor):
     mock_supervisor.get_cluster_device_info.return_value = {
@@ -191,6 +242,103 @@ async def test_list_cached_models_returns_list(mock_api, mock_supervisor):
     assert response.status_code == 200
     assert _json_body(response) == {"list": ["model1", "model2"]}
     mock_supervisor.list_cached_models.assert_called_once_with("qwen", None)
+
+
+@pytest.mark.asyncio
+async def test_cache_model_forwards_only_download_inputs(mock_api, mock_supervisor):
+    request = MagicMock()
+    request.json = AsyncMock(
+        return_value={
+            "cache_uid": "cache-1",
+            "model_name": "qwen",
+            "model_type": "LLM",
+            "model_engine": "transformers",
+            "model_format": "pytorch",
+            "quantization": "none",
+            "n_gpu": 2,
+            "replica": 3,
+            "enable_mtp": True,
+            "draft_quantization": "q4_k_m",
+        }
+    )
+
+    response = await admin.cache_model(request=request, api=mock_api)
+
+    assert response.status_code == 200
+    assert _json_body(response)["cache_uid"] == "cache-1"
+    call_kwargs = mock_supervisor.cache_builtin_model.await_args.kwargs
+    assert "n_gpu" not in call_kwargs
+    assert "replica" not in call_kwargs
+    assert call_kwargs["enable_mtp"] is True
+    assert call_kwargs["draft_quantization"] == "q4_k_m"
+
+
+@pytest.mark.parametrize(
+    ("internal_key", "value"),
+    [
+        ("_resume", True),
+        ("_download_repositories", [{"path": "/tmp/client-controlled"}]),
+    ],
+)
+@pytest.mark.asyncio
+async def test_cache_model_rejects_internal_fields(
+    mock_api, mock_supervisor, internal_key, value
+):
+    request = MagicMock()
+    request.json = AsyncMock(
+        return_value={
+            "model_name": "qwen",
+            "model_type": "LLM",
+            "model_engine": "transformers",
+            internal_key: value,
+        }
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await admin.cache_model(request=request, api=mock_api)
+
+    assert exc_info.value.status_code == 400
+    assert internal_key in exc_info.value.detail
+    mock_supervisor.cache_builtin_model.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_cache_model_progress_and_cancel(mock_api, mock_supervisor):
+    response = await admin.get_cache_model_progress(cache_uid="cache-1", api=mock_api)
+    assert _json_body(response) == {"progress": 0.5, "stage": "downloading"}
+
+    cancel_response = await admin.cancel_cache_model(cache_uid="cache-1", api=mock_api)
+    assert cancel_response.status_code == 200
+    mock_supervisor.cancel_cache_builtin_model.assert_awaited_once_with("cache-1")
+
+    delete_response = await admin.delete_cache_download(
+        cache_uid="cache-1", api=mock_api
+    )
+    assert _json_body(delete_response) == {"removed_bytes": 1024}
+    mock_supervisor.delete_cache_builtin_model.assert_awaited_once_with("cache-1")
+
+
+@pytest.mark.asyncio
+async def test_list_model_downloads_returns_list(mock_api, mock_supervisor):
+    downloads = [{"model_uid": "qwen", "stage": "downloading"}]
+    mock_supervisor.list_model_downloads.return_value = downloads
+
+    response = await admin.list_model_downloads(api=mock_api)
+
+    assert response.status_code == 200
+    assert _json_body(response) == {"list": downloads}
+    mock_supervisor.list_model_downloads.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_pause_and_resume_cache_model(mock_api, mock_supervisor):
+    pause_response = await admin.pause_cache_model(cache_uid="cache-1", api=mock_api)
+    assert _json_body(pause_response)["status"] == "paused"
+    mock_supervisor.pause_cache_builtin_model.assert_awaited_once_with("cache-1")
+
+    resume_response = await admin.resume_cache_model(cache_uid="cache-1", api=mock_api)
+    assert _json_body(resume_response)["status"] == "resuming"
+    mock_supervisor.resume_cache_builtin_model.assert_awaited_once_with("cache-1")
 
 
 @pytest.mark.asyncio

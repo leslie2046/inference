@@ -38,6 +38,8 @@ from ..utils import (
     neutralize_broken_torchcodec,
     parse_uri,
     resolve_media_seed,
+    retry_download,
+    retry_snapshot_download,
     symlink_local_file,
 )
 
@@ -71,6 +73,65 @@ def test_parse_uri():
     scheme, path = parse_uri("s3://bucket/dir")
     assert scheme == "s3"
     assert path == "bucket/dir"
+
+
+def test_retry_snapshot_download_applies_environment_max_workers(monkeypatch):
+    received = {}
+    monkeypatch.setenv("HF_HUB_DOWNLOAD_WORKERS", "2")
+
+    def snapshot_download(repo_id, *, max_workers=8):
+        received["repo_id"] = repo_id
+        received["max_workers"] = max_workers
+        return "ok"
+
+    assert retry_snapshot_download(snapshot_download, "dummy", None, "repo") == "ok"
+    assert received == {
+        "repo_id": "repo",
+        "max_workers": 2,
+    }
+
+
+def test_retry_snapshot_download_preserves_explicit_max_workers(monkeypatch):
+    received = {}
+    monkeypatch.setenv("HF_HUB_DOWNLOAD_WORKERS", "2")
+
+    def snapshot_download(repo_id, *, max_workers=8):
+        received["max_workers"] = max_workers
+        return "ok"
+
+    assert (
+        retry_snapshot_download(snapshot_download, "dummy", None, "repo", max_workers=6)
+        == "ok"
+    )
+    assert received["max_workers"] == 6
+
+
+def test_retry_download_does_not_inject_snapshot_workers(monkeypatch):
+    received = {}
+    monkeypatch.setenv("HF_HUB_DOWNLOAD_WORKERS", "2")
+
+    def file_download(repo_id, *, filename):
+        received["repo_id"] = repo_id
+        received["filename"] = filename
+        return "ok"
+
+    assert (
+        retry_download(file_download, "dummy", None, "repo", filename="config.json")
+        == "ok"
+    )
+    assert received == {"repo_id": "repo", "filename": "config.json"}
+
+
+def test_retry_snapshot_download_preserves_default_without_environment(monkeypatch):
+    received = {}
+    monkeypatch.delenv("HF_HUB_DOWNLOAD_WORKERS", raising=False)
+
+    def snapshot_download(repo_id, *, max_workers=8):
+        received["max_workers"] = max_workers
+        return "ok"
+
+    assert retry_snapshot_download(snapshot_download, "dummy", None, "repo") == "ok"
+    assert received["max_workers"] == 8
 
 
 def test_create_symlink_ignores_downloaded_cache_source_manifest(tmp_path, monkeypatch):
@@ -178,6 +239,21 @@ def test_tqdm_patch_uses_equal_file_weights():
 
         small_file.update(15)
         assert downloader.get_progress() == pytest.approx((1 + 15 / 30) / 3)
+
+
+def test_tqdm_patch_recognizes_modelscope_file_counter():
+    downloader = CancellableDownloader(cancel_error_cls=RuntimeError)
+
+    with downloader:
+        # modelscope_hub labels its repository-level counter with unit="file".
+        # Four concurrent files at 50% are half of four tasks, not one task at
+        # 100%.
+        tqdm(total=4, unit="file", file=io.StringIO())
+        file_bars = [tqdm(total=100, unit="B", file=io.StringIO()) for _ in range(4)]
+        for file_bar in file_bars:
+            file_bar.update(50)
+
+        assert downloader.get_progress() == pytest.approx(0.5)
 
 
 def test_tqdm_patch_preserves_completion_without_intermediate_poll():
