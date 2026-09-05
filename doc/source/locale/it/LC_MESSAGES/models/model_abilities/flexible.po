@@ -309,3 +309,19 @@ msgstr ""
 "<https://github.com/xorbitsai/inference/tree/main/xinference/model/flexible/launchers>`_."
 " Si accettano contributi per aggiungere il supporto di più modelli di "
 "machine learning tradizionali!"
+
+#: ../../source/models/model_abilities/flexible.rst
+msgid "Local text classification models"
+msgstr "Modelli locali di classificazione del testo"
+
+#: ../../source/models/model_abilities/flexible.rst
+msgid "Register a local BERT or other Transformers sequence classification model using the same launcher with ``task=\"text-classification\"``. The directory must contain a trained classification model and tokenizer saved with ``save_pretrained``; a base encoder or a training checkpoint alone is insufficient. The model's ``config.json`` supplies ``id2label``, ``label2id`` and ``problem_type``. The directory must be accessible on the worker that loads the model."
+msgstr "Registrare un modello locale BERT o un altro modello Transformers di classificazione di sequenze con lo stesso launcher e ``task=\"text-classification\"``. La directory deve contenere un modello di classificazione addestrato e un tokenizer salvati con ``save_pretrained``; un encoder di base o un checkpoint di addestramento da solo non è sufficiente. Il file ``config.json`` del modello fornisce ``id2label``, ``label2id`` e ``problem_type``. La directory deve essere accessibile al worker che carica il modello."
+
+#: ../../source/models/model_abilities/flexible.rst
+msgid "Inference preserves the Transformers pipeline output: a batch returns one list of ``{\"label\": ..., \"score\": ...}`` entries per input. ``top_k=None`` returns all label scores. Choose ``max_length`` within the model's supported context length. Transformers must be installed in the model's runtime environment."
+msgstr "L’inferenza mantiene il formato di output della pipeline Transformers: un batch restituisce un elenco di voci ``{\"label\": ..., \"score\": ...}`` per ogni input. ``top_k=None`` restituisce i punteggi di tutte le etichette. Scegliere ``max_length`` entro la lunghezza di contesto supportata dal modello. Transformers deve essere installato nell’ambiente di esecuzione del modello."
+
+#: ../../source/models/model_abilities/flexible.rst
+msgid "For multi-label models, export the configuration with ``problem_type=\"multi_label_classification\"`` so the pipeline uses sigmoid scores rather than softmax. Label thresholds and any fallback that selects a label when none pass the thresholds belong in the calling application; Xinference does not force a prediction. Keep private weights and business-specific labels outside the Xinference source tree."
+msgstr "Per i modelli multietichetta, esportare la configurazione con ``problem_type=\"multi_label_classification\"`` affinché la pipeline usi punteggi sigmoid anziché softmax. Le soglie per etichetta e la selezione alternativa quando nessuna etichetta supera la soglia spettano all’applicazione chiamante; Xinference non impone una previsione. Conservare i pesi privati e le etichette aziendali fuori dall’albero sorgente di Xinference."

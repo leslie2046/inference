@@ -258,3 +258,19 @@ msgstr ""
 "Xinference 內建的靈活模型啟動器可以在  `Github "
 "<https://github.com/xorbitsai/inference/tree/main/xinference/model/flexible/launchers>`_"
 " 找到，歡迎貢獻更多傳統機器學習模型的支援！"
+
+#: ../../source/models/model_abilities/flexible.rst
+msgid "Local text classification models"
+msgstr "本機文字分類模型"
+
+#: ../../source/models/model_abilities/flexible.rst
+msgid "Register a local BERT or other Transformers sequence classification model using the same launcher with ``task=\"text-classification\"``. The directory must contain a trained classification model and tokenizer saved with ``save_pretrained``; a base encoder or a training checkpoint alone is insufficient. The model's ``config.json`` supplies ``id2label``, ``label2id`` and ``problem_type``. The directory must be accessible on the worker that loads the model."
+msgstr "使用相同的 launcher 並設定 ``task=\"text-classification\"``，即可註冊本機 BERT 或其他 Transformers 序列分類模型。目錄必須包含透過 ``save_pretrained`` 儲存的已訓練分類模型和分詞器；僅有基礎編碼器或訓練檢查點並不足夠。模型的 ``config.json`` 提供 ``id2label``、``label2id`` 和 ``problem_type``。載入模型的 worker 必須能夠存取該目錄。"
+
+#: ../../source/models/model_abilities/flexible.rst
+msgid "Inference preserves the Transformers pipeline output: a batch returns one list of ``{\"label\": ..., \"score\": ...}`` entries per input. ``top_k=None`` returns all label scores. Choose ``max_length`` within the model's supported context length. Transformers must be installed in the model's runtime environment."
+msgstr "推論保留 Transformers pipeline 的輸出格式：批次輸入的每個文字對應一個由 ``{\"label\": ..., \"score\": ...}`` 項目組成的清單。``top_k=None`` 傳回所有標籤分數。請將 ``max_length`` 設定在模型支援的上下文長度以內。模型執行環境必須安裝 Transformers。"
+
+#: ../../source/models/model_abilities/flexible.rst
+msgid "For multi-label models, export the configuration with ``problem_type=\"multi_label_classification\"`` so the pipeline uses sigmoid scores rather than softmax. Label thresholds and any fallback that selects a label when none pass the thresholds belong in the calling application; Xinference does not force a prediction. Keep private weights and business-specific labels outside the Xinference source tree."
+msgstr "匯出多標籤模型時，請在設定中指定 ``problem_type=\"multi_label_classification\"``，使 pipeline 使用 sigmoid 分數而非 softmax。標籤閾值以及沒有標籤達到閾值時的備援選擇策略應由呼叫端應用程式處理；Xinference 不會強制輸出預測標籤。私有權重和業務標籤應保存在 Xinference 原始碼樹之外。"

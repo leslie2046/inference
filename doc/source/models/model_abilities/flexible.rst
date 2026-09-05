@@ -115,6 +115,54 @@ After the model is successfully loaded, we can perform inference using the follo
 
     {"sequence":"one day I will see the world","labels":["travel","cooking","dancing"],"scores":[0.9799638986587524,0.010605016723275185,0.009431036189198494]}
 
+Local text classification models
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Register a local BERT or other Transformers sequence classification model using
+the same launcher with ``task="text-classification"``. The directory must contain
+a trained classification model and tokenizer saved with ``save_pretrained``;
+a base encoder or a training checkpoint alone is insufficient. The model's
+``config.json`` supplies ``id2label``, ``label2id`` and ``problem_type``.
+The directory must be accessible on the worker that loads the model.
+
+.. code-block:: python
+
+    import json
+    from xinference.client import Client
+
+    client = Client("http://127.0.0.1:9997")
+    registration = {
+        "version": 2,
+        "model_name": "private-text-classifier",
+        "model_uri": "/path/to/exported-classifier",
+        "launcher": "xinference.model.flexible.launchers.transformers",
+        "launcher_args": json.dumps({
+            "task": "text-classification",
+            "device": "cpu",
+        }),
+    }
+    client.register_model("flexible", json.dumps(registration), persist=True)
+    uid = client.launch_model(
+        model_name="private-text-classifier", model_type="flexible"
+    )
+    model = client.get_model(uid)
+    scores = model.infer(
+        ["First document", "Second document"],
+        top_k=None, batch_size=8, truncation=True, max_length=128,
+    )
+
+Inference preserves the Transformers pipeline output: a batch returns one list
+of ``{"label": ..., "score": ...}`` entries per input. ``top_k=None`` returns all
+label scores. Choose ``max_length`` within the model's supported context length.
+Transformers must be installed in the model's runtime environment.
+
+For multi-label models, export the configuration with
+``problem_type="multi_label_classification"`` so the pipeline uses sigmoid scores
+rather than softmax. Label thresholds and any fallback that selects a label when
+none pass the thresholds belong in the calling application; Xinference does not
+force a prediction. Keep private weights and business-specific labels outside
+the Xinference source tree.
+
 ModelScope Pipeline Model
 ~~~~~~~~~~~~~~~~~~~~~~~~~
 
