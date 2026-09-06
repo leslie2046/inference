@@ -25,6 +25,8 @@ class AutoModel(FlexibleModel):
         from transformers import pipeline
 
         config = dict(self.config or {})
+        # The worker injects this runtime option; it is not a pipeline argument.
+        config.pop("enable_virtual_env", None)
         config.setdefault("device", self.device)
         self._pipeline = pipeline(model=self.model_path, **config)
 

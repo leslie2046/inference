@@ -22,14 +22,15 @@ import pytest
 
 @pytest.mark.parametrize("task", ["text-classification", "zero-shot-classification"])
 @pytest.mark.parametrize("device", [None, "cpu", 0])
-def test_pipeline_device(monkeypatch, task, device):
+@pytest.mark.parametrize("enable_virtual_env", [None, False, True])
+def test_pipeline_device(monkeypatch, task, device, enable_virtual_env):
     from ..core import FlexibleModelSpec
     from ..utils import get_launcher
 
     launcher = get_launcher("xinference.model.flexible.launchers.transformers")
     pipeline = Mock()
     monkeypatch.setitem(sys.modules, "transformers", SimpleNamespace(pipeline=pipeline))
-    config = {"task": task}
+    config = {"task": task, "enable_virtual_env": enable_virtual_env}
     if device is not None:
         config["device"] = device
     model = launcher(
@@ -55,7 +56,11 @@ def test_pipeline_device(monkeypatch, task, device):
 )
 def test_local_bert_classification(tmp_path, problem_type):
     import torch
-    from transformers import BertConfig, BertForSequenceClassification, BertTokenizer
+    from transformers import (
+        BertConfig,
+        BertForSequenceClassification,
+        BertTokenizerFast,
+    )
 
     from ..core import FlexibleModelSpec, create_flexible_model_instance
     from ..custom import register_flexible_model, unregister_flexible_model
@@ -65,7 +70,7 @@ def test_local_bert_classification(tmp_path, problem_type):
     vocab.write_text(
         "[PAD]\n[UNK]\n[CLS]\n[SEP]\n[MASK]\ngood\nbad\n", encoding="utf-8"
     )
-    tokenizer = BertTokenizer(vocab_file=str(vocab), do_lower_case=False)
+    tokenizer = BertTokenizerFast(vocab_file=str(vocab), do_lower_case=False)
     tokenizer.save_pretrained(tmp_path)
     config = BertConfig(
         vocab_size=7,
@@ -92,7 +97,9 @@ def test_local_bert_classification(tmp_path, problem_type):
     )
     register_flexible_model(spec, persist=False)
     try:
-        model = create_flexible_model_instance("classifier", spec.model_name)
+        model = create_flexible_model_instance(
+            "classifier", spec.model_name, enable_virtual_env=False
+        )
         model.load()
         texts = ["good", "bad good", "good " * 30]
         with torch.inference_mode():
