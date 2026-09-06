@@ -125,19 +125,6 @@ a base encoder or a training checkpoint alone is insufficient. The model's
 ``config.json`` supplies ``id2label``, ``label2id`` and ``problem_type``.
 The directory must be accessible on the worker that loads the model.
 
-Leave ``device`` out of ``launcher_args``: registered arguments override launch
-arguments. At launch, use ``n_gpu=None, device="cpu"`` for CPU or
-``n_gpu=1, device="cuda:0"`` for GPU with CUDA-enabled PyTorch.
-
-``n_gpu`` controls resource allocation; ``device`` controls pipeline placement.
-``cuda:0`` refers to the first GPU visible to the model process. In the Web UI,
-select CPU or GPU when launching, then add ``device`` with value ``cpu`` or
-``cuda:0`` under advanced engine parameters.
-
-For multi-label classification, set ``problem_type="multi_label_classification"``
-in the model configuration and pass ``top_k=None`` when calling ``infer`` to
-return all label scores. Apply label thresholds in the calling application.
-
 ModelScope Pipeline Model
 ~~~~~~~~~~~~~~~~~~~~~~~~~
 
