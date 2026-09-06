@@ -55,6 +55,8 @@ def test_pipeline_device(monkeypatch, task, device, enable_virtual_env):
     "problem_type", ["single_label_classification", "multi_label_classification"]
 )
 def test_local_bert_classification(tmp_path, problem_type):
+    pytest.importorskip("torch")
+    pytest.importorskip("transformers")
     import torch
     from transformers import (
         BertConfig,
