@@ -317,15 +317,3 @@ msgstr "Modelli locali di classificazione del testo"
 #: ../../source/models/model_abilities/flexible.rst
 msgid "Register a local BERT or other Transformers sequence classification model using the same launcher with ``task=\"text-classification\"``. The directory must contain a trained classification model and tokenizer saved with ``save_pretrained``; a base encoder or a training checkpoint alone is insufficient. The model's ``config.json`` supplies ``id2label``, ``label2id`` and ``problem_type``. The directory must be accessible on the worker that loads the model."
 msgstr "Registrare un modello locale BERT o un altro modello Transformers di classificazione di sequenze con lo stesso launcher e ``task=\"text-classification\"``. La directory deve contenere un modello di classificazione addestrato e un tokenizer salvati con ``save_pretrained``; un encoder di base o un checkpoint di addestramento da solo non è sufficiente. Il file ``config.json`` del modello fornisce ``id2label``, ``label2id`` e ``problem_type``. La directory deve essere accessibile al worker che carica il modello."
-
-#: ../../source/models/model_abilities/flexible.rst
-msgid "``n_gpu`` controls resource allocation; ``device`` controls pipeline placement. ``cuda:0`` refers to the first GPU visible to the model process. In the Web UI, select CPU or GPU when launching, then add ``device`` with value ``cpu`` or ``cuda:0`` under advanced engine parameters."
-msgstr "``n_gpu`` controlla l’allocazione delle risorse; ``device`` controlla il dispositivo di esecuzione della pipeline. ``cuda:0`` indica la prima GPU visibile al processo del modello. Nella Web UI, selezionare CPU o GPU all’avvio, quindi aggiungere ``device`` con valore ``cpu`` o ``cuda:0`` nei parametri avanzati del motore."
-
-#: ../../source/models/model_abilities/flexible.rst
-msgid "Leave ``device`` out of ``launcher_args``: registered arguments override launch arguments. At launch, use ``n_gpu=None, device=\"cpu\"`` for CPU or ``n_gpu=1, device=\"cuda:0\"`` for GPU with CUDA-enabled PyTorch."
-msgstr "Omettere ``device`` da ``launcher_args``: gli argomenti registrati prevalgono su quelli di avvio. All’avvio, usare ``n_gpu=None, device=\"cpu\"`` per CPU o ``n_gpu=1, device=\"cuda:0\"`` per GPU con PyTorch dotato di supporto CUDA."
-
-#: ../../source/models/model_abilities/flexible.rst
-msgid "For multi-label classification, set ``problem_type=\"multi_label_classification\"`` in the model configuration and pass ``top_k=None`` when calling ``infer`` to return all label scores. Apply label thresholds in the calling application."
-msgstr "Per la classificazione multietichetta, impostare ``problem_type=\"multi_label_classification\"`` nella configurazione del modello e passare ``top_k=None`` quando si chiama ``infer`` per restituire tutti i punteggi delle etichette. Applicare le soglie nell’applicazione chiamante."

@@ -268,15 +268,3 @@ msgstr "本地文本分类模型"
 #: ../../source/models/model_abilities/flexible.rst
 msgid "Register a local BERT or other Transformers sequence classification model using the same launcher with ``task=\"text-classification\"``. The directory must contain a trained classification model and tokenizer saved with ``save_pretrained``; a base encoder or a training checkpoint alone is insufficient. The model's ``config.json`` supplies ``id2label``, ``label2id`` and ``problem_type``. The directory must be accessible on the worker that loads the model."
 msgstr "使用同一 launcher 并设置 ``task=\"text-classification\"``，即可注册本地 BERT 或其他 Transformers 序列分类模型。目录必须包含通过 ``save_pretrained`` 保存的已训练分类模型和分词器；仅有基础编码器或训练检查点是不够的。模型的 ``config.json`` 提供 ``id2label``、``label2id`` 和 ``problem_type``。加载模型的 worker 必须能够访问该目录。"
-
-#: ../../source/models/model_abilities/flexible.rst
-msgid "``n_gpu`` controls resource allocation; ``device`` controls pipeline placement. ``cuda:0`` refers to the first GPU visible to the model process. In the Web UI, select CPU or GPU when launching, then add ``device`` with value ``cpu`` or ``cuda:0`` under advanced engine parameters."
-msgstr "``n_gpu`` 控制资源分配；``device`` 控制 pipeline 的运行设备。``cuda:0`` 指模型进程可见的第一张 GPU。在 Web UI 中，启动时选择 CPU 或 GPU，然后在高级引擎参数中添加 ``device``，值为 ``cpu`` 或 ``cuda:0``。"
-
-#: ../../source/models/model_abilities/flexible.rst
-msgid "Leave ``device`` out of ``launcher_args``: registered arguments override launch arguments. At launch, use ``n_gpu=None, device=\"cpu\"`` for CPU or ``n_gpu=1, device=\"cuda:0\"`` for GPU with CUDA-enabled PyTorch."
-msgstr "不要在 ``launcher_args`` 中指定 ``device``：注册参数会覆盖启动参数。启动时，CPU 使用 ``n_gpu=None, device=\"cpu\"``；GPU 使用 ``n_gpu=1, device=\"cuda:0\"``，并需安装支持 CUDA 的 PyTorch。"
-
-#: ../../source/models/model_abilities/flexible.rst
-msgid "For multi-label classification, set ``problem_type=\"multi_label_classification\"`` in the model configuration and pass ``top_k=None`` when calling ``infer`` to return all label scores. Apply label thresholds in the calling application."
-msgstr "对于多标签分类，在模型配置中设置 ``problem_type=\"multi_label_classification\"``，并在调用 ``infer`` 时传入 ``top_k=None``，以返回全部标签分数。在调用应用中应用标签阈值。"
