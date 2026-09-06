@@ -317,17 +317,13 @@ msgid "Register a local BERT or other Transformers sequence classification model
 msgstr "Registre um modelo local BERT ou outro modelo Transformers de classificação de sequências com o mesmo launcher e ``task=\"text-classification\"``. O diretório deve conter um modelo de classificação treinado e um tokenizador salvos com ``save_pretrained``; apenas um codificador base ou um checkpoint de treinamento não é suficiente. O arquivo ``config.json`` do modelo fornece ``id2label``, ``label2id`` e ``problem_type``. O diretório deve estar acessível ao worker que carrega o modelo."
 
 #: ../../source/models/model_abilities/flexible.rst
-msgid "Inference preserves the Transformers pipeline output: a batch returns one list of ``{\"label\": ..., \"score\": ...}`` entries per input. ``top_k=None`` returns all label scores. Choose ``max_length`` within the model's supported context length. Transformers must be installed in the model's runtime environment."
-msgstr "A inferência preserva o formato de saída do pipeline Transformers: um lote retorna uma lista de entradas ``{\"label\": ..., \"score\": ...}`` para cada entrada. ``top_k=None`` retorna as pontuações de todos os rótulos. Escolha ``max_length`` dentro do comprimento de contexto suportado pelo modelo. Transformers deve estar instalado no ambiente de execução do modelo."
-
-#: ../../source/models/model_abilities/flexible.rst
-msgid "For multi-label models, export the configuration with ``problem_type=\"multi_label_classification\"`` so the pipeline uses sigmoid scores rather than softmax. Label thresholds and any fallback that selects a label when none pass the thresholds belong in the calling application; Xinference does not force a prediction. Keep private weights and business-specific labels outside the Xinference source tree."
-msgstr "Para modelos multirrótulo, exporte a configuração com ``problem_type=\"multi_label_classification\"`` para que o pipeline use pontuações sigmoid em vez de softmax. Os limiares por rótulo e a seleção alternativa quando nenhum rótulo atinge o limiar pertencem à aplicação chamadora; o Xinference não força uma previsão. Mantenha os pesos privados e os rótulos de negócio fora da árvore de código-fonte do Xinference."
-
-#: ../../source/models/model_abilities/flexible.rst
-msgid "Leave ``device`` out of ``launcher_args`` to choose CPU or GPU at launch time. Registered launcher arguments override launch arguments. The CPU example above uses ``n_gpu=None`` to avoid allocating a GPU. To launch a GPU instance of the same registered model, use the following configuration with CUDA-enabled PyTorch:"
-msgstr "Omita ``device`` em ``launcher_args`` para escolher CPU ou GPU na inicialização. Os argumentos registrados do launcher prevalecem sobre os argumentos de inicialização. O exemplo de CPU acima usa ``n_gpu=None`` para evitar a alocação de uma GPU. Para iniciar uma instância GPU do mesmo modelo registrado, use a configuração a seguir com PyTorch compatível com CUDA:"
-
-#: ../../source/models/model_abilities/flexible.rst
 msgid "``n_gpu`` controls resource allocation; ``device`` controls pipeline placement. ``cuda:0`` refers to the first GPU visible to the model process. In the Web UI, select CPU or GPU when launching, then add ``device`` with value ``cpu`` or ``cuda:0`` under advanced engine parameters."
 msgstr "``n_gpu`` controla a alocação de recursos; ``device`` controla o dispositivo de execução do pipeline. ``cuda:0`` indica a primeira GPU visível para o processo do modelo. Na Web UI, selecione CPU ou GPU ao iniciar e adicione ``device`` com o valor ``cpu`` ou ``cuda:0`` nos parâmetros avançados do mecanismo."
+
+#: ../../source/models/model_abilities/flexible.rst
+msgid "Leave ``device`` out of ``launcher_args``: registered arguments override launch arguments. At launch, use ``n_gpu=None, device=\"cpu\"`` for CPU or ``n_gpu=1, device=\"cuda:0\"`` for GPU with CUDA-enabled PyTorch."
+msgstr "Omita ``device`` em ``launcher_args``: os argumentos registrados prevalecem sobre os de inicialização. Ao iniciar, use ``n_gpu=None, device=\"cpu\"`` para CPU ou ``n_gpu=1, device=\"cuda:0\"`` para GPU com PyTorch compatível com CUDA."
+
+#: ../../source/models/model_abilities/flexible.rst
+msgid "For multi-label classification, set ``problem_type=\"multi_label_classification\"`` in the model configuration and pass ``top_k=None`` when calling ``infer`` to return all label scores. Apply label thresholds in the calling application."
+msgstr "Para classificação multirrótulo, defina ``problem_type=\"multi_label_classification\"`` na configuração do modelo e passe ``top_k=None`` ao chamar ``infer`` para retornar todas as pontuações dos rótulos. Aplique os limiares na aplicação chamadora."

@@ -321,17 +321,13 @@ msgid "Register a local BERT or other Transformers sequence classification model
 msgstr "Enregistrez un modèle local BERT ou un autre modèle Transformers de classification de séquences avec le même launcher et ``task=\"text-classification\"``. Le répertoire doit contenir un modèle de classification entraîné et un tokenizer enregistrés avec ``save_pretrained`` ; un encodeur de base ou un point de contrôle seul ne suffit pas. Le fichier ``config.json`` du modèle fournit ``id2label``, ``label2id`` et ``problem_type``. Le répertoire doit être accessible au worker qui charge le modèle."
 
 #: ../../source/models/model_abilities/flexible.rst
-msgid "Inference preserves the Transformers pipeline output: a batch returns one list of ``{\"label\": ..., \"score\": ...}`` entries per input. ``top_k=None`` returns all label scores. Choose ``max_length`` within the model's supported context length. Transformers must be installed in the model's runtime environment."
-msgstr "L’inférence conserve le format de sortie du pipeline Transformers : un lot renvoie, pour chaque entrée, une liste d’éléments ``{\"label\": ..., \"score\": ...}``. ``top_k=None`` renvoie tous les scores des étiquettes. Choisissez ``max_length`` dans la limite de contexte prise en charge par le modèle. Transformers doit être installé dans l’environnement d’exécution du modèle."
-
-#: ../../source/models/model_abilities/flexible.rst
-msgid "For multi-label models, export the configuration with ``problem_type=\"multi_label_classification\"`` so the pipeline uses sigmoid scores rather than softmax. Label thresholds and any fallback that selects a label when none pass the thresholds belong in the calling application; Xinference does not force a prediction. Keep private weights and business-specific labels outside the Xinference source tree."
-msgstr "Pour les modèles multi-étiquettes, exportez la configuration avec ``problem_type=\"multi_label_classification\"`` afin que le pipeline utilise des scores sigmoid plutôt que softmax. Les seuils par étiquette et le choix de repli si aucune étiquette ne dépasse son seuil relèvent de l’application appelante ; Xinference ne force pas de prédiction. Conservez les poids privés et les étiquettes métier hors de l’arborescence source de Xinference."
-
-#: ../../source/models/model_abilities/flexible.rst
-msgid "Leave ``device`` out of ``launcher_args`` to choose CPU or GPU at launch time. Registered launcher arguments override launch arguments. The CPU example above uses ``n_gpu=None`` to avoid allocating a GPU. To launch a GPU instance of the same registered model, use the following configuration with CUDA-enabled PyTorch:"
-msgstr "Ne spécifiez pas ``device`` dans ``launcher_args`` pour choisir CPU ou GPU au lancement. Les arguments enregistrés du launcher remplacent ceux du lancement. L’exemple CPU ci-dessus utilise ``n_gpu=None`` pour éviter d’allouer un GPU. Pour lancer une instance GPU du même modèle enregistré, utilisez la configuration suivante avec une installation de PyTorch prenant en charge CUDA :"
-
-#: ../../source/models/model_abilities/flexible.rst
 msgid "``n_gpu`` controls resource allocation; ``device`` controls pipeline placement. ``cuda:0`` refers to the first GPU visible to the model process. In the Web UI, select CPU or GPU when launching, then add ``device`` with value ``cpu`` or ``cuda:0`` under advanced engine parameters."
 msgstr "``n_gpu`` contrôle l’allocation des ressources ; ``device`` contrôle le périphérique d’exécution du pipeline. ``cuda:0`` désigne le premier GPU visible par le processus du modèle. Dans la Web UI, sélectionnez CPU ou GPU au lancement, puis ajoutez ``device`` avec la valeur ``cpu`` ou ``cuda:0`` dans les paramètres avancés du moteur."
+
+#: ../../source/models/model_abilities/flexible.rst
+msgid "Leave ``device`` out of ``launcher_args``: registered arguments override launch arguments. At launch, use ``n_gpu=None, device=\"cpu\"`` for CPU or ``n_gpu=1, device=\"cuda:0\"`` for GPU with CUDA-enabled PyTorch."
+msgstr "Ne spécifiez pas ``device`` dans ``launcher_args`` : les arguments enregistrés remplacent ceux du lancement. Au lancement, utilisez ``n_gpu=None, device=\"cpu\"`` pour le CPU ou ``n_gpu=1, device=\"cuda:0\"`` pour le GPU avec PyTorch prenant en charge CUDA."
+
+#: ../../source/models/model_abilities/flexible.rst
+msgid "For multi-label classification, set ``problem_type=\"multi_label_classification\"`` in the model configuration and pass ``top_k=None`` when calling ``infer`` to return all label scores. Apply label thresholds in the calling application."
+msgstr "Pour la classification multi-étiquettes, définissez ``problem_type=\"multi_label_classification\"`` dans la configuration du modèle et passez ``top_k=None`` lors de l’appel à ``infer`` pour renvoyer tous les scores des étiquettes. Appliquez les seuils dans l’application appelante."

@@ -284,17 +284,13 @@ msgid "Register a local BERT or other Transformers sequence classification model
 msgstr "동일한 launcher에서 ``task=\"text-classification\"`` 을 지정하여 로컬 BERT 또는 다른 Transformers 시퀀스 분류 모델을 등록할 수 있습니다. 디렉터리에는 ``save_pretrained`` 로 저장한 학습된 분류 모델과 토크나이저가 있어야 합니다. 기본 인코더나 학습 체크포인트만으로는 충분하지 않습니다. 모델의 ``config.json`` 에서 ``id2label``, ``label2id``, ``problem_type`` 을 제공합니다. 모델을 로드하는 worker가 해당 디렉터리에 접근할 수 있어야 합니다."
 
 #: ../../source/models/model_abilities/flexible.rst
-msgid "Inference preserves the Transformers pipeline output: a batch returns one list of ``{\"label\": ..., \"score\": ...}`` entries per input. ``top_k=None`` returns all label scores. Choose ``max_length`` within the model's supported context length. Transformers must be installed in the model's runtime environment."
-msgstr "추론은 Transformers pipeline의 출력 형식을 유지합니다. 배치 입력은 입력마다 ``{\"label\": ..., \"score\": ...}`` 항목의 목록을 반환합니다. ``top_k=None`` 은 모든 레이블 점수를 반환합니다. ``max_length`` 는 모델이 지원하는 컨텍스트 길이 이내로 설정하세요. 모델 실행 환경에 Transformers가 설치되어 있어야 합니다."
-
-#: ../../source/models/model_abilities/flexible.rst
-msgid "For multi-label models, export the configuration with ``problem_type=\"multi_label_classification\"`` so the pipeline uses sigmoid scores rather than softmax. Label thresholds and any fallback that selects a label when none pass the thresholds belong in the calling application; Xinference does not force a prediction. Keep private weights and business-specific labels outside the Xinference source tree."
-msgstr "다중 레이블 모델을 내보낼 때 ``problem_type=\"multi_label_classification\"`` 을 설정하면 pipeline이 softmax 대신 sigmoid 점수를 사용합니다. 레이블 임계값과 임계값을 통과하는 레이블이 없을 때의 대체 선택 정책은 호출 애플리케이션에서 처리해야 합니다. Xinference는 예측 레이블을 강제하지 않습니다. 비공개 가중치와 업무별 레이블은 Xinference 소스 트리 외부에 보관하세요."
-
-#: ../../source/models/model_abilities/flexible.rst
-msgid "Leave ``device`` out of ``launcher_args`` to choose CPU or GPU at launch time. Registered launcher arguments override launch arguments. The CPU example above uses ``n_gpu=None`` to avoid allocating a GPU. To launch a GPU instance of the same registered model, use the following configuration with CUDA-enabled PyTorch:"
-msgstr "시작할 때 CPU 또는 GPU를 선택하려면 ``launcher_args`` 에 ``device`` 를 지정하지 마세요. 등록된 launcher 인수는 시작 인수보다 우선합니다. 위 CPU 예제는 GPU를 할당하지 않도록 ``n_gpu=None`` 을 사용합니다. 같은 등록 모델의 GPU 인스턴스를 시작하려면 CUDA를 지원하는 PyTorch 환경에서 다음 설정을 사용하세요."
-
-#: ../../source/models/model_abilities/flexible.rst
 msgid "``n_gpu`` controls resource allocation; ``device`` controls pipeline placement. ``cuda:0`` refers to the first GPU visible to the model process. In the Web UI, select CPU or GPU when launching, then add ``device`` with value ``cpu`` or ``cuda:0`` under advanced engine parameters."
 msgstr "``n_gpu`` 는 리소스 할당을 제어하고, ``device`` 는 pipeline의 실행 장치를 제어합니다. ``cuda:0`` 은 모델 프로세스에서 볼 수 있는 첫 번째 GPU를 가리킵니다. Web UI에서 시작할 때 CPU 또는 GPU를 선택한 다음, 고급 엔진 매개변수에 ``device`` 를 추가하고 값을 ``cpu`` 또는 ``cuda:0`` 으로 설정하세요."
+
+#: ../../source/models/model_abilities/flexible.rst
+msgid "Leave ``device`` out of ``launcher_args``: registered arguments override launch arguments. At launch, use ``n_gpu=None, device=\"cpu\"`` for CPU or ``n_gpu=1, device=\"cuda:0\"`` for GPU with CUDA-enabled PyTorch."
+msgstr "``launcher_args`` 에 ``device`` 를 지정하지 마세요. 등록된 인수는 시작 인수보다 우선합니다. 시작할 때 CPU는 ``n_gpu=None, device=\"cpu\"`` 를, GPU는 CUDA를 지원하는 PyTorch와 함께 ``n_gpu=1, device=\"cuda:0\"`` 를 사용하세요."
+
+#: ../../source/models/model_abilities/flexible.rst
+msgid "For multi-label classification, set ``problem_type=\"multi_label_classification\"`` in the model configuration and pass ``top_k=None`` when calling ``infer`` to return all label scores. Apply label thresholds in the calling application."
+msgstr "다중 레이블 분류에서는 모델 설정에 ``problem_type=\"multi_label_classification\"`` 을 지정하고 ``infer`` 를 호출할 때 ``top_k=None`` 을 전달하여 모든 레이블 점수를 반환하세요. 레이블 임계값은 호출 애플리케이션에서 적용하세요."

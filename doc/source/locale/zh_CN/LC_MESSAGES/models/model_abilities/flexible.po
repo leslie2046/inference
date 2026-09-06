@@ -270,17 +270,13 @@ msgid "Register a local BERT or other Transformers sequence classification model
 msgstr "使用同一 launcher 并设置 ``task=\"text-classification\"``，即可注册本地 BERT 或其他 Transformers 序列分类模型。目录必须包含通过 ``save_pretrained`` 保存的已训练分类模型和分词器；仅有基础编码器或训练检查点是不够的。模型的 ``config.json`` 提供 ``id2label``、``label2id`` 和 ``problem_type``。加载模型的 worker 必须能够访问该目录。"
 
 #: ../../source/models/model_abilities/flexible.rst
-msgid "Inference preserves the Transformers pipeline output: a batch returns one list of ``{\"label\": ..., \"score\": ...}`` entries per input. ``top_k=None`` returns all label scores. Choose ``max_length`` within the model's supported context length. Transformers must be installed in the model's runtime environment."
-msgstr "推理保留 Transformers pipeline 的输出格式：批量输入的每个文本对应一个由 ``{\"label\": ..., \"score\": ...}`` 条目组成的列表。``top_k=None`` 返回所有标签分数。请将 ``max_length`` 设置在模型支持的上下文长度以内。模型运行环境必须安装 Transformers。"
-
-#: ../../source/models/model_abilities/flexible.rst
-msgid "For multi-label models, export the configuration with ``problem_type=\"multi_label_classification\"`` so the pipeline uses sigmoid scores rather than softmax. Label thresholds and any fallback that selects a label when none pass the thresholds belong in the calling application; Xinference does not force a prediction. Keep private weights and business-specific labels outside the Xinference source tree."
-msgstr "多标签模型导出时，请在配置中设置 ``problem_type=\"multi_label_classification\"``，使 pipeline 使用 sigmoid 分数而非 softmax。标签阈值以及无标签达到阈值时选择标签的兜底策略应在调用应用中处理；Xinference 不会强制输出预测标签。私有权重和业务标签应保存在 Xinference 源码树之外。"
-
-#: ../../source/models/model_abilities/flexible.rst
-msgid "Leave ``device`` out of ``launcher_args`` to choose CPU or GPU at launch time. Registered launcher arguments override launch arguments. The CPU example above uses ``n_gpu=None`` to avoid allocating a GPU. To launch a GPU instance of the same registered model, use the following configuration with CUDA-enabled PyTorch:"
-msgstr "不要在 ``launcher_args`` 中指定 ``device``，以便启动时选择 CPU 或 GPU。注册的 launcher 参数会覆盖启动参数。上面的 CPU 示例使用 ``n_gpu=None``，避免分配 GPU。若要为同一注册模型启动 GPU 实例，请在支持 CUDA 的 PyTorch 环境中使用以下配置："
-
-#: ../../source/models/model_abilities/flexible.rst
 msgid "``n_gpu`` controls resource allocation; ``device`` controls pipeline placement. ``cuda:0`` refers to the first GPU visible to the model process. In the Web UI, select CPU or GPU when launching, then add ``device`` with value ``cpu`` or ``cuda:0`` under advanced engine parameters."
 msgstr "``n_gpu`` 控制资源分配；``device`` 控制 pipeline 的运行设备。``cuda:0`` 指模型进程可见的第一张 GPU。在 Web UI 中，启动时选择 CPU 或 GPU，然后在高级引擎参数中添加 ``device``，值为 ``cpu`` 或 ``cuda:0``。"
+
+#: ../../source/models/model_abilities/flexible.rst
+msgid "Leave ``device`` out of ``launcher_args``: registered arguments override launch arguments. At launch, use ``n_gpu=None, device=\"cpu\"`` for CPU or ``n_gpu=1, device=\"cuda:0\"`` for GPU with CUDA-enabled PyTorch."
+msgstr "不要在 ``launcher_args`` 中指定 ``device``：注册参数会覆盖启动参数。启动时，CPU 使用 ``n_gpu=None, device=\"cpu\"``；GPU 使用 ``n_gpu=1, device=\"cuda:0\"``，并需安装支持 CUDA 的 PyTorch。"
+
+#: ../../source/models/model_abilities/flexible.rst
+msgid "For multi-label classification, set ``problem_type=\"multi_label_classification\"`` in the model configuration and pass ``top_k=None`` when calling ``infer`` to return all label scores. Apply label thresholds in the calling application."
+msgstr "对于多标签分类，在模型配置中设置 ``problem_type=\"multi_label_classification\"``，并在调用 ``infer`` 时传入 ``top_k=None``，以返回全部标签分数。在调用应用中应用标签阈值。"
