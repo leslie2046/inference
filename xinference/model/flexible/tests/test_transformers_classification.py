@@ -93,12 +93,12 @@ def test_local_bert_classification(tmp_path, problem_type):
         model_name="test-local-bert-classifier",
         model_uri=str(tmp_path),
         launcher="xinference.model.flexible.launchers.transformers",
-        launcher_args=json.dumps({"task": "text-classification", "device": "cpu"}),
+        launcher_args=json.dumps({"task": "text-classification"}),
     )
     register_flexible_model(spec, persist=False)
     try:
         model = create_flexible_model_instance(
-            "classifier", spec.model_name, enable_virtual_env=False
+            "classifier", spec.model_name, device="cpu", enable_virtual_env=False
         )
         model.load()
         texts = ["good", "bad good", "good " * 30]

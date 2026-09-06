@@ -138,18 +138,36 @@ The directory must be accessible on the worker that loads the model.
         "launcher": "xinference.model.flexible.launchers.transformers",
         "launcher_args": json.dumps({
             "task": "text-classification",
-            "device": "cpu",
         }),
     }
     client.register_model("flexible", json.dumps(registration), persist=True)
     uid = client.launch_model(
-        model_name="private-text-classifier", model_type="flexible"
+        model_name="private-text-classifier", model_type="flexible",
+        model_uid="classifier-cpu", n_gpu=None, device="cpu",
     )
     model = client.get_model(uid)
     scores = model.infer(
         ["First document", "Second document"],
         top_k=None, batch_size=8, truncation=True, max_length=128,
     )
+
+Leave ``device`` out of ``launcher_args`` to choose CPU or GPU at launch time.
+Registered launcher arguments override launch arguments. The CPU example above
+uses ``n_gpu=None`` to avoid allocating a GPU. To launch a GPU instance of the
+same registered model, use the following configuration with CUDA-enabled PyTorch:
+
+.. code-block:: python
+
+    gpu_uid = client.launch_model(
+        model_name="private-text-classifier", model_type="flexible",
+        model_uid="classifier-gpu", n_gpu=1, device="cuda:0",
+    )
+    gpu_model = client.get_model(gpu_uid)
+
+``n_gpu`` controls resource allocation; ``device`` controls pipeline placement.
+``cuda:0`` refers to the first GPU visible to the model process. In the Web UI,
+select CPU or GPU when launching, then add ``device`` with value ``cpu`` or
+``cuda:0`` under advanced engine parameters.
 
 Inference preserves the Transformers pipeline output: a batch returns one list
 of ``{"label": ..., "score": ...}`` entries per input. ``top_k=None`` returns all
