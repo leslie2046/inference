@@ -60,6 +60,7 @@ import CommandLine from './command-line';
 import DownloadProgressDetails, { type DownloadProgressFile } from './download-progress-details';
 import ReplicaPlacementConfig from './replica-placement-config';
 import { FormField } from '@/components/ui/form-field';
+import { shouldApplyPreferredDownloadSource } from './download-source-utils.mjs';
 
 interface LaunchDialogProps {
   model?: CatalogModel;
@@ -85,6 +86,10 @@ interface LaunchProgressResponse {
   stage?: string;
   download_files?: DownloadProgressFile[];
   replicas?: LaunchProgressReplica[];
+}
+
+interface SystemSettingsResponse {
+  download_source: string;
 }
 
 const DOWNLOAD_TERMINAL_STAGES = new Set(['completed', 'failed', 'cancelled']);
@@ -121,7 +126,7 @@ export default function LaunchDialog({
   const [form] = useForm();
   const { t } = useI18n();
   const { clusterAuth } = useGlobal();
-  const { isAdmin } = useMenuAuth();
+  const { isAdmin, hasSettingsRead } = useMenuAuth();
   const router = useRouter();
   const [loading, setLoading] = useState(false);
   const [isDownloading, setIsDownloading] = useState(false);
@@ -415,6 +420,21 @@ export default function LaunchDialog({
       value: item,
     }));
   }, [model?.download_hubs, model?.modelSpecs, modelEngineValue]);
+  const downloadHubOptionsRef = useRef(downloadHubOptions);
+  const downloadHubTouchedRef = useRef(false);
+  const downloadHubFieldProps = useMemo(
+    () => ({
+      options: downloadHubOptions,
+      onChange: () => {
+        downloadHubTouchedRef.current = true;
+      },
+    }),
+    [downloadHubOptions]
+  );
+
+  useEffect(() => {
+    downloadHubOptionsRef.current = downloadHubOptions;
+  }, [downloadHubOptions]);
 
   const workerIpFieldProps = useMemo(
     () => ({
@@ -679,7 +699,7 @@ export default function LaunchDialog({
         type: 'select',
         label: t('launchModel.downloadHub'),
         placeholder: t('launchModel.downloadHubPlaceholder'),
-        fieldProps: { options: downloadHubOptions },
+        fieldProps: downloadHubFieldProps,
       },
       {
         name: 'enable_thinking',
@@ -793,7 +813,7 @@ export default function LaunchDialog({
         type: 'select',
         label: t('launchModel.downloadHub'),
         placeholder: t('launchModel.downloadHubPlaceholder'),
-        fieldProps: { options: downloadHubOptions },
+        fieldProps: downloadHubFieldProps,
       },
       {
         name: 'request_limits',
@@ -899,7 +919,7 @@ export default function LaunchDialog({
         type: 'select',
         label: t('launchModel.downloadHub'),
         placeholder: t('launchModel.downloadHubPlaceholder'),
-        fieldProps: { options: downloadHubOptions },
+        fieldProps: downloadHubFieldProps,
       },
       {
         name: 'gguf_quantization',
@@ -1020,7 +1040,7 @@ export default function LaunchDialog({
         type: 'select',
         label: t('launchModel.downloadHub'),
         placeholder: t('launchModel.downloadHubPlaceholder'),
-        fieldProps: { options: downloadHubOptions },
+        fieldProps: downloadHubFieldProps,
       },
       {
         name: 'request_limits',
@@ -1148,7 +1168,7 @@ export default function LaunchDialog({
         type: 'select',
         label: t('launchModel.downloadHub'),
         placeholder: t('launchModel.downloadHubPlaceholder'),
-        fieldProps: { options: downloadHubOptions },
+        fieldProps: downloadHubFieldProps,
       },
       {
         name: 'request_limits',
@@ -1253,7 +1273,7 @@ export default function LaunchDialog({
         type: 'select',
         label: t('launchModel.downloadHub'),
         placeholder: t('launchModel.downloadHubPlaceholder'),
-        fieldProps: { options: downloadHubOptions },
+        fieldProps: downloadHubFieldProps,
       },
       {
         name: 'request_limits',
@@ -1360,7 +1380,7 @@ export default function LaunchDialog({
         type: 'select',
         label: t('launchModel.downloadHub'),
         placeholder: t('launchModel.downloadHubPlaceholder'),
-        fieldProps: { options: downloadHubOptions },
+        fieldProps: downloadHubFieldProps,
       },
       {
         name: 'request_limits',
@@ -1838,6 +1858,7 @@ export default function LaunchDialog({
   useEffect(() => {
     if (!isOpen) return;
 
+    downloadHubTouchedRef.current = false;
     const latestConfig = getLatestModelConfigHistory(model?.model_name);
 
     form.resetFields();
@@ -1846,6 +1867,38 @@ export default function LaunchDialog({
       form.setFieldsValue(transformFetchToForm(latestConfig.data));
     }
   }, [form, isOpen, model?.model_name]);
+
+  useEffect(() => {
+    if (!isOpen || (clusterAuth?.auth && !hasSettingsRead)) return;
+
+    let active = true;
+
+    const applyPreferredDownloadSource = async () => {
+      try {
+        const { download_source } = await request.get<SystemSettingsResponse>(
+          '/v1/cluster/system_settings'
+        );
+        if (
+          active &&
+          shouldApplyPreferredDownloadSource(
+            download_source,
+            downloadHubOptionsRef.current,
+            downloadHubTouchedRef.current
+          )
+        ) {
+          form.setFieldValue('download_hub', download_source);
+        }
+      } catch {
+        // Keep the current selection when settings are unavailable or unauthorized.
+      }
+    };
+
+    void applyPreferredDownloadSource();
+
+    return () => {
+      active = false;
+    };
+  }, [clusterAuth?.auth, form, hasSettingsRead, isOpen, model?.model_name]);
 
   useEffect(() => {
     return () => {
