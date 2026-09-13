@@ -20,6 +20,13 @@ ARG PIP_INDEX=https://mirrors.aliyun.com/pypi/simple/
 #ARG HTTPS_PROXY
 #ARG NO_PROXY
 COPY xinference/deploy/docker/requirements_cpu/ /opt/inference/xinference/deploy/docker/requirements_cpu/
+COPY local-wheels/ /opt/wheels/
+
+RUN sed -i \
+    -e '/^[[:space:]]*en_core_web_trf[[:space:]]*@/c\en_core_web_trf @ file:///opt/wheels/en_core_web_trf-3.8.0-py3-none-any.whl' \
+    -e '/^[[:space:]]*en_core_web_sm[[:space:]]*@/c\en_core_web_sm @ file:///opt/wheels/en_core_web_sm-3.8.0-py3-none-any.whl' \
+    /opt/inference/xinference/deploy/docker/requirements_cpu/requirements_cpu-models.txt
+
 RUN --mount=type=cache,target=/root/.cache/pip \
     python -m pip install --upgrade -i "$PIP_INDEX" pip "setuptools<82" wheel "packaging>=24.2" && \
     pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu && \
