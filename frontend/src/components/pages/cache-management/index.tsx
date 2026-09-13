@@ -11,6 +11,7 @@ import {
   Database,
   Download,
   ExternalLink,
+  Package,
   Pause,
   Play,
   RefreshCw,
@@ -32,6 +33,7 @@ import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
 import { Collapsible, CollapsibleContent } from '@/components/ui/collapsible';
 import { ConfirmDialog } from '@/components/ui/confirm-dialog';
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import PageContainer from '@/components/ui/page-container';
 import { Progress } from '@/components/ui/progress';
 import { SearchInput } from '@/components/ui/search-input';
@@ -50,8 +52,13 @@ import { useI18n } from '@/contexts/i18n-context';
 import { useMenuAuth } from '@/hooks/use-menu-auth';
 import { ModelType } from '@/constants';
 import request from '@/lib/request';
-import { cn, copyToClipboard } from '@/lib/utils';
-import type { ModelCachedItem, ModelDownloadItem, ModelEnvItem } from '@/types/services';
+import { cn, copyToClipboard, formatFileSize } from '@/lib/utils';
+import type {
+  ModelCachedItem,
+  ModelDownloadItem,
+  ModelEnvItem,
+  VirtualEnvPackage,
+} from '@/types/services';
 
 type TabValue = 'models' | 'environments';
 const ACTIVE_CACHE_DOWNLOAD_STAGES = new Set(['pending', 'resuming', 'downloading', 'pausing']);
@@ -77,6 +84,10 @@ interface ListResponse<T> {
 
 interface DeleteResponse {
   result?: boolean;
+}
+
+interface VirtualEnvPackagesResponse {
+  packages?: VirtualEnvPackage[];
 }
 
 interface ModelRegistrationListItem {
@@ -114,6 +125,12 @@ function includesQuery(query: string, ...values: unknown[]): boolean {
       .toLowerCase()
       .includes(query)
   );
+}
+
+function formatDiskUsage(sizeBytes?: number): string {
+  return typeof sizeBytes === 'number' && Number.isFinite(sizeBytes)
+    ? formatFileSize(Math.max(0, sizeBytes))
+    : '-';
 }
 
 function SummaryCard({ icon, label, value }: { icon: ReactNode; label: string; value: number }) {
@@ -174,10 +191,14 @@ export default function CacheManagement() {
   const [launchingModelName, setLaunchingModelName] = useState<string>();
   const [expandedDownloadUids, setExpandedDownloadUids] = useState<Set<string>>(() => new Set());
   const [pendingAction, setPendingAction] = useState<PendingAction>();
+  const [packageEnvironment, setPackageEnvironment] = useState<ModelEnvItem>();
+  const [environmentPackages, setEnvironmentPackages] = useState<VirtualEnvPackage[]>([]);
+  const [packagesLoading, setPackagesLoading] = useState(false);
   const [lastUpdated, setLastUpdated] = useState<number>();
   const downloadsInFlight = useRef(false);
   const launchRequestGuardRef = useRef(createLatestRequestGuard());
   const previousDownloadUids = useRef<Set<string>>(new Set());
+  const packageRequestGuardRef = useRef(createLatestRequestGuard());
 
   const availableTabs = useMemo<TabValue[]>(() => {
     const tabs: TabValue[] = [];
@@ -232,6 +253,41 @@ export default function CacheManagement() {
     setEnvironments(asList(response));
     setLastUpdated(Date.now());
   }, [canViewEnvironments]);
+
+  const openPackageDetails = useCallback(async (item: ModelEnvItem) => {
+    const requestId = packageRequestGuardRef.current.start();
+    setPackageEnvironment(item);
+    setEnvironmentPackages([]);
+    setPackagesLoading(true);
+    const params = new URLSearchParams({
+      model_name: item.model_name,
+      model_engine: item.model_engine,
+      python_version: item.python_version,
+      worker_ip: item.actor_ip_address,
+    });
+
+    try {
+      const response = await request.get<VirtualEnvPackagesResponse>(
+        `/v1/virtualenvs/packages?${params.toString()}`
+      );
+      if (packageRequestGuardRef.current.isLatest(requestId)) {
+        setEnvironmentPackages(Array.isArray(response?.packages) ? response.packages : []);
+      }
+    } catch {
+      // handled by interceptor
+    } finally {
+      if (packageRequestGuardRef.current.isLatest(requestId)) {
+        setPackagesLoading(false);
+      }
+    }
+  }, []);
+
+  const closePackageDetails = useCallback(() => {
+    packageRequestGuardRef.current.start();
+    setPackageEnvironment(undefined);
+    setEnvironmentPackages([]);
+    setPackagesLoading(false);
+  }, []);
 
   const loadAll = useCallback(async () => {
     setInitialLoading(true);
@@ -532,6 +588,7 @@ export default function CacheManagement() {
                   <col className="w-[15%]" />
                   <col className="w-[6%]" />
                   <col className="w-[5%]" />
+                  <col className="w-[7%]" />
                   <col className="w-[4%]" />
                   <col className="w-[15%]" />
                   <col className="w-[12%]" />
@@ -545,6 +602,7 @@ export default function CacheManagement() {
                     <TableHead>{t('cacheManagement.modelVersion')}</TableHead>
                     <TableHead>{t('cacheManagement.format')}</TableHead>
                     <TableHead>{t('cacheManagement.size')}</TableHead>
+                    <TableHead>{t('cacheManagement.diskUsage')}</TableHead>
                     <TableHead>{t('cacheManagement.quantization')}</TableHead>
                     <TableHead>{t('cacheManagement.statusAndProgress')}</TableHead>
                     <TableHead>{t('cacheManagement.path')}</TableHead>
@@ -645,6 +703,7 @@ export default function CacheManagement() {
                           <TableCell className="font-semibold tabular-nums">
                             {download.model_size_in_billions ?? '-'}
                           </TableCell>
+                          <TableCell>-</TableCell>
                           <TableCell>{download.quantization || '-'}</TableCell>
                           <TableCell>
                             <div className="w-full space-y-2">
@@ -741,7 +800,7 @@ export default function CacheManagement() {
                             className={cn('hover:bg-transparent', !isDetailsExpanded && 'border-0')}
                             aria-hidden={!isDetailsExpanded}
                           >
-                            <TableCell colSpan={10} className="p-0">
+                            <TableCell colSpan={11} className="p-0">
                               <Collapsible open={isDetailsExpanded}>
                                 <CollapsibleContent forceMount>
                                   <div className="space-y-3 bg-muted/10 px-4 py-3">
@@ -784,6 +843,9 @@ export default function CacheManagement() {
                       <TableCell>{item.model_format || '-'}</TableCell>
                       <TableCell className="font-semibold tabular-nums">
                         {item.model_size_in_billions ?? '-'}
+                      </TableCell>
+                      <TableCell className="tabular-nums">
+                        {formatDiskUsage(item.size_bytes)}
                       </TableCell>
                       <TableCell>{item.quantization || '-'}</TableCell>
                       <TableCell>
@@ -842,7 +904,7 @@ export default function CacheManagement() {
 
                   {filteredDownloads.length === 0 && filteredCachedModels.length === 0 && (
                     <TableRow>
-                      <TableCell colSpan={10} className="h-64 text-center text-muted-foreground">
+                      <TableCell colSpan={11} className="h-64 text-center text-muted-foreground">
                         {t('cacheManagement.noModelCacheItems')}
                       </TableCell>
                     </TableRow>
@@ -859,6 +921,7 @@ export default function CacheManagement() {
                   <col className="w-[14%]" />
                   <col className="w-[12%]" />
                   <col className="w-[10%]" />
+                  <col className="w-[10%]" />
                   <col className="w-[21%]" />
                   <col className="w-[21%]" />
                   <col className="w-[11%]" />
@@ -869,6 +932,7 @@ export default function CacheManagement() {
                     <TableHead>{t('cacheManagement.modelName')}</TableHead>
                     <TableHead>{t('cacheManagement.engine')}</TableHead>
                     <TableHead>{t('cacheManagement.pythonVersion')}</TableHead>
+                    <TableHead>{t('cacheManagement.diskUsage')}</TableHead>
                     <TableHead>{t('cacheManagement.path')}</TableHead>
                     <TableHead>{t('cacheManagement.realPath')}</TableHead>
                     <TableHead>{t('cacheManagement.worker')}</TableHead>
@@ -884,6 +948,9 @@ export default function CacheManagement() {
                         <TableCell className="break-words font-medium">{item.model_name}</TableCell>
                         <TableCell className="break-words">{item.model_engine}</TableCell>
                         <TableCell>{item.python_version}</TableCell>
+                        <TableCell className="tabular-nums">
+                          {formatDiskUsage(item.size_bytes)}
+                        </TableCell>
                         <TableCell>
                           <PathCell path={item.path} copyLabel={t('cacheManagement.copyPath')} />
                         </TableCell>
@@ -897,27 +964,37 @@ export default function CacheManagement() {
                           {item.actor_ip_address}
                         </TableCell>
                         <TableCell>
-                          {canDeleteEnvironments ? (
-                            <InfoTooltip content={t('cacheManagement.deleteEnvironment')}>
+                          <div className="flex items-center gap-1">
+                            <InfoTooltip content={t('cacheManagement.packageDetails')}>
                               <Button
                                 variant="ghost"
                                 size="icon"
-                                aria-label={t('cacheManagement.deleteEnvironment')}
-                                className="hover:bg-destructive/10 hover:text-destructive"
-                                onClick={() => setPendingAction({ kind: 'environment', item })}
+                                aria-label={t('cacheManagement.packageDetails')}
+                                onClick={() => void openPackageDetails(item)}
                               >
-                                <Trash2 />
+                                <Package />
                               </Button>
                             </InfoTooltip>
-                          ) : (
-                            '-'
-                          )}
+                            {canDeleteEnvironments && (
+                              <InfoTooltip content={t('cacheManagement.deleteEnvironment')}>
+                                <Button
+                                  variant="ghost"
+                                  size="icon"
+                                  aria-label={t('cacheManagement.deleteEnvironment')}
+                                  className="hover:bg-destructive/10 hover:text-destructive"
+                                  onClick={() => setPendingAction({ kind: 'environment', item })}
+                                >
+                                  <Trash2 />
+                                </Button>
+                              </InfoTooltip>
+                            )}
+                          </div>
                         </TableCell>
                       </TableRow>
                     ))
                   ) : (
                     <TableRow>
-                      <TableCell colSpan={7} className="h-64 text-center text-muted-foreground">
+                      <TableCell colSpan={8} className="h-64 text-center text-muted-foreground">
                         {t('cacheManagement.noVirtualEnvironments')}
                       </TableCell>
                     </TableRow>
@@ -944,6 +1021,56 @@ export default function CacheManagement() {
         onConfirm={() => void handleConfirmAction()}
         isLoading={actionLoading}
       />
+
+      <Dialog
+        open={Boolean(packageEnvironment)}
+        onOpenChange={(open) => {
+          if (!open) closePackageDetails();
+        }}
+      >
+        <DialogContent className="sm:max-w-3xl">
+          <DialogHeader>
+            <DialogTitle>
+              {t('cacheManagement.packageDetails')}
+              {packageEnvironment ? ` - ${packageEnvironment.model_name}` : ''}
+            </DialogTitle>
+          </DialogHeader>
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>{t('cacheManagement.packageName')}</TableHead>
+                <TableHead>{t('cacheManagement.packageVersion')}</TableHead>
+                <TableHead className="text-right">{t('cacheManagement.packageSize')}</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {packagesLoading ? (
+                <TableRow>
+                  <TableCell colSpan={3} className="h-32 text-center text-muted-foreground">
+                    {t('cacheManagement.loadingPackages')}
+                  </TableCell>
+                </TableRow>
+              ) : environmentPackages.length ? (
+                environmentPackages.map((item) => (
+                  <TableRow key={`${item.name}:${item.version}`}>
+                    <TableCell className="break-all font-medium">{item.name}</TableCell>
+                    <TableCell>{item.version}</TableCell>
+                    <TableCell className="text-right tabular-nums">
+                      {formatFileSize(item.size_bytes)}
+                    </TableCell>
+                  </TableRow>
+                ))
+              ) : (
+                <TableRow>
+                  <TableCell colSpan={3} className="h-32 text-center text-muted-foreground">
+                    {t('cacheManagement.noVirtualEnvPackages')}
+                  </TableCell>
+                </TableRow>
+              )}
+            </TableBody>
+          </Table>
+        </DialogContent>
+      </Dialog>
     </PageContainer>
   );
 }

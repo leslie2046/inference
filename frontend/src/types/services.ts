@@ -73,6 +73,7 @@ export interface ModelCachedItem {
   model_version: string;
   path: string;
   real_path?: string;
+  size_bytes?: number;
   actor_ip_address: string;
 }
 
@@ -81,8 +82,15 @@ export interface ModelEnvItem {
   model_engine: string;
   path: string;
   real_path: string;
+  size_bytes?: number;
   python_version: string;
   actor_ip_address: string;
+}
+
+export interface VirtualEnvPackage {
+  name: string;
+  version: string;
+  size_bytes: number;
 }
 
 export interface DownloadProgressFile {

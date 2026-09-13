@@ -106,6 +106,7 @@ from .utils import (
     filter_virtualenv_packages_by_markers,
     find_direct_reference_packages,
     find_remote_direct_reference_packages,
+    get_path_size,
     log_async,
     log_sync,
     merge_virtual_env_packages,
@@ -2368,6 +2369,17 @@ class WorkerActor(xo.StatelessActor):
                 generate_fn,
             ) = self._custom_register_type_to_cls[model_type]
             model_spec = model_spec_cls.parse_raw(model)
+            # parse_raw() applies the caller's JSON verbatim, and
+            # Config.extra = "allow" lets it set is_builtin as well.
+            # A client-submitted registration is never a vetted
+            # built-in, so reset it regardless of what the payload
+            # requested; allow_trust_remote_code() trusts this flag
+            # to enable trust_remote_code. This mirrors the same
+            # reset in Supervisor.register_model, needed here too
+            # since a supervisor forwards raw registrations to a
+            # specific worker via worker_ip.
+            if hasattr(model_spec, "is_builtin"):
+                model_spec.is_builtin = False
             try:
                 register_fn(model_spec, persist)
             except ValueError as e:
@@ -2717,6 +2729,7 @@ class WorkerActor(xo.StatelessActor):
                             {
                                 "model_format": family.model_format or "pytorch",
                                 "model_engine": family.engine,
+                                "quantization": family.quantization or "none",
                                 "model_hub": family.model_hub,
                                 "model_id": family.model_id,
                                 "cache_name": family.cache_name,
@@ -4916,7 +4929,12 @@ class WorkerActor(xo.StatelessActor):
         elif model_type == "audio":
             from ..model.audio.core import match_audio
 
-            spec = match_audio(model_name, download_hub, model_engine=model_engine)
+            spec = match_audio(
+                model_name,
+                download_hub,
+                model_engine=model_engine,
+                quantization=quantization,
+            )
         elif model_type == "video":
             from ..model.video.core import match_diffusion as match_video
             from ..model.video.core import resolve_video_model_name_and_engine
@@ -5785,6 +5803,18 @@ class WorkerActor(xo.StatelessActor):
                 cached_model["real_path"] = real_path
             cached_model["actor_ip_address"] = self.address
             cached_models.append(cached_model)
+        sizes = await asyncio.gather(
+            *[
+                asyncio.to_thread(
+                    get_path_size,
+                    cached_model["path"],
+                    follow_file_symlinks=True,
+                )
+                for cached_model in cached_models
+            ]
+        )
+        for cached_model, size in zip(cached_models, sizes):
+            cached_model["size_bytes"] = size
         return cached_models
 
     @staticmethod
@@ -6208,14 +6238,30 @@ class WorkerActor(xo.StatelessActor):
                 }
                 virtual_envs.append(virtual_env)
 
+            sizes = await asyncio.gather(
+                *[
+                    asyncio.to_thread(get_path_size, virtual_env["path"])
+                    for virtual_env in virtual_envs
+                ]
+            )
+            for virtual_env, size in zip(virtual_envs, sizes):
+                virtual_env["size_bytes"] = size
+
             return virtual_envs
         except Exception as e:
             logger.error(f"Error in list_virtual_envs: {e}")
             raise
 
-    async def list_virtual_env_packages(self, model_name: str) -> Dict[str, Any]:
-        """List packages installed in a specific virtual environment."""
-        return self._virtual_env_manager.list_virtual_env_packages(model_name)
+    async def list_virtual_env_packages(
+        self, model_name: str, model_engine: str, python_version: str
+    ) -> Dict[str, Any]:
+        """List packages installed directly in one virtual environment."""
+        return await asyncio.to_thread(
+            self._virtual_env_manager.list_virtual_env_packages,
+            model_name,
+            model_engine,
+            python_version,
+        )
 
     async def remove_virtual_env(
         self,
