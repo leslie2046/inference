@@ -432,6 +432,63 @@ async def test_chat_with_non_dict_usage_does_not_crash(_chat_pool):
     assert parsed["choices"][0]["message"]["content"] == "hi"
 
 
+
+class _ConcurrentEmbeddingModel:
+    allow_batch = True
+
+    def __init__(self):
+        self.model_family = MockModelFamily()
+        self._entered = 0
+        self._both_entered = asyncio.Event()
+
+    async def create_embedding(self, input, **kwargs):
+        self._entered += 1
+        if self._entered >= 2:
+            self._both_entered.set()
+        await self._both_entered.wait()
+        return {"data": [{"index": 0, "embedding": [1.0]}], "input": input}
+
+
+class _ConcurrentEmbeddingModelActor(ModelActor):
+    def __init__(self, supervisor_address, worker_address, replica_model_uid):
+        super().__init__(
+            supervisor_address=supervisor_address,
+            worker_address=worker_address,
+            model=_ConcurrentEmbeddingModel(),  # type: ignore[arg-type]
+            replica_model_uid=replica_model_uid,
+        )
+        self._model_state = "ready"
+
+    async def __pre_destroy__(self):
+        pass
+
+    async def record_metrics(self, name, op, kwargs):
+        pass
+
+
+@pytest.mark.asyncio
+async def test_embedding_requests_can_enter_model_actor_concurrently(setup_pool):
+    pool = setup_pool
+    actor = await xo.create_actor(
+        _ConcurrentEmbeddingModelActor,
+        address=pool.external_address,
+        uid="concurrent-embedding-model",
+        supervisor_address="test:123",
+        worker_address="test:345",
+        replica_model_uid="test_embedding",
+    )
+
+    first = asyncio.create_task(actor.create_embedding("first"))
+    second = asyncio.create_task(actor.create_embedding("second"))
+
+    first_result, second_result = await asyncio.wait_for(
+        asyncio.gather(first, second), timeout=1
+    )
+
+    assert json.loads(first_result)["input"] == "first"
+    assert json.loads(second_result)["input"] == "second"
+
+
 class _BatchGenerateModel:
     allow_batch = True
 
