@@ -960,6 +960,7 @@ class ModelActor(xo.StatelessActor, CancelMixin):
         # Otherwise return NO_OP for legacy models or when model doesn't handle abort
         return AbortRequestMessage.NO_OP.name
 
+    @xo.no_lock
     @request_limit
     @log_async(logger=logger)
     async def create_embedding(self, input: Union[str, List[str]], *args, **kwargs):
