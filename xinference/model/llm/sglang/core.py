@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import asyncio
 import json
 import logging
 import multiprocessing
@@ -37,6 +38,7 @@ from ....types import (
 from ...utils import check_dependency_available
 from .. import LLM, LLMFamilyV2, LLMSpecV1
 from ..core import chat_context_var, get_model_speculative_tokens_default
+from ..media import materialize_messages_media, media_workspace
 from ..utils import (
     DEEPSEEK_TOOL_CALL_FAMILY,
     GEMMA_TOOL_CALL_FAMILY,
@@ -57,6 +59,7 @@ class SGLANGModelConfig(TypedDict, total=False):
     tp_size: int
     mem_fraction_static: float
     log_level: str
+    launch_timeout: float
     attention_reduce_in_fp32: bool  # For gemma
     quantization: Optional[str]
     dtype: Optional[str]
@@ -65,6 +68,7 @@ class SGLANGModelConfig(TypedDict, total=False):
     node_rank: Optional[int]
     dist_init_addr: Optional[str]
     reasoning_content: bool
+    enable_thinking: bool
     # engine-neutral speculative decoding options, translated into the
     # speculative_* server args below and never forwarded to the engine as-is
     draft_model_path: Optional[str]
@@ -124,6 +128,7 @@ SGLANG_SUPPORTED_MODELS = [
     "MixtralForCausalLM",
     "Qwen2ForCausalLM",
     "OPTForCausalLM",
+    "Spark2_5ForCausalLM",
 ]
 SGLANG_SUPPORTED_CHAT_MODELS = [
     "LlamaForCausalLM",
@@ -141,6 +146,8 @@ SGLANG_SUPPORTED_CHAT_MODELS = [
     "Qwen3_5MoeForCausalLM",
     "HunYuanDenseV1ForCausalLM",
     "HYV3ForCausalLM",
+    "Spark2_5ForCausalLM",
+    "BailingMoeV3ForCausalLM",
 ]
 SGLANG_SUPPORTED_VISION_MODEL_LIST = [
     "Qwen2_5_VLForConditionalGeneration",
@@ -152,6 +159,8 @@ SGLANG_SUPPORTED_VISION_MODEL_LIST = [
     "Qwen3_5MoeForConditionalGeneration",
     "MiniMaxM3SparseForConditionalGeneration",
 ]
+
+LING3_FLASH_SGLANG_LAUNCH_TIMEOUT = 900.0
 
 
 class SGLANGModel(LLM):
@@ -282,6 +291,11 @@ class SGLANGModel(LLM):
                 **self._model_config,
             )
 
+    def _get_launch_timeout(self) -> float:
+        if self.model_family.has_architecture("BailingMoeV3ForCausalLM"):
+            return LING3_FLASH_SGLANG_LAUNCH_TIMEOUT
+        return 300.0
+
     def wait_for_load(self):
         if self._loading_thread:
             if self._shard == 0:
@@ -387,7 +401,10 @@ class SGLANGModel(LLM):
             else:
                 model_config["mem_fraction_static"] = 0.88
         model_config.setdefault("log_level", "info")
+        model_config.setdefault("launch_timeout", self._get_launch_timeout())
         model_config.setdefault("reasoning_content", False)
+        if self.model_family.has_architecture("BailingMoeV3ForCausalLM"):
+            model_config.setdefault("enable_thinking", True)
         self._apply_fp4_config(model_config)
 
         return model_config
@@ -946,18 +963,23 @@ class SGLANGChatModel(SGLANGModel, ChatModelMixin):
     def match_json(
         cls, llm_family: "LLMFamilyV2", llm_spec: "LLMSpecV1", quantization: str
     ) -> Union[bool, Tuple[bool, str]]:
-        if llm_spec.model_format not in ["pytorch", "gptq", "awq", "fp8", "bnb"]:
+        is_ling3 = llm_family.has_architecture("BailingMoeV3ForCausalLM")
+        supported_formats = ["pytorch", "gptq", "awq", "fp8", "bnb"]
+        if is_ling3:
+            supported_formats.append("fp4")
+        if llm_spec.model_format not in supported_formats:
             return (
                 False,
-                "SGLang chat engine supports pytorch/gptq/awq/fp8/bnb formats only",
+                f"SGLang chat engine supports {'/'.join(supported_formats)} formats only",
             )
-        if llm_spec.model_format == "fp4":
+        if llm_spec.model_format == "fp4" and not is_ling3:
             return (
                 False,
                 "SGLang chat engine does not support fp4 online quantization; use offline fp4 weights with a compatible SGLang version",
             )
         if llm_spec.model_format == "pytorch":
-            if quantization not in (None, "none"):
+            offline_ling_int4 = is_ling3 and quantization == "Int4"
+            if quantization not in (None, "none") and not offline_ling_int4:
                 return (
                     False,
                     "pytorch format with quantization is not supported by SGLang chat",
@@ -1003,6 +1025,18 @@ class SGLANGChatModel(SGLANGModel, ChatModelMixin):
         chat_template: str = (
             self.model_family.chat_template if self.model_family.chat_template else ""
         )
+        if not chat_template and self.model_family.has_architecture(
+            "Spark2_5ForCausalLM"
+        ):
+            chat_template_path = os.path.join(self.model_path, "chat_template.jinja")
+            try:
+                with open(chat_template_path, encoding="utf-8") as template_file:
+                    chat_template = template_file.read()
+            except OSError as exc:
+                raise ValueError(
+                    "Spark-X2.5 SGLang requires chat_template.jinja from the "
+                    "official model snapshot"
+                ) from exc
         # fix: Object of type list_iterator is not JSON serializable
         tools = list(generate_config.pop("tools", [])) if generate_config else None
         model_family = self.model_family.model_family or self.model_family.model_name
@@ -1105,12 +1139,26 @@ class SGLANGVisionModel(SGLANGModel, ChatModelMixin):
         request_id: Optional[str] = None,
     ) -> Union[ChatCompletion, AsyncGenerator[ChatCompletionChunk, None]]:
         import base64
+        import copy
         from io import BytesIO
 
         from PIL import Image
         from qwen_vl_utils import process_vision_info
 
-        messages = self._transform_messages(messages)
+        # qwen_vl_utils fetches urls itself and follows redirects, so the bytes are
+        # pulled here and the messages rewritten to local copies; the reader then
+        # has nothing left to resolve.  Work on a copy so the request never keeps
+        # paths that vanish with the directory.
+        with media_workspace("xinference-sglang-") as temp_dir:
+            messages = copy.deepcopy(messages)
+            # to_thread: blocking I/O on the model actor's event loop.
+            await asyncio.to_thread(materialize_messages_media, messages, temp_dir)
+            messages = self._transform_messages(messages)
+            images, video_inputs = await asyncio.to_thread(
+                process_vision_info, messages
+            )
+        if video_inputs:
+            raise ValueError("Not support video input now.")
 
         tools = list(generate_config.pop("tools", [])) if generate_config else None
         # Handle empty chat_template by falling back to tokenizer's chat_template
@@ -1135,10 +1183,6 @@ class SGLANGVisionModel(SGLANGModel, ChatModelMixin):
         prompt = self.get_full_context(
             messages, chat_template, tokenizer=tokenizer, **full_context_kwargs
         )
-
-        images, video_inputs = process_vision_info(messages)
-        if video_inputs:
-            raise ValueError("Not support video input now.")
 
         base64_images: Optional[List[str]] = None
         if images:

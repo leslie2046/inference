@@ -18,7 +18,7 @@ import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from fastapi import HTTPException
+from fastapi import HTTPException, Request
 
 from xinference.api.routers import admin, models
 from xinference.core.virtual_env_manager import VirtualEnvConflictError
@@ -26,6 +26,21 @@ from xinference.core.virtual_env_manager import VirtualEnvConflictError
 
 def _json_body(response):
     return json.loads(response.body.decode())
+
+
+def _request(request_id: str = "http-request-id") -> Request:
+    return Request(
+        {
+            "type": "http",
+            "method": "GET",
+            "path": "/v1/requests/req-123/progress",
+            "headers": [(b"x-request-id", request_id.encode())],
+            "query_string": b"",
+            "server": ("testserver", 80),
+            "client": ("testclient", 123),
+            "scheme": "http",
+        }
+    )
 
 
 @pytest.fixture
@@ -476,17 +491,26 @@ async def test_remove_virtual_env_returns_conflict_for_active_model(
 @pytest.mark.asyncio
 async def test_get_progress_returns_progress(mock_api, mock_supervisor):
     mock_supervisor.get_progress.return_value = 0.75
-    response = await admin.get_progress(request_id="req-123", api=mock_api)
+    response = await admin.get_progress(
+        request=_request(), request_id="req-123", api=mock_api
+    )
     assert response.status_code == 200
     assert _json_body(response) == {"progress": 0.75}
-    mock_supervisor.get_progress.assert_called_once_with("req-123")
+    mock_supervisor.get_progress.assert_called_once()
+    args, kwargs = mock_supervisor.get_progress.call_args
+    assert args == ("req-123",)
+    metadata = kwargs["__xinf_rpc_metadata__"]
+    assert metadata["correlation_id"] == "http-request-id"
+    assert metadata["operation_request_id"] == "req-123"
 
 
 @pytest.mark.asyncio
 async def test_get_progress_raises_400_on_key_error(mock_api, mock_supervisor):
     mock_supervisor.get_progress.side_effect = KeyError("req-missing")
     with pytest.raises(HTTPException) as exc_info:
-        await admin.get_progress(request_id="req-missing", api=mock_api)
+        await admin.get_progress(
+            request=_request(), request_id="req-missing", api=mock_api
+        )
     assert exc_info.value.status_code == 400
 
 
@@ -831,3 +855,529 @@ async def test_list_audit_filter_options_returns_502_when_group_search_fails(
     assert exc_info.value.detail == "Elasticsearch query failed"
     assert len(captured_urls) == 2
     assert captured_urls[1] == "http://elasticsearch:9200/audit-direct/_search"
+
+
+def test_log_search_uses_prefix_queries_for_high_cardinality_ids():
+    clause = admin._build_log_search_clause("xinf-123")
+    should = clause["bool"]["should"]
+
+    for field in ("request_id", "correlation_id"):
+        assert {
+            "prefix": {field: {"value": "xinf-123", "case_insensitive": True}}
+        } in should
+        assert all(field not in item.get("wildcard", {}) for item in should)
+
+
+def test_model_request_routes_use_separate_metadata_and_body_permissions():
+    captured = {}
+
+    def add_api_route(path, endpoint, methods=None, **kwargs):
+        captured[(path, tuple(methods or []))] = kwargs
+
+    api = MagicMock()
+    api._router.add_api_route.side_effect = add_api_route
+    api._auth_service = MagicMock()
+    api.is_authenticated.return_value = True
+
+    admin.register_routes(api)
+
+    correlated = captured[("/v1/cluster/logs/correlated", ("GET",))]
+    body = captured[("/v1/cluster/model-requests/{request_id}/body", ("GET",))]
+    assert correlated["dependencies"][0].scopes == ["logs:list"]
+    assert body["dependencies"][0].scopes == [
+        "logs:list",
+        "model_requests:read_body",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_model_request_body_denied_when_authentication_is_disabled(mock_api):
+    mock_api.is_authenticated.return_value = False
+    with pytest.raises(HTTPException) as exc_info:
+        await admin.get_model_request_body("xinf-123", api=mock_api)
+
+    assert exc_info.value.status_code == 403
+
+
+def test_log_source_excludes_protected_request_body():
+    assert "request_body" in admin._LOG_SOURCE_EXCLUDES
+    assert "request_body_raw" in admin._LOG_SOURCE_EXCLUDES
+
+
+@pytest.mark.asyncio
+async def test_search_correlated_logs_excludes_protected_body(monkeypatch, mock_api):
+    captured = {}
+
+    class FakeResponse:
+        status = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            return None
+
+        async def json(self):
+            return {
+                "hits": {
+                    "total": {"value": 1},
+                    "hits": [{"_source": {"request_id": "xinf-123"}}],
+                }
+            }
+
+    class FakeClientSession:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            return None
+
+        def post(self, url, json=None, headers=None, auth=None):
+            captured.update(url=url, body=json, headers=headers, auth=auth)
+            return FakeResponse()
+
+    monkeypatch.setenv("XINFERENCE_ES_URL", "http://elasticsearch:9200")
+    monkeypatch.setenv("XINFERENCE_ES_INDEX", "xinference-log-search")
+    mock_api._get_elasticsearch_client.return_value = FakeClientSession()
+
+    response = await admin.search_correlated_logs(
+        request_id="xinf-123",
+        time_from="2026-09-19T00:00:00Z",
+        time_to="2026-09-20T00:00:00Z",
+        api=mock_api,
+    )
+
+    assert captured["url"] == (
+        "http://elasticsearch:9200/xinference-log-search/_search"
+    )
+    query = captured["body"]["query"]["bool"]
+    assert query["filter"] == [
+        {
+            "range": {
+                "@timestamp": {
+                    "gte": "2026-09-19T00:00:00Z",
+                    "lte": "2026-09-20T00:00:00Z",
+                }
+            }
+        }
+    ]
+    assert query["should"] == [
+        {"term": {"request_id": "xinf-123"}},
+        {"term": {"correlation_id": "xinf-123"}},
+        {"wildcard": {"message.keyword": {"value": "*[request xinf-123]*"}}},
+    ]
+    assert query["minimum_should_match"] == 1
+    assert query["must_not"] == [{"term": {"module": "uvicorn.access"}}]
+    assert captured["body"]["_source"]["excludes"] == admin._LOG_SOURCE_EXCLUDES
+    assert captured["body"]["sort"] == [{"@timestamp": "asc"}]
+    assert _json_body(response) == {
+        "hits": [{"request_id": "xinf-123"}],
+        "total": 1,
+        "truncated": False,
+        "request_id": "xinf-123",
+    }
+
+
+def test_correlated_request_id_candidates_support_legacy_uuid_prefix():
+    request_id = "0b359038-38eb-4361-ab5a-b82c0472685d"
+
+    assert admin._correlated_request_id_candidates(request_id) == [
+        request_id,
+        f"xinf-{request_id}",
+    ]
+    assert admin._correlated_request_id_candidates(f"xinf-{request_id}") == [
+        f"xinf-{request_id}",
+        request_id,
+    ]
+    assert admin._correlated_request_id_candidates("external-request-id") == [
+        "external-request-id"
+    ]
+
+
+def test_parse_relative_time_rejects_compound_date_math():
+    now = admin.datetime(2026, 9, 21, 0, 0, tzinfo=admin.timezone.utc)
+
+    assert admin._parse_relative_time("now-1d-30d", now=now) is None
+    assert admin._parse_relative_time("now-1d/d", now=now) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("time_from", "time_to"),
+    [
+        ("now-1d-30d", "now"),
+        ("now-1d", "now-1h+30d"),
+    ],
+)
+async def test_search_correlated_logs_rejects_invalid_bounds_before_query(
+    monkeypatch, mock_api, time_from, time_to
+):
+    monkeypatch.setenv("XINFERENCE_ES_URL", "http://elasticsearch:9200")
+
+    with pytest.raises(HTTPException) as exc_info:
+        await admin.search_correlated_logs(
+            request_id="xinf-123",
+            time_from=time_from,
+            time_to=time_to,
+            api=mock_api,
+        )
+
+    assert exc_info.value.status_code == 400
+    mock_api._get_elasticsearch_client.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_search_correlated_logs_normalizes_epoch_and_offset_bounds(
+    monkeypatch, mock_api
+):
+    captured = {}
+
+    class FakeResponse:
+        status = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            return None
+
+        async def json(self):
+            return {"hits": {"total": {"value": 0}, "hits": []}}
+
+    class FakeClientSession:
+        def post(self, url, json=None, headers=None, auth=None):
+            captured["body"] = json
+            return FakeResponse()
+
+    monkeypatch.setenv("XINFERENCE_ES_URL", "http://elasticsearch:9200")
+    mock_api._get_elasticsearch_client.return_value = FakeClientSession()
+
+    await admin.search_correlated_logs(
+        request_id="xinf-123",
+        time_from="1789948800000",
+        time_to="2026-09-21T08:00:00+08:00",
+        api=mock_api,
+    )
+
+    bounds = captured["body"]["query"]["bool"]["filter"][0]["range"]["@timestamp"]
+    assert bounds == {
+        "gte": "2026-09-21T00:00:00Z",
+        "lte": "2026-09-21T00:00:00Z",
+    }
+
+
+@pytest.mark.asyncio
+async def test_search_correlated_logs_accepts_exact_seven_day_boundary(
+    monkeypatch, mock_api
+):
+    captured = {}
+
+    class FakeResponse:
+        status = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            return None
+
+        async def json(self):
+            return {"hits": {"total": {"value": 0}, "hits": []}}
+
+    class FakeClientSession:
+        def post(self, url, json=None, headers=None, auth=None):
+            captured["body"] = json
+            return FakeResponse()
+
+    monkeypatch.setenv("XINFERENCE_ES_URL", "http://elasticsearch:9200")
+    mock_api._get_elasticsearch_client.return_value = FakeClientSession()
+
+    await admin.search_correlated_logs(
+        request_id="xinf-123",
+        time_from="2026-09-14T00:00:00Z",
+        time_to="2026-09-21T00:00:00Z",
+        api=mock_api,
+    )
+
+    assert captured["body"]["query"]["bool"]["filter"][0] == {
+        "range": {
+            "@timestamp": {
+                "gte": "2026-09-14T00:00:00Z",
+                "lte": "2026-09-21T00:00:00Z",
+            }
+        }
+    }
+
+
+@pytest.mark.asyncio
+async def test_search_correlated_logs_deduplicates_documents_and_sorts_ties(
+    monkeypatch, mock_api
+):
+    class FakeResponse:
+        status = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            return None
+
+        async def json(self):
+            return {
+                "hits": {
+                    "total": {"value": 3},
+                    "hits": [
+                        {
+                            "_index": "logs-b",
+                            "_id": "2",
+                            "_source": {
+                                "@timestamp": "2026-09-20T00:00:00Z",
+                                "message": "worker",
+                            },
+                        },
+                        {
+                            "_index": "logs-a",
+                            "_id": "1",
+                            "_source": {
+                                "@timestamp": "2026-09-20T00:00:00Z",
+                                "message": "supervisor",
+                            },
+                        },
+                        {
+                            "_index": "logs-a",
+                            "_id": "1",
+                            "_source": {
+                                "@timestamp": "2026-09-20T00:00:00Z",
+                                "message": "duplicate",
+                            },
+                        },
+                    ],
+                }
+            }
+
+    class FakeClientSession:
+        def post(self, url, json=None, headers=None, auth=None):
+            return FakeResponse()
+
+    monkeypatch.setenv("XINFERENCE_ES_URL", "http://elasticsearch:9200")
+    mock_api._get_elasticsearch_client.return_value = FakeClientSession()
+
+    response = await admin.search_correlated_logs(
+        request_id="request-id",
+        time_from="2026-09-19T00:00:00Z",
+        time_to="2026-09-20T00:00:00Z",
+        api=mock_api,
+    )
+
+    assert _json_body(response)["hits"] == [
+        {"@timestamp": "2026-09-20T00:00:00Z", "message": "supervisor"},
+        {"@timestamp": "2026-09-20T00:00:00Z", "message": "worker"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_search_correlated_logs_rejects_oversized_time_range(
+    monkeypatch, mock_api
+):
+    monkeypatch.setenv("XINFERENCE_ES_URL", "http://elasticsearch:9200")
+
+    with pytest.raises(HTTPException) as exc_info:
+        await admin.search_correlated_logs(
+            request_id="xinf-123",
+            time_from="2026-09-01T00:00:00Z",
+            time_to="2026-09-20T00:00:00Z",
+            api=mock_api,
+        )
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == "Correlated log time range must not exceed 7 days"
+
+
+@pytest.mark.asyncio
+async def test_get_model_request_body_queries_only_started_event(monkeypatch, mock_api):
+    captured = {}
+    mock_api.is_authenticated.return_value = True
+
+    class FakeResponse:
+        status = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            return None
+
+        async def json(self):
+            return {
+                "hits": {
+                    "hits": [
+                        {
+                            "_source": {
+                                "request_id": "xinf-123",
+                                "event_type": "model_request_started",
+                                "request_body": {"model": "Qwen3.8-27B"},
+                            }
+                        }
+                    ]
+                }
+            }
+
+    class FakeClientSession:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            return None
+
+        def post(self, url, json=None, headers=None, auth=None):
+            captured.update(url=url, body=json, headers=headers, auth=auth)
+            return FakeResponse()
+
+    monkeypatch.setenv("XINFERENCE_ES_URL", "http://elasticsearch:9200")
+    mock_api._get_elasticsearch_client.return_value = FakeClientSession()
+
+    response = await admin.get_model_request_body("xinf-123", api=mock_api)
+
+    assert captured["url"] == (
+        "http://elasticsearch:9200/xinference-model-request-*/_search"
+    )
+    assert captured["body"]["size"] == 1
+    assert captured["body"]["query"]["bool"]["filter"] == [
+        {"term": {"request_id": "xinf-123"}}
+    ]
+    should = captured["body"]["query"]["bool"]["should"]
+    assert {"term": {"event_type": "model_request_started"}} in should
+    assert {"term": {"event": "model_request_started"}} in should
+    assert {"exists": {"field": "request_body"}} in should
+    assert {"exists": {"field": "request_body_raw"}} in should
+    assert {"exists": {"field": "request_body_omitted"}} in should
+    assert "request_body" in captured["body"]["_source"]["includes"]
+    assert "request_body_raw" in captured["body"]["_source"]["includes"]
+    assert _json_body(response)["request_body"] == {"model": "Qwen3.8-27B"}
+
+
+@pytest.mark.asyncio
+async def test_get_model_request_body_returns_404_when_started_event_is_missing(
+    monkeypatch, mock_api
+):
+    mock_api.is_authenticated.return_value = True
+
+    class FakeResponse:
+        status = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            return None
+
+        async def json(self):
+            return {"hits": {"hits": []}}
+
+    class FakeClientSession:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            return None
+
+        def post(self, url, json=None, headers=None, auth=None):
+            return FakeResponse()
+
+    monkeypatch.setenv("XINFERENCE_ES_URL", "http://elasticsearch:9200")
+    mock_api._get_elasticsearch_client.return_value = FakeClientSession()
+
+    with pytest.raises(HTTPException) as exc_info:
+        await admin.get_model_request_body("xinf-missing", api=mock_api)
+
+    assert exc_info.value.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_get_model_request_body_accepts_historical_body_without_event(
+    monkeypatch, mock_api
+):
+    mock_api.is_authenticated.return_value = True
+
+    class FakeResponse:
+        status = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            return None
+
+        async def json(self):
+            return {
+                "hits": {
+                    "hits": [
+                        {
+                            "_source": {
+                                "request_id": "xinf-historical",
+                                "request_body_raw": "historical body",
+                            }
+                        }
+                    ]
+                }
+            }
+
+    class FakeClientSession:
+        def post(self, url, json=None, headers=None, auth=None):
+            return FakeResponse()
+
+    monkeypatch.setenv("XINFERENCE_ES_URL", "http://elasticsearch:9200")
+    mock_api._get_elasticsearch_client.return_value = FakeClientSession()
+
+    response = await admin.get_model_request_body("xinf-historical", api=mock_api)
+    assert _json_body(response)["request_body_raw"] == "historical body"
+
+
+@pytest.mark.asyncio
+async def test_get_model_request_body_rejects_hit_without_body_fields(
+    monkeypatch, mock_api
+):
+    mock_api.is_authenticated.return_value = True
+
+    class FakeResponse:
+        status = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            return None
+
+        async def json(self):
+            return {
+                "hits": {
+                    "hits": [
+                        {
+                            "_source": {
+                                "request_id": "xinf-finished",
+                                "event_type": "model_request_finished",
+                            }
+                        }
+                    ]
+                }
+            }
+
+    class FakeClientSession:
+        def post(self, url, json=None, headers=None, auth=None):
+            return FakeResponse()
+
+    monkeypatch.setenv("XINFERENCE_ES_URL", "http://elasticsearch:9200")
+    mock_api._get_elasticsearch_client.return_value = FakeClientSession()
+
+    with pytest.raises(HTTPException) as exc_info:
+        await admin.get_model_request_body("xinf-finished", api=mock_api)
+    assert exc_info.value.status_code == 404

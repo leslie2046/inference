@@ -429,6 +429,13 @@ class LoggerNameFilter(logging.Filter):
 _POLLING_ENDPOINTS = ("/progress", "/replicas", "/metrics", "/status")
 
 
+class DropAccessLogFilter(logging.Filter):
+    """Keep Uvicorn access lines out of Xinference application logs."""
+
+    def filter(self, record):
+        return False
+
+
 class PollingAccessFilter(logging.Filter):
     """Drop successful polling requests from uvicorn's access log.
 
@@ -710,8 +717,7 @@ class AddressFormatter(logging.Formatter):
 
     def __init__(self, fmt=None, datefmt=None, style="%", role="", address=""):
         super().__init__(fmt, datefmt, style)
-        self.role = role
-        self.address = address
+        self.role, self.address = _resolve_formatter_identity(role, address)
         AddressFormatter._instances.add(self)
 
     def format(self, record):
@@ -773,8 +779,7 @@ class JsonFileFormatter(logging.Formatter):
 
     def __init__(self, role="", address="", **kwargs):
         super().__init__()
-        self.role = role
-        self.address = address
+        self.role, self.address = _resolve_formatter_identity(role, address)
         self._hostname = socket.gethostname()
         JsonFileFormatter._instances.add(self)
 
@@ -813,8 +818,7 @@ class TextFileFormatter(logging.Formatter):
 
     def __init__(self, role="", address="", **kwargs):
         super().__init__()
-        self.role = role
-        self.address = address
+        self.role, self.address = _resolve_formatter_identity(role, address)
         self._hostname = socket.gethostname()
         TextFileFormatter._instances.add(self)
 
@@ -846,8 +850,72 @@ class TextFileFormatter(logging.Formatter):
                 inst.address = address
 
 
+_PROCESS_LOG_IDENTITY_LOCK = threading.Lock()
+_PROCESS_LOG_IDENTITY = {
+    "role": "",
+    "address": "",
+    "node": socket.gethostname(),
+}
+
+
+def set_process_log_identity(role: str, address: str) -> None:
+    """Set the identity shared by application and model-request logs."""
+
+    with _PROCESS_LOG_IDENTITY_LOCK:
+        _PROCESS_LOG_IDENTITY["role"] = role
+        _PROCESS_LOG_IDENTITY["address"] = address
+        # Refresh the hostname after process/container startup.  This also keeps
+        # tests that patch ``socket.gethostname`` deterministic.
+        _PROCESS_LOG_IDENTITY["node"] = socket.gethostname()
+
+
+def get_process_log_identity() -> dict:
+    """Return a copy of the current process log identity."""
+
+    with _PROCESS_LOG_IDENTITY_LOCK:
+        return dict(_PROCESS_LOG_IDENTITY)
+
+
+def _resolve_formatter_identity(role: str, address: str) -> tuple[str, str]:
+    """Fill missing formatter identity fields from the process identity."""
+
+    if role and address:
+        return role, address
+    identity = get_process_log_identity()
+    return role or identity["role"], address or identity["address"]
+
+
+_XINFERENCE_FORMATTER_FACTORIES = (
+    AddressFormatter,
+    JsonFileFormatter,
+    TextFileFormatter,
+    "xinference.deploy.utils.AddressFormatter",
+    "xinference.deploy.utils.JsonFileFormatter",
+    "xinference.deploy.utils.TextFileFormatter",
+)
+
+
+def update_logging_config_addresses(
+    logging_conf: Optional[dict], role: str, address: str
+) -> None:
+    """Update Xinference formatter identities in a reusable logging config."""
+
+    if not logging_conf:
+        return
+    formatters = logging_conf.get("formatters")
+    if not isinstance(formatters, dict):
+        return
+    for formatter in formatters.values():
+        if not isinstance(formatter, dict):
+            continue
+        if formatter.get("()") in _XINFERENCE_FORMATTER_FACTORIES:
+            formatter["role"] = role
+            formatter["address"] = address
+
+
 def update_all_formatter_addresses(role: str, address: str):
-    """Update address on both text and JSON formatters."""
+    """Update the shared identity and all text/JSON formatter instances."""
+    set_process_log_identity(role, address)
     AddressFormatter.update_address(role, address)
     JsonFileFormatter.update_address(role, address)
     TextFileFormatter.update_address(role, address)
@@ -951,6 +1019,9 @@ def get_config_dict(
             "polling_access_filter": {
                 "()": __name__ + ".PollingAccessFilter",
             },
+            "drop_access_log_filter": {
+                "()": __name__ + ".DropAccessLogFilter",
+            },
         },
         "handlers": {
             "stream_handler": {
@@ -988,7 +1059,7 @@ def get_config_dict(
                 "handlers": handlers_list,
                 "level": log_level,
                 "propagate": False,
-                "filters": ["polling_access_filter"],
+                "filters": ["drop_access_log_filter"],
             },
             "transformers": {
                 "handlers": (

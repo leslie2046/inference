@@ -6,8 +6,98 @@ Model Launching Instructions
 
 This document aims to provide a functional overview of model launching.
 
+LLM launch recommendations
+==========================
+
+.. versionadded:: v3.5.0
+
+In an LLM's deployment dialog, use the launch recommendation button to get a
+suggested configuration, then review it before deploying. The button is available
+for LLMs, embedding, rerank, and audio models. Recommendations currently target a single replica.
+Custom model paths and custom engine parameters require manual configuration.
+
+How recommendations are chosen
+------------------------------
+
+Click **Recommend configuration** in the upper-right corner of the launch
+dialog to fill in the engine, format, size, and quantization together. You can
+still change these fields before clicking **Deploy**. The recommendation also
+selects a worker, so the configuration is tied to the machine checked for it.
+
+Xinference starts with your choices. If you have selected an 8B model, it looks
+for configurations of that size; it will not switch to a smaller model. Worker,
+GPU, and virtual environment settings also constrain the search. It checks each
+worker separately and removes combinations that fail the compatibility checks.
+If none remain, it leaves your form unchanged so you can adjust the settings.
+
+If memory data is available, Xinference prefers the largest size estimated to
+fit. Otherwise it falls back to the smallest unverified size. Within that size,
+installed engines are preferred; virtual-environment candidates remain eligible.
+
+Next comes the platform's default engine order. With the earlier conditions
+equal, MLX comes first on Apple Silicon, vLLM followed by SGLang on Linux with
+CUDA, and llama.cpp on CPU. Within an engine, common 4-bit quantizations such as
+Q4_K_M and Int4 are preferred when supported. If choices are still tied, weights
+already cached on that worker get priority. A cached model does not override
+your selected size or the earlier preferences.
+
+Estimates use offline metadata, one sequence, 2048 tokens, FP16 KV cache and
+80% of currently free memory. Automatic GPU placement uses the lowest free memory
+among eligible GPUs; CPU and Apple Silicon use available system memory. Multiple
+GPUs are not added together: multi-GPU requests keep compatibility-only selection.
+Known oversized candidates are excluded. Missing data remains unverified. Longer
+contexts, concurrency and engine preallocation can need more memory. No resources
+are reserved, and you still review and launch the model yourself.
+
+Using the API
+-------------
+
+``POST /v1/models/recommend`` is read-only. Supply ``model_name`` and
+``model_type="LLM"``; the optional ``constraints`` object accepts
+``model_size_in_billions``, ``worker_ip``, ``enable_virtual_env``, ``n_gpu``, and
+``gpu_idx``. Supplied constraints are hard requirements, never silently relaxed.
+
+.. code-block:: bash
+
+    curl -X POST http://127.0.0.1:9997/v1/models/recommend \
+      -H 'Content-Type: application/json' \
+      -d '{
+        "model_name": "qwen2.5-instruct",
+        "model_type": "LLM",
+        "constraints": {"model_size_in_billions": "7", "n_gpu": 1}
+      }'
+
+The response ``status`` is ``recommended`` or ``no_recommendation``. On success,
+``config`` contains launch-compatible fields such as ``model_engine``,
+``model_format``, ``model_size_in_billions``, ``quantization``, and ``worker_ip``.
+``reasons`` and ``warnings`` contain entries with ``code`` and ``message`` fields.
+If no configuration satisfies the constraints, review the explanation and adjust
+the constraints or configure the launch manually.
+
+A recommendation does not guarantee sufficient memory or a successful launch.
+It reserves no resources, downloads no model files, and installs no dependencies.
+Existing launch behavior is unchanged; deployment remains a separate action.
+
+``config`` also includes the effective
+``enable_virtual_env`` and any supplied ``n_gpu`` and ``gpu_idx`` constraints.
+``n_gpu=null`` requests CPU placement, while ``n_gpu="auto"`` uses the existing
+launch allocation policy rather than calculating the required GPU count.
+
+Both ``recommended`` and ``no_recommendation`` return HTTP 200. An unknown model
+returns HTTP 404; invalid requests return HTTP 422. Reason and warning codes use
+lower snake_case. The ``memory_not_verified`` warning is always included.
+
+Recommendations for other model types
+======================================
+
+.. versionadded:: v3.5.0
+
+Embedding, rerank, and audio models use the same **Recommend configuration** button and ``POST /v1/models/recommend`` endpoint; set ``model_type`` to ``embedding``, ``rerank``, or ``audio``. The recommendation fills only the fields supported by that type, without selecting a model size. Embedding and rerank prefer an available sentence-transformers engine; audio prefers an available MLX engine on Apple Silicon, otherwise its standard Transformers or PyTorch backend. Installed engines come before engines that need a virtual environment, and unquantized variants are preferred within an engine. Unlike LLM recommendations, these types do not use cached weights as a tie-breaker. Worker, GPU, and virtual environment constraints still apply; ``model_size_in_billions`` is rejected for these types. A recommendation remains a starting configuration, not a memory-fit guarantee. Image and video recommendations are not yet supported.
+
 Download without launching
 ==========================
+
+.. versionadded:: v3.4.0
 
 Open a model's deployment dialog and choose **Download only** beside the
 **Deploy** button. It downloads the same model artifacts used by deployment,
@@ -63,6 +153,23 @@ cache receives the files. If it is omitted, the supervisor selects one worker.
 
 Replica
 =======
+
+During deployment, the progress endpoint ``GET /v1/models/{model_uid}/progress``
+reports a stage for each replica. After model files finish downloading, a replica
+can report ``waiting_for_dependencies`` while another launch prepares its shared
+virtual environment, then ``installing_dependencies`` while packages are being
+installed, and ``loading`` after the environment is ready.
+
+The Web UI shows each replica's file download details inside its replica card.
+
+During dependency installation, each replica's progress includes the number of
+packages planned for the main install and the number already present in its
+virtual environment. A replica waiting for a shared environment has no install
+count of its own. If the installer cannot resolve a reliable plan, the count is
+omitted.
+
+The Web UI keeps the dependency installation result visible while a replica is
+loading. When no dependency installation is needed, the replica card says so.
 
 Replicas specify the number of model instances to load. For example, if you have two GPUs and each can host one replica of the model,
 you can set the replica count to 2. This way, two identical instances of the model will be distributed across the two GPUs.
@@ -283,7 +390,6 @@ continuous batching is available and can be enabled via environment variables at
 Key settings:
 
 - ``XINFERENCE_BATCH_SIZE`` and ``XINFERENCE_BATCH_INTERVAL`` for general batching behavior.
-- ``XINFERENCE_TEXT_TO_IMAGE_BATCHING_SIZE`` for text-to-image models (when supported).
 
 Example (LLM, transformers):
 
@@ -292,11 +398,7 @@ Example (LLM, transformers):
   XINFERENCE_BATCH_SIZE=32 XINFERENCE_BATCH_INTERVAL=0.003 xinference-local --log-level debug
   xinference launch -e <endpoint> --model-engine transformers -n qwen1.5-chat -s 4 -f pytorch -q none
 
-Example (text-to-image):
-
-.. code-block:: bash
-
-  XINFERENCE_TEXT_TO_IMAGE_BATCHING_SIZE=1024*1024 xinference-local --log-level debug
+For image and video models, batching depends on the selected native engine and model. Diffusers does not use a Xinference step-level scheduler. See :ref:`image` and :ref:`video`.
 
 For detailed behavior, supported models, and aborting requests, see
 :ref:`Continuous Batching <user_guide_continuous_batching>`.

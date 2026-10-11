@@ -215,6 +215,11 @@ class DiffusionModel(SDAPIDiffusionModelMixin):
         model_name = self._model_spec.model_name.lower().replace("_", "-")
         return model_name.startswith("glm-image")
 
+    def _is_qwen_image21_model(self) -> bool:
+        return bool(
+            self._model_spec and self._model_spec.model_name.lower() == "qwen-image-2.1"
+        )
+
     def _is_joyai_image_model(self) -> bool:
         if self._model_spec is None:
             return False
@@ -267,7 +272,7 @@ class DiffusionModel(SDAPIDiffusionModelMixin):
             if (
                 ability == "image2image"
                 and controlnet_name is None
-                and self._is_glm_image_model()
+                and (self._is_glm_image_model() or self._is_qwen_image21_model())
             ):
                 model = self._model
             elif controlnet_name:
@@ -377,6 +382,8 @@ class DiffusionModel(SDAPIDiffusionModelMixin):
             from diffusers import DiffusionPipeline as AutoPipelineModel
         elif self._is_glm_image_model():
             from diffusers import GlmImagePipeline as AutoPipelineModel
+        elif self._is_qwen_image21_model():
+            from diffusers import QwenImage21Pipeline as AutoPipelineModel
         elif "text2image" in self._abilities or "image2image" in self._abilities:
             from diffusers import AutoPipelineForText2Image as AutoPipelineModel
         elif "inpainting" in self._abilities:
@@ -503,20 +510,6 @@ class DiffusionModel(SDAPIDiffusionModelMixin):
                     cache_interval=self._kwargs.get("deepcache_cache_interval", 3),
                     cache_branch_id=self._kwargs.get("deepcache_cache_branch_id", 0),
                 )
-
-        # Initialize batch scheduler if batching is enabled
-        self._image_batch_scheduler = None
-        if self._should_use_batching():
-            from ..scheduler.flux import FluxBatchScheduler
-
-            self._image_batch_scheduler = FluxBatchScheduler(self)
-            # Note: scheduler will be started when first request comes in
-
-    def _should_use_batching(self) -> bool:
-        """Check if this model should use batch scheduling for images"""
-        from ....constants import XINFERENCE_TEXT_TO_IMAGE_BATCHING_SIZE
-
-        return XINFERENCE_TEXT_TO_IMAGE_BATCHING_SIZE is not None
 
     def _get_quantize_config(self, method: str, quantization: str, module: str):
         if method == "bnb":
@@ -730,9 +723,6 @@ class DiffusionModel(SDAPIDiffusionModelMixin):
                 model.enable_vae_slicing()
             except AttributeError:
                 model.vae.enable_slicing()
-
-    def get_max_num_images_for_batching(self):
-        return self._kwargs.get("max_num_images", 16)
 
     @staticmethod
     def _get_scheduler(model: Any, sampler_name: str, scheduler="automatic"):
@@ -1039,38 +1029,6 @@ class DiffusionModel(SDAPIDiffusionModelMixin):
                 logger.warning(f"{type(model)} cannot accept `{key}`, will ignore it")
                 kwargs.pop(key)
 
-    async def text_to_image(
-        self,
-        prompt: str,
-        n: int = 1,
-        size: str = "1024*1024",
-        response_format: str = "url",
-        **kwargs,
-    ):
-        """Text to image method that handles both batching and non-batching"""
-        if self._image_batch_scheduler and "gen_prompt_embeds" not in kwargs:
-            await self._ensure_scheduler_started()
-            # Use batching path
-            from concurrent.futures import Future as ConcurrentFuture
-
-            future: ConcurrentFuture = ConcurrentFuture()
-            await self._image_batch_scheduler.add_request(
-                prompt, future, n, size, response_format, **kwargs
-            )
-
-            fut = asyncio.wrap_future(future)
-            return await fut
-        else:
-            # Use direct path
-            return await self._direct_text_to_image(
-                prompt, n, size, response_format, **kwargs
-            )
-
-    async def _ensure_scheduler_started(self):
-        """Ensure the image batch scheduler is started"""
-        if self._image_batch_scheduler and not self._image_batch_scheduler._running:
-            await self._image_batch_scheduler.start()
-
     def _gen_config_for_lightning(self, kwargs):
         if (
             not kwargs.get("num_inference_steps")
@@ -1083,7 +1041,7 @@ class DiffusionModel(SDAPIDiffusionModelMixin):
                 assert "8steps" in self._lightning_model_path
                 kwargs["num_inference_steps"] = 8
 
-    async def _direct_text_to_image(
+    async def text_to_image(
         self,
         prompt: str,
         n: int = 1,
@@ -1210,6 +1168,7 @@ class DiffusionModel(SDAPIDiffusionModelMixin):
         is_joyai_image_edit_plus = self._is_joyai_image_edit_plus_model()
         if kwargs.get("reference_images") and (
             type(model).__name__ == "QwenImageEditPlusPipeline"
+            or self._is_qwen_image21_model()
             or self._is_glm_image_model()
             or is_joyai_image_edit_plus
         ):
@@ -1253,16 +1212,22 @@ class DiffusionModel(SDAPIDiffusionModelMixin):
         else:
             # SD3 image2image cannot accept width and height
             allow_width_height = model_accept_param(["width", "height"], model)
-            if allow_width_height and not is_joyai_image_edit_plus:
+            if (
+                allow_width_height
+                and not is_joyai_image_edit_plus
+                and not self._is_qwen_image21_model()
+            ):
                 if isinstance(image, list):
                     kwargs["width"], kwargs["height"] = image[0].size
                 else:
                     kwargs["width"], kwargs["height"] = image.size
 
-        if self._model_expects_four_channel_input(model):
-            image = self._ensure_four_channel_image(image, model)
-        else:
-            image = self._ensure_three_channel_image(image)
+        # Qwen-Image-2.1 handles RGB/RGBA references itself; retain their alpha.
+        if not self._is_qwen_image21_model():
+            if self._model_expects_four_channel_input(model):
+                image = self._ensure_four_channel_image(image, model)
+            else:
+                image = self._ensure_three_channel_image(image)
 
         # generate config for lightning
         self._gen_config_for_lightning(kwargs)

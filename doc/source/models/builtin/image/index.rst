@@ -51,6 +51,8 @@ The following is a list of built-in image models in Xinference:
   
    ideogram4
 
+   jina-ocr-v1
+
    joyai-image-edit
 
    joyai-image-edit-plus
@@ -60,6 +62,12 @@ The following is a list of built-in image models in Xinference:
    krea-2-raw
 
    krea-2-turbo
+
+   mineru2.5
+
+   ming-image-0.1-design
+
+   ming-image-0.1-design-layer
 
    monkeyocr
   
@@ -73,6 +81,8 @@ The following is a list of built-in image models in Xinference:
   
    qwen-image
   
+   qwen-image-2.1
+
    qwen-image-2512
   
    qwen-image-edit
@@ -106,6 +116,8 @@ The following is a list of built-in image models in Xinference:
    stable-diffusion-xl-base-1.0
   
    stable-diffusion-xl-inpainting
+
+   teleocr
   
    unlimited-ocr
   

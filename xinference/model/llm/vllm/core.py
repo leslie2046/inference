@@ -13,8 +13,10 @@
 # limitations under the License.
 
 import asyncio
+import contextlib
 import copy
 import importlib
+import inspect
 import itertools
 import json
 import logging
@@ -32,6 +34,7 @@ from typing import (
     Dict,
     List,
     Optional,
+    Set,
     Tuple,
     Type,
     TypedDict,
@@ -59,9 +62,11 @@ from ....types import (
     CompletionUsage,
     LoRA,
 )
+from ...utils import allow_trust_remote_code
 from .. import BUILTIN_LLM_FAMILIES, LLM, LLMFamilyV2, LLMSpecV1
 from ..core import chat_context_var, get_model_speculative_tokens_default
 from ..llm_family import cache_model_tokenizer_and_config
+from ..media import materialize_messages_media, media_workspace, validate_messages_media
 from ..utils import (
     DEEPSEEK_TOOL_CALL_FAMILY,
     GEMMA_TOOL_CALL_FAMILY,
@@ -113,6 +118,7 @@ class VLLMModelConfig(TypedDict, total=False):
     guided_decoding_backend: Optional[str]
     scheduling_policy: Optional[str]
     reasoning_content: bool
+    enable_thinking: bool
     model_quantization: Optional[str]
     mm_processor_kwargs: NotRequired[dict[str, Any]]
     min_pixels: NotRequired[int]
@@ -322,6 +328,7 @@ VLLM_SUPPORTED_MULTI_MODEL_LIST: List[str] = []
 VLLM_SUPPORTED_MODELS = [
     "LlamaForCausalLM",
     "MistralForCausalLM",
+    "Spark2_5ForCausalLM",
 ]
 VLLM_SUPPORTED_CHAT_MODELS = [
     "LlamaForCausalLM",
@@ -334,6 +341,7 @@ VLLM_SUPPORTED_CHAT_MODELS = [
     "GlmForCausalLM",
     "ChatGLMModel",
     "Qwen3_5MoeForCausalLM",
+    "Spark2_5ForCausalLM",
 ]
 
 
@@ -485,6 +493,9 @@ def _update_vllm_supported_lists() -> None:
             VLLM_SUPPORTED_MULTI_MODEL_LIST, "KimiK3ForConditionalGeneration"
         )
 
+    if effective_version >= version.parse("0.28.0"):
+        _append_unique(VLLM_SUPPORTED_CHAT_MODELS, "BailingMoeV3ForCausalLM")
+
 
 _update_vllm_supported_lists()
 
@@ -504,6 +515,7 @@ class VLLMModel(LLM):
         super().__init__(model_uid, model_family, model_path)
         self._model_config = model_config
         self._engine = None
+        self._active_request_ids: Set[str] = set()
         self.lora_modules = peft_model
         self.lora_requests: List[Any] = []
         self._xavier_config = None
@@ -1311,11 +1323,19 @@ class VLLMModel(LLM):
             model_config.setdefault("tokenizer_mode", "deepseek_v32")
         else:
             model_config.setdefault("tokenizer_mode", "auto")
-        # Respect the XINFERENCE_TRUST_REMOTE_CODE setting.
-        model_config["trust_remote_code"] = (
-            bool(model_config.get("trust_remote_code", XINFERENCE_TRUST_REMOTE_CODE))
-            and XINFERENCE_TRUST_REMOTE_CODE
-        )
+        if "Spark2_5ForCausalLM" in architectures:
+            # The official vLLM deployment uses the model's remote-code loader.
+            model_config["trust_remote_code"] = allow_trust_remote_code(
+                self.model_family
+            )
+        else:
+            # Respect the XINFERENCE_TRUST_REMOTE_CODE setting.
+            model_config["trust_remote_code"] = (
+                bool(
+                    model_config.get("trust_remote_code", XINFERENCE_TRUST_REMOTE_CODE)
+                )
+                and XINFERENCE_TRUST_REMOTE_CODE
+            )
         model_config.setdefault("tensor_parallel_size", self._device_count)  # type: ignore
         model_config.setdefault("pipeline_parallel_size", self._n_worker)  # type: ignore
         if (
@@ -1359,6 +1379,8 @@ class VLLMModel(LLM):
             model_config.setdefault("quantization", None)
         model_config.setdefault("max_model_len", None)
         model_config.setdefault("reasoning_content", False)
+        if self.model_family.has_architecture("BailingMoeV3ForCausalLM"):
+            model_config.setdefault("enable_thinking", True)
 
         config_dict_list = [
             "additional_config",
@@ -1997,6 +2019,8 @@ class VLLMModel(LLM):
             lora_request=lora_request,
         )
 
+        results_generator = self._track_engine_request(request_id, results_generator)
+
         async def stream_results() -> AsyncGenerator[CompletionChunk, None]:
             previous_texts = [""] * sanitized_generate_config["n"]
             previous_logprobs_counts = [0] * sanitized_generate_config["n"]
@@ -2135,6 +2159,70 @@ class VLLMModel(LLM):
                 request_id, model=self.model_uid, request_output=final_output
             )
 
+    def _track_engine_request(self, request_id: str, results_generator: Any) -> Any:
+        """Track a vLLM request and abort it when consumption ends early."""
+        self._active_request_ids.add(request_id)
+        results_iterator = aiter(results_generator)
+
+        async def tracked_results():
+            completed = False
+            try:
+                async for request_output in results_iterator:
+                    yield request_output
+                completed = True
+            finally:
+                try:
+                    if not completed:
+                        await self.abort_request(request_id)
+                except Exception:
+                    logger.exception(
+                        "Failed to abort interrupted vLLM request: %s", request_id
+                    )
+                finally:
+                    self._active_request_ids.discard(request_id)
+                    if not completed:
+                        close = getattr(results_iterator, "aclose", None)
+                        if close is not None:
+                            try:
+                                close_result = close()
+                                if inspect.isawaitable(close_result):
+                                    await close_result
+                            except Exception:
+                                logger.debug(
+                                    "Failed to close interrupted vLLM result "
+                                    "iterator: %s",
+                                    request_id,
+                                    exc_info=True,
+                                )
+
+        return tracked_results()
+
+    async def abort_request(self, request_id: str) -> str:
+        """Abort an active request in the underlying asynchronous vLLM engine."""
+        from ...scheduler.core import AbortRequestMessage
+
+        if self._engine is None or request_id not in self._active_request_ids:
+            return AbortRequestMessage.NOT_FOUND.name
+
+        abort = getattr(self._engine, "abort", None)
+        if abort is None:
+            return AbortRequestMessage.NO_OP.name
+
+        # Claim the request before awaiting so concurrent aborts cannot invoke the
+        # engine twice. Restore it if the engine rejects the abort, allowing the
+        # stream cleanup path (or a later explicit abort) to retry.
+        self._active_request_ids.discard(request_id)
+        try:
+            result = abort(request_id)
+            if inspect.isawaitable(result):
+                await result
+        except BaseException:
+            self._active_request_ids.add(request_id)
+            raise
+
+        logger.info("Aborted vLLM request: %s", request_id)
+        return AbortRequestMessage.DONE.name
+
 
 class VLLMChatModel(VLLMModel, ChatModelMixin):
     @classmethod
@@ -2154,8 +2242,19 @@ class VLLMChatModel(VLLMModel, ChatModelMixin):
                 False,
                 "vLLM chat mode supports pytorch/gptq/awq/fp4/fp8/bnb/ggufv2 formats only",
             )
+        is_ling3 = llm_family.has_architecture("BailingMoeV3ForCausalLM")
+        if is_ling3:
+            if llm_spec.model_format not in ("pytorch", "fp8", "fp4"):
+                return False, "Ling-3.0 vLLM supports pytorch/fp8/fp4 checkpoints only"
+            if _get_effective_vllm_version_for_family(llm_family) < version.parse(
+                "0.28.0"
+            ):
+                return False, "Ling-3.0 requires vLLM >= 0.28.0"
         if llm_spec.model_format == "pytorch":
-            if quantization not in (None, "none"):
+            # The official INT4 checkpoint uses compressed-tensors; vLLM
+            # infers its quantization method from the checkpoint configuration.
+            offline_ling_int4 = is_ling3 and quantization == "Int4"
+            if quantization not in (None, "none") and not offline_ling_int4:
                 return (
                     False,
                     "pytorch format with quantization is not supported in vLLM chat",
@@ -2180,7 +2279,10 @@ class VLLMChatModel(VLLMModel, ChatModelMixin):
             and not _virtual_env_allows_missing_vllm()
         ):
             return False, "Qwen3_5MoeForCausalLM requires vLLM >= 0.27.0"
-        if not llm_family.matches_supported_architectures(VLLM_SUPPORTED_CHAT_MODELS):
+        supported_architectures = list(VLLM_SUPPORTED_CHAT_MODELS)
+        if is_ling3:
+            _append_unique(supported_architectures, "BailingMoeV3ForCausalLM")
+        if not llm_family.matches_supported_architectures(supported_architectures):
             return (
                 False,
                 f"Model architectures {llm_family.architectures} are not supported by vLLM chat",
@@ -2290,7 +2392,13 @@ class VLLMChatModel(VLLMModel, ChatModelMixin):
                 or model_family in MINICPM5_TOOL_CALL_FAMILY
             ):
                 full_context_kwargs["tools"] = tools
-        assert self.model_family.chat_template is not None
+        chat_template = self.model_family.chat_template
+        if self.model_family.has_architecture("Spark2_5ForCausalLM"):
+            # The official checkpoint supplies its chat template in tokenizer_config.
+            chat_template = None
+        assert chat_template is not None or self.model_family.has_architecture(
+            "Spark2_5ForCausalLM"
+        )
 
         generate_config = self._sanitize_chat_config(generate_config)
         stream = generate_config.get("stream", None)
@@ -2306,7 +2414,7 @@ class VLLMChatModel(VLLMModel, ChatModelMixin):
         logger.debug("tokenizer class: %s", type(tokenizer).__name__)
         full_prompt = self.get_full_context(
             messages,
-            self.model_family.chat_template,
+            chat_template,
             tokenizer=tokenizer,
             **full_context_kwargs,
         )
@@ -2633,7 +2741,7 @@ class VLLMMultiModel(VLLMModel, ChatModelMixin):
 
         model_family = self.model_family.model_family or self.model_family.model_name
         audios, images, videos, video_kwargs = None, None, None, None
-        temp_dir = None
+        workspace = contextlib.ExitStack()
         try:
             if "internvl" not in model_family.lower():
                 from qwen_omni_utils import (
@@ -2645,14 +2753,16 @@ class VLLMMultiModel(VLLMModel, ChatModelMixin):
                 # Work on a copy so request messages never retain paths that are
                 # removed when the request-level temporary directory is cleaned.
                 messages = copy.deepcopy(messages)
+                temp_dir = workspace.enter_context(media_workspace("xinference-vllm-"))
+                # qwen_omni_utils fetches urls itself and follows redirects, so the
+                # bytes have to be pulled here instead.  to_thread: blocking I/O on
+                # the model actor's event loop.
+                await asyncio.to_thread(materialize_messages_media, messages, temp_dir)
                 if (
                     "vision" in self.model_family.model_ability
                     or "omni" in self.model_family.model_ability
                 ):
-                    import tempfile
-
-                    temp_dir = tempfile.TemporaryDirectory(prefix="xinference-vllm-")
-                    self._handle_base64_media(messages, temp_dir.name)
+                    self._handle_base64_media(messages, temp_dir)
 
                 messages = self._transform_messages(messages)
 
@@ -2680,30 +2790,36 @@ class VLLMMultiModel(VLLMModel, ChatModelMixin):
                     model_family
                 )
 
+                # These readers open files and fetch URLs; async_chat runs on the
+                # model actor's event loop, so they must not block it.
                 if "omni" in self.model_family.model_ability:
-                    audios, images, videos, video_kwargs = process_mm_info(
-                        messages, use_audio_in_video=True, return_video_kwargs=True
+                    audios, images, videos, video_kwargs = await asyncio.to_thread(
+                        process_mm_info,
+                        messages,
+                        use_audio_in_video=True,
+                        return_video_kwargs=True,
                     )
                 elif "audio" in self.model_family.model_ability:
-                    audios = process_audio_info(messages, use_audio_in_video=False)
+                    audios = await asyncio.to_thread(
+                        process_audio_info, messages, use_audio_in_video=False
+                    )
                 elif "vision" in self.model_family.model_ability:
-                    images, videos, video_kwargs = process_vision_info(  # type: ignore
-                        messages, return_video_kwargs=True
+                    images, videos, video_kwargs = await asyncio.to_thread(  # type: ignore
+                        process_vision_info, messages, return_video_kwargs=True
                     )
 
                 prompt = self.get_full_context(
                     messages, chat_template, tokenizer=tokenizer, **full_context_kwargs
                 )
             else:
-                prompt, images = self.get_specific_prompt(model_family, messages)
+                # get_specific_prompt fetches through load_media_bytes, so the urls
+                # only need gating here.
+                await asyncio.to_thread(validate_messages_media, messages)
+                prompt, images = await asyncio.to_thread(
+                    self.get_specific_prompt, model_family, messages
+                )
         finally:
-            if temp_dir is not None:
-                try:
-                    temp_dir.cleanup()
-                except Exception:
-                    logger.warning(
-                        "Failed to clean up temporary media directory", exc_info=True
-                    )
+            workspace.close()
         inputs = {"prompt": prompt, "multi_modal_data": {}, "mm_processor_kwargs": {}}
         if images:
             inputs["multi_modal_data"]["image"] = images

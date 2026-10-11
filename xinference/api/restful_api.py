@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import asyncio
+import gc
 import inspect
 import ipaddress
 import json
@@ -25,8 +26,20 @@ import uuid
 import warnings
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, AsyncIterator, Dict, List, Optional, Union, get_type_hints
+from typing import (
+    Any,
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Union,
+    get_type_hints,
+)
 
+import aiohttp
+import anyio
 import httpx
 import xoscar as xo
 from aioprometheus import REGISTRY, MetricsMiddleware
@@ -70,15 +83,17 @@ from ..constants import (
     is_metrics_disabled,
 )
 from ..core.event import Event, EventCollectorActor, EventType
-from ..core.exceptions import ModelNotReadyError
+from ..core.exceptions import InvalidAudioInputError, ModelNotReadyError
 from ..core.http_protocol import create_hardened_http_protocol
 from ..core.replica_config import ReplicaConfig
+from ..core.rpc_context import actor_call, correlate_model_ref
 from ..core.supervisor import SupervisorActor
 from ..core.utils import CancelMixin
 from ..router.constants import TOKEN_ROUTER_BACKEND_AUTHORIZATION_HEADER
 from ..router.credentials import token_router_data_plane_token
 from ..types import CreateChatCompletion, PeftModelConfig, max_tokens_field
 from .frontend_static import mount_frontend
+from .model_request_logging import ModelRequestLoggingRoute, get_model_request_id
 from .pdf_ocr import (
     DEFAULT_PDF_OCR_DPI,
     PDF_MAGIC,
@@ -94,6 +109,15 @@ from .protocols import (
     anthropic_stream_events,
     openai_to_anthropic,
     parse_anthropic_request,
+)
+from .protocols.openai_responses import (
+    ResponsesProtocolError,
+    ResponsesRequest,
+    chat_to_response,
+    parse_responses_request,
+    responses_error,
+    responses_error_code,
+    responses_stream_events,
 )
 from .responses import JSONResponse
 from .schemas import (
@@ -113,6 +137,13 @@ from .schemas import (
     TextToVideoRequest,
     UpdateModelRequest,
     WorldGenerationRequest,
+)
+from .streaming_outcome import (
+    FailureOrigin,
+    get_stream_outcome_reporter,
+    observe_stream,
+    report_client_disconnect,
+    report_stream_failure,
 )
 from .utils import get_request_route_path, require_model
 
@@ -140,6 +171,198 @@ _TOKEN_ROUTER_REQUEST_HEADERS = {
     "user-agent",
     "x-request-id",
 }
+
+
+class _SSERequestAbortController:
+    """Abort and close an interrupted model stream exactly once."""
+
+    def __init__(self, model: Any, request_id: str, request: Request, kind: str):
+        self._model = model
+        self._request_id = request_id
+        self._request = request
+        self._kind = kind
+        self._abort_task: Optional[asyncio.Task] = None
+        self._body_iterator: Optional[AsyncIterator[Any]] = None
+        self._stream_task: Optional[asyncio.Task] = None
+
+    def bind_body_iterator(self, body_iterator: AsyncIterator[Any]) -> None:
+        self._body_iterator = body_iterator
+
+    def bind_stream_task(self) -> None:
+        self._stream_task = asyncio.current_task()
+
+    async def abort(self) -> None:
+        if self._abort_task is None:
+            self._abort_task = asyncio.create_task(
+                self._model.abort_request(self._request_id)
+            )
+        try:
+            await asyncio.shield(self._abort_task)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(
+                "Failed to abort disconnected %s request %s",
+                self._kind,
+                self._request_id,
+            )
+
+    async def handle_disconnect(self, _message: Dict[str, Any]) -> None:
+        with anyio.CancelScope(shield=True):
+            report_client_disconnect(self._request)
+            logger.info(
+                "Disconnected from client (via refresh/close) %s during %s.",
+                self._request.client,
+                self._kind,
+            )
+            await self.abort()
+
+            # Cancel and join the response's stream task before the disconnect
+            # listener returns. EventSourceResponse cancels its AnyIO task
+            # group after this callback, which is too late for cleanup code
+            # containing cancellation checkpoints.
+            stream_task = self._stream_task
+            if (
+                stream_task is not None
+                and stream_task is not asyncio.current_task()
+                and not stream_task.done()
+            ):
+                stream_task.cancel()
+                try:
+                    await stream_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    logger.debug(
+                        "Disconnected %s stream task %s failed during cleanup",
+                        self._kind,
+                        self._request_id,
+                        exc_info=True,
+                    )
+
+            # During an ASGI send the generator is suspended at ``yield``, so
+            # the response task itself never receives CancelledError. Close it
+            # here to run its finally block and release the remote iterator.
+            close = getattr(self._body_iterator, "aclose", None)
+            if close is not None:
+                try:
+                    await close()
+                except RuntimeError:
+                    # The generator may instead be running in __anext__. The
+                    # task-group cancellation closes it after this returns.
+                    pass
+                except Exception:
+                    logger.debug(
+                        "Failed to close disconnected %s response iterator %s",
+                        self._kind,
+                        self._request_id,
+                        exc_info=True,
+                    )
+
+
+def _observe_sse_disconnect(
+    response: EventSourceResponse,
+    handler: Callable[[Dict[str, Any]], Awaitable[None]],
+) -> None:
+    """Attach a disconnect handler across supported sse-starlette versions."""
+
+    if hasattr(response, "client_close_handler_callable"):
+        previous_handler = response.client_close_handler_callable
+
+        async def chained_handler(message: Dict[str, Any]) -> None:
+            await handler(message)
+            if previous_handler is not None:
+                await previous_handler(message)
+
+        response.client_close_handler_callable = chained_handler
+        return
+
+    listener_name = next(
+        (
+            name
+            for name in ("listen_for_disconnect", "_listen_for_disconnect")
+            if hasattr(response, name)
+        ),
+        None,
+    )
+    if listener_name is None:
+        logger.warning(
+            "Cannot abort model requests on SSE disconnects with this sse-starlette version."
+        )
+        return
+
+    previous_listener = getattr(response, listener_name)
+
+    async def listen_for_disconnect(
+        receive: Callable[[], Awaitable[Dict[str, Any]]],
+    ) -> None:
+        async def receive_and_abort() -> Dict[str, Any]:
+            message = await receive()
+            if message.get("type") == "http.disconnect":
+                await handler(message)
+            return message
+
+        await previous_listener(receive_and_abort)
+
+    setattr(response, listener_name, listen_for_disconnect)
+
+
+async def _close_async_iterator(iterator: Any) -> None:
+    close = getattr(iterator, "aclose", None)
+    if close is None:
+        return
+    result = close()
+    if inspect.isawaitable(result):
+        await result
+
+
+async def _cleanup_model_stream(
+    *,
+    abort_controller: _SSERequestAbortController,
+    interrupted: bool,
+    observed_iterator: Any,
+    model_iterator: Any,
+    model: Any,
+    request_id: str,
+    kind: str,
+) -> None:
+    """Finish all stream cleanup even under AnyIO task-group cancellation."""
+
+    from xoscar.api import IteratorWrapper
+
+    with anyio.CancelScope(shield=True):
+        if interrupted:
+            try:
+                await abort_controller.abort()
+            except (asyncio.CancelledError, Exception):
+                logger.exception(
+                    "Failed to abort interrupted %s request %s", kind, request_id
+                )
+
+        try:
+            if observed_iterator is not None:
+                await _close_async_iterator(observed_iterator)
+        except (asyncio.CancelledError, Exception):
+            logger.debug(
+                "Failed to close %s stream %s",
+                kind,
+                request_id,
+                exc_info=True,
+            )
+        finally:
+            if model_iterator is not None and (
+                inspect.isasyncgen(model_iterator)
+                or inspect.isgenerator(model_iterator)
+                or isinstance(model_iterator, IteratorWrapper)
+            ):
+                try:
+                    await model.decrease_serve_count()
+                except (asyncio.CancelledError, Exception):
+                    logger.exception(
+                        "Failed to release serve count for %s request %s",
+                        kind,
+                        request_id,
+                    )
 
 
 def _request_credential(request: Request) -> str:
@@ -335,15 +558,48 @@ def _log_setup_required_notice() -> None:
 class RESTfulAPI(CancelMixin):
     # Add new class attributes
     _allowed_ip_list: Optional[List[ipaddress.IPv4Network]] = None
+    _cluster_metrics_task: Optional[asyncio.Task[None]] = None
     QWEN38_REASONING_EFFORTS = {"xhigh", "medium", "low"}
     QWEN38_REASONING_MODEL_NAMES = {"qwen3.8", "qwen3.8-max"}
 
     @asynccontextmanager
     async def _lifespan(self, _app: FastAPI) -> AsyncIterator[None]:
+        # Keep the large startup heap out of full collections while continuing
+        # to collect cycles created by requests. Respect an existing freeze
+        # owned by the host application.
+        owns_gc_freeze = gc.get_freeze_count() == 0
+        if owns_gc_freeze:
+            gc.collect()
+            gc.freeze()
         try:
+            if not is_metrics_disabled():
+                self._cluster_metrics_task = asyncio.create_task(
+                    self._cluster_metrics_update_loop(),
+                    name="cluster-metrics-updater",
+                )
             yield
         finally:
-            await self._close_token_router_client()
+            if owns_gc_freeze:
+                gc.unfreeze()
+            try:
+                task = self._cluster_metrics_task
+                self._cluster_metrics_task = None
+                if task is not None:
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception:
+                        logger.warning(
+                            "Cluster metrics updater failed during shutdown",
+                            exc_info=True,
+                        )
+            finally:
+                try:
+                    await self._close_elasticsearch_client()
+                finally:
+                    await self._close_token_router_client()
 
     def __init__(
         self,
@@ -411,8 +667,10 @@ class RESTfulAPI(CancelMixin):
             XINFERENCE_SYSTEM_SETTINGS_PATH
         )
 
-        self._router = APIRouter()
+        self._router = APIRouter(route_class=ModelRequestLoggingRoute)
+        self._elasticsearch_client: Optional[aiohttp.ClientSession] = None
         self._token_router_client: Optional[httpx.AsyncClient] = None
+        self._cluster_metrics_task = None
         self._app = FastAPI(lifespan=self._lifespan)
         # Initialize allowed IP list once
         self._init_allowed_ip_list()
@@ -468,7 +726,9 @@ class RESTfulAPI(CancelMixin):
         if not self._advanced_auth_service.validate_model_access(
             token, model_uid, model_type
         ):
-            self._record_audit(request, model_uid, model_type or "", "denied")
+            request.state._audit_model_uid = model_uid
+            request.state._audit_model_type = model_type or ""
+            request.state.audit_status = "denied"
             raise HTTPException(
                 status_code=403,
                 detail=f"API key does not have access to model: {model_uid}",
@@ -522,7 +782,11 @@ class RESTfulAPI(CancelMixin):
             client_ip=request.client.host if request.client else "",
             category="inference",
             auth_type="api_key",
+            method=request.method,
+            status_code=getattr(request.state, "audit_status_code", 0),
+            request_id=str(getattr(request.state, "model_request_id", "") or ""),
         )
+        request.state.audit_recorded = True
         _requests_total = getattr(_metrics, "api_key_requests_total", None)
         if _requests_total is not None:
             _requests_total.inc(
@@ -546,62 +810,110 @@ class RESTfulAPI(CancelMixin):
                 latency_s,
             )
 
-    def _record_admin_audit(self, request, status: str, latency_s: float = 0.0):
+    def _record_admin_audit(
+        self,
+        request: Request,
+        status: str,
+        latency_s: float = 0.0,
+        status_code: int = 0,
+        category: str = "",
+    ) -> None:
         if not self._advanced_auth_service:
             return
-        token = request.headers.get("Authorization", "").replace("Bearer ", "")
-        if not token:
-            return
-        payload = self._advanced_auth_service.verify_access_token(token)
-        username = payload.get("sub", "") if payload else ""
+        identity = getattr(request.state, "audit_identity", {}) or {}
+        username = str(identity.get("user", ""))
+        api_key_name = str(identity.get("api_key_name", ""))
+        api_key_prefix = str(identity.get("api_key_prefix", ""))
+        auth_type = str(identity.get("auth_type", ""))
+        if not username and not auth_type:
+            token = request.headers.get("Authorization", "").replace("Bearer ", "")
+            if token:
+                payload = self._advanced_auth_service.verify_access_token(token)
+                username = payload.get("sub", "") if payload else ""
+                auth_type = "jwt" if payload else ""
 
-        from .oauth2.advanced.audit import record_audit_event
+        from .oauth2.advanced.audit import classify_endpoint, record_audit_event
 
         record_audit_event(
             user=username,
-            api_key_name="",
-            api_key_prefix="",
-            model_id="",
-            model_name="",
-            model_type="",
+            api_key_name=api_key_name,
+            api_key_prefix=api_key_prefix,
+            model_id=str(getattr(request.state, "audit_model_id", "") or ""),
+            model_name=str(getattr(request.state, "audit_model_name", "") or ""),
+            model_type=str(getattr(request.state, "audit_model_type", "") or ""),
             endpoint=request.url.path,
             status=status,
             latency_ms=round(latency_s * 1000, 1),
             client_ip=request.client.host if request.client else "",
-            category="admin",
-            auth_type="jwt",
+            category=category or classify_endpoint(request.url.path),
+            auth_type=auth_type,
+            method=request.method,
+            status_code=status_code,
+            request_id=str(getattr(request.state, "model_request_id", "") or ""),
         )
+        request.state.audit_recorded = True
 
     async def _audit_middleware(self, request: Request, call_next):
+        from .oauth2.advanced.audit import classify_endpoint, should_skip_audit
+
         started = time.perf_counter()
-        response = await call_next(request)
+        request_id = get_model_request_id(request)
+        try:
+            response = await call_next(request)
+        except Exception:
+            if (
+                self._advanced_auth_service
+                and not should_skip_audit(request.url.path)
+                and not getattr(request.state, "audit_recorded", False)
+            ):
+                request.state.audit_status_code = 500
+                self._record_admin_audit(
+                    request,
+                    "error",
+                    time.perf_counter() - started,
+                    status_code=500,
+                )
+            raise
+
+        response.headers.setdefault("X-Request-ID", request_id)
+        if (
+            not self._advanced_auth_service
+            or should_skip_audit(request.url.path)
+            or getattr(request.state, "audit_recorded", False)
+        ):
+            return response
+
+        latency_s = time.perf_counter() - started
+        status_code = response.status_code
+        request.state.audit_status_code = status_code
         model_uid = getattr(request.state, "_audit_model_uid", "")
-        if model_uid:
-            latency_s = time.perf_counter() - started
-            if response.status_code < 400:
+        audit_status = getattr(request.state, "audit_status", "")
+        if not audit_status:
+            if status_code < 400:
                 audit_status = "success"
-            elif response.status_code == 404:
+            elif model_uid and status_code == 404:
                 audit_status = "model_not_found"
+            elif request.url.path.startswith(("/token", "/v1/auth/")):
+                audit_status = "login_failed"
             else:
                 audit_status = "error"
+
+        if model_uid:
             model_type = getattr(request.state, "_audit_model_type", "")
             self._record_audit(request, model_uid, model_type, audit_status, latency_s)
-        elif self._advanced_auth_service and request.url.path.startswith(
-            ("/v1/models", "/v1/admin", "/v1/token_routers")
-        ):
-            from .oauth2.advanced.audit import classify_endpoint
-
-            category = classify_endpoint(request.url.path)
-            if category == "admin":
-                latency_s = time.perf_counter() - started
-                audit_status = "success" if response.status_code < 400 else "error"
-                self._record_admin_audit(request, audit_status, latency_s)
-        elif self._advanced_auth_service and request.url.path.startswith(
-            ("/token", "/v1/auth/", "/v1/api_keys")
-        ):
-            latency_s = time.perf_counter() - started
-            audit_status = "success" if response.status_code < 400 else "login_failed"
-            self._record_admin_audit(request, audit_status, latency_s)
+        if not getattr(request.state, "audit_recorded", False):
+            if model_uid:
+                request.state.audit_model_id = model_uid
+                request.state.audit_model_type = getattr(
+                    request.state, "_audit_model_type", ""
+                )
+            self._record_admin_audit(
+                request,
+                audit_status,
+                latency_s,
+                status_code=status_code,
+                category=classify_endpoint(request.url.path),
+            )
         return response
 
     @staticmethod
@@ -673,6 +985,19 @@ class RESTfulAPI(CancelMixin):
                 "Report error event failed, model: %s, content: %s", model_uid, content
             )
 
+    def _get_elasticsearch_client(self) -> aiohttp.ClientSession:
+        client = getattr(self, "_elasticsearch_client", None)
+        if client is None or client.closed:
+            client = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10))
+            self._elasticsearch_client = client
+        return client
+
+    async def _close_elasticsearch_client(self) -> None:
+        client = getattr(self, "_elasticsearch_client", None)
+        if client is not None:
+            await client.close()
+            self._elasticsearch_client = None
+
     def _get_token_router_client(self) -> httpx.AsyncClient:
         client = getattr(self, "_token_router_client", None)
         if client is None or client.is_closed:
@@ -694,11 +1019,7 @@ class RESTfulAPI(CancelMixin):
         *,
         forward_external_credential: bool = True,
     ) -> tuple[httpx.Response, str]:
-        request_id = (
-            request.headers.get("request-id")
-            or request.headers.get("x-request-id")
-            or f"xinf-{uuid.uuid4()}"
-        )
+        request_id = get_model_request_id(request)
         upstream_url = f"{runtime['endpoint']}/v1/chat/completions"
         client = self._get_token_router_client()
         upstream_request = client.build_request(
@@ -720,7 +1041,7 @@ class RESTfulAPI(CancelMixin):
         raw_body: Dict[str, Any],
         runtime: Dict[str, Any],
     ) -> Response:
-        request_id = request.headers.get("x-request-id") or f"xinf-{uuid.uuid4()}"
+        request_id = get_model_request_id(request)
         endpoint = runtime["endpoint"]
         upstream_url = f"{endpoint}/v1/chat/completions"
         client = self._get_token_router_client()
@@ -767,13 +1088,20 @@ class RESTfulAPI(CancelMixin):
 
             async def body_stream() -> AsyncIterator[bytes]:
                 try:
-                    async for chunk in upstream_response.aiter_raw():
+                    async for chunk in observe_stream(
+                        upstream_response.aiter_raw(),
+                        get_stream_outcome_reporter(request),
+                        failure_origin=FailureOrigin.UPSTREAM,
+                    ):
                         if await request.is_disconnected():
+                            report_client_disconnect(request)
                             break
                         yield chunk
-                except asyncio.CancelledError:
+                except asyncio.CancelledError as exc:
+                    report_client_disconnect(request, exc)
                     raise
-                except Exception:
+                except Exception as exc:
+                    report_stream_failure(request, exc, FailureOrigin.UPSTREAM)
                     logger.exception(
                         "Token Router stream failed: virtual_model_uid=%s "
                         "router_uid=%s instance_id=%s",
@@ -815,7 +1143,6 @@ class RESTfulAPI(CancelMixin):
             allow_headers=["*"],
         )
 
-        @self._app.middleware("http")
         async def ip_restriction_middleware(request: Request, call_next):
             client_ip = request.client.host
             if not self._is_ip_allowed(client_ip):
@@ -825,7 +1152,12 @@ class RESTfulAPI(CancelMixin):
             response = await call_next(request)
             return response
 
-        self._app.middleware("http")(self._audit_middleware)
+        @self._app.middleware("http")
+        async def audited_ip_middleware(request: Request, call_next):
+            async def check_ip(inner_request):
+                return await ip_restriction_middleware(inner_request, call_next)
+
+            return await self._audit_middleware(request, check_ip)
 
         # Initialise OpenTelemetry tracing & metrics (no-op when disabled)
         if XINFERENCE_ENABLE_OTEL:
@@ -896,13 +1228,6 @@ class RESTfulAPI(CancelMixin):
             self._app.add_middleware(MetricsMiddleware)
             self._app.include_router(self._router)
             self._app.add_route("/metrics", metrics)
-
-            # Start background task to periodically refresh cluster metrics
-            @self._app.on_event("startup")
-            async def _start_cluster_metrics_updater():
-                import asyncio
-
-                asyncio.create_task(self._cluster_metrics_update_loop())
 
         # Check all the routes returns Response.
         # This is to avoid `jsonable_encoder` performance issue:
@@ -978,13 +1303,10 @@ class RESTfulAPI(CancelMixin):
 
     async def _cluster_metrics_update_loop(self):
         """Periodically refresh Supervisor-side Prometheus Gauges (every 15s)."""
-        import asyncio
-
         from ..core.metrics import update_cluster_metrics, update_security_gauges
 
         while True:
             try:
-                await asyncio.sleep(15)
                 supervisor_ref = await self._get_supervisor_ref()
                 cluster_data = await supervisor_ref.get_cluster_metrics_data()
                 models_data = await supervisor_ref.list_models()
@@ -995,8 +1317,14 @@ class RESTfulAPI(CancelMixin):
                 )
                 if self._advanced_auth_service:
                     update_security_gauges(self._advanced_auth_service)
+            except asyncio.CancelledError:
+                raise
+            except (ConnectionError, xo.ActorNotExist, xo.ServerClosed) as e:
+                logger.warning("Failed to update cluster metrics: %s", e)
             except Exception:
                 logger.warning("Failed to update cluster metrics", exc_info=True)
+
+            await asyncio.sleep(15)
 
     async def _get_builtin_prompts(self) -> JSONResponse:
         """
@@ -1773,6 +2101,7 @@ class RESTfulAPI(CancelMixin):
         }
         raw_kwargs = {k: v for k, v in raw_body.items() if k not in exclude}
         kwargs = body.dict(exclude_unset=True, exclude=exclude)
+        request_id = str(kwargs.get("request_id") or uuid.uuid4().hex)
 
         # guided_decoding params
         kwargs.update(self.extract_guided_params(raw_body=raw_body))
@@ -1792,26 +2121,49 @@ class RESTfulAPI(CancelMixin):
         model = await require_model(
             self._get_supervisor_ref, model_uid, self._report_error_event
         )
+        is_vllm_backend = await model.is_vllm_backend()
+        model_call_kwargs: Dict[str, Any] = {"raw_params": raw_kwargs}
+        if is_vllm_backend:
+            kwargs.pop("request_id", None)
+            raw_kwargs.pop("request_id", None)
+            model_call_kwargs["request_id"] = request_id
 
         if body.stream:
+            abort_controller = _SSERequestAbortController(
+                model, request_id, request, "generate"
+            )
 
             async def stream_results():
+                abort_controller.bind_stream_task()
                 iterator = None
+                observed_iterator = None
+                completed = False
                 try:
                     try:
                         iterator = await model.generate(
-                            body.prompt, kwargs, raw_params=raw_kwargs
+                            body.prompt,
+                            kwargs,
+                            **model_call_kwargs,
                         )
                     except RuntimeError as re:
                         self.handle_request_limit_error(re)
-                    async for item in iterator:
+                    observed_iterator = observe_stream(
+                        iterator,
+                        get_stream_outcome_reporter(request),
+                        failure_origin=FailureOrigin.MODEL_GENERATOR,
+                    )
+                    async for item in observed_iterator:
                         yield item
-                except asyncio.CancelledError:
+                    completed = True
+                except asyncio.CancelledError as exc:
+                    report_client_disconnect(request, exc)
                     logger.info(
                         f"Disconnected from client (via refresh/close) {request.client} during generate."
                     )
+                    await abort_controller.abort()
                     return
                 except Exception as ex:
+                    report_stream_failure(request, ex, FailureOrigin.MODEL_GENERATOR)
                     ex = await self._get_model_last_error(model.uid, ex)
                     logger.exception("Completion stream got an error: %s", ex)
                     await self._report_error_event(model_uid, str(ex))
@@ -1819,22 +2171,30 @@ class RESTfulAPI(CancelMixin):
                     yield dict(data=json.dumps({"error": str(ex)}))
                     return
                 finally:
-                    if iterator is not None:
-                        from xoscar.api import IteratorWrapper
+                    await _cleanup_model_stream(
+                        abort_controller=abort_controller,
+                        interrupted=not completed,
+                        observed_iterator=observed_iterator,
+                        model_iterator=iterator,
+                        model=model,
+                        request_id=request_id,
+                        kind="completion",
+                    )
 
-                        if (
-                            inspect.isasyncgen(iterator)
-                            or inspect.isgenerator(iterator)
-                            or isinstance(iterator, IteratorWrapper)
-                        ):
-                            await model.decrease_serve_count()
-
-            return EventSourceResponse(
-                stream_results(), ping=XINFERENCE_SSE_PING_ATTEMPTS_SECONDS
+            body_iterator = stream_results()
+            response = EventSourceResponse(
+                body_iterator, ping=XINFERENCE_SSE_PING_ATTEMPTS_SECONDS
             )
+            abort_controller.bind_body_iterator(body_iterator)
+            _observe_sse_disconnect(response, abort_controller.handle_disconnect)
+            return response
         else:
             try:
-                data = await model.generate(body.prompt, kwargs, raw_params=raw_kwargs)
+                data = await model.generate(
+                    body.prompt,
+                    kwargs,
+                    **model_call_kwargs,
+                )
                 return Response(data, media_type="application/json")
             except Exception as e:
                 e = await self._get_model_last_error(model.uid, e)
@@ -1928,6 +2288,8 @@ class RESTfulAPI(CancelMixin):
         )
 
     async def create_message(self, request: Request) -> Response:
+        # Keep Anthropic protocol response IDs backward compatible. The route-level
+        # correlation ID is exposed separately through ``X-Request-ID``.
         request_id = (
             request.headers.get("request-id")
             or request.headers.get("x-request-id")
@@ -2044,23 +2406,42 @@ class RESTfulAPI(CancelMixin):
                     await asyncio.shield(cleanup_task)
 
                 async def router_chunks() -> AsyncIterator[Dict[str, Any]]:
+                    reporter = get_stream_outcome_reporter(request)
+                    upstream_chunks = observe_stream(
+                        upstream_response.aiter_raw(),
+                        reporter,
+                        failure_origin=FailureOrigin.UPSTREAM,
+                    )
+                    protocol_chunks = observe_stream(
+                        self._iter_openai_sse_bytes(upstream_chunks),
+                        reporter,
+                        failure_origin=FailureOrigin.PROTOCOL,
+                    )
                     try:
-                        async for chunk in self._iter_openai_sse_bytes(
-                            upstream_response.aiter_raw()
-                        ):
+                        async for chunk in protocol_chunks:
                             if await request.is_disconnected():
+                                report_client_disconnect(request)
                                 break
                             yield chunk
-                    except asyncio.CancelledError:
+                    except asyncio.CancelledError as exc:
+                        report_client_disconnect(request, exc)
                         raise
                     except Exception as exc:
+                        report_stream_failure(request, exc, FailureOrigin.PROTOCOL)
                         logger.exception("Anthropic Token Router stream failed")
                         yield {"error": {"type": "api_error", "message": str(exc)}}
                     finally:
                         await release_resources()
 
+                anthropic_events = anthropic_stream_events(
+                    router_chunks(), model_uid, request_id
+                )
                 return EventSourceResponse(
-                    anthropic_stream_events(router_chunks(), model_uid, request_id),
+                    observe_stream(
+                        anthropic_events,
+                        get_stream_outcome_reporter(request),
+                        failure_origin=FailureOrigin.PROTOCOL,
+                    ),
                     ping=XINFERENCE_SSE_PING_ATTEMPTS_SECONDS,
                     headers={"request-id": request_id},
                     background=BackgroundTask(release_resources),
@@ -2112,14 +2493,28 @@ class RESTfulAPI(CancelMixin):
                 return self._anthropic_error(status_code, str(exc), request_id)
 
             async def physical_chunks() -> AsyncIterator[Dict[str, Any]]:
+                reporter = get_stream_outcome_reporter(request)
+                model_chunks = observe_stream(
+                    iterator,
+                    reporter,
+                    failure_origin=FailureOrigin.MODEL_GENERATOR,
+                )
+                protocol_chunks = observe_stream(
+                    self._iter_model_openai_chunks(model_chunks),
+                    reporter,
+                    failure_origin=FailureOrigin.PROTOCOL,
+                )
                 try:
-                    async for chunk in self._iter_model_openai_chunks(iterator):
+                    async for chunk in protocol_chunks:
                         if await request.is_disconnected():
+                            report_client_disconnect(request)
                             break
                         yield chunk
-                except asyncio.CancelledError:
+                except asyncio.CancelledError as exc:
+                    report_client_disconnect(request, exc)
                     raise
                 except Exception as exc:
+                    report_stream_failure(request, exc, FailureOrigin.MODEL_GENERATOR)
                     exc = await self._get_model_last_error(model.uid, exc)
                     logger.exception("Anthropic physical model stream failed")
                     await self._report_error_event(model_uid, str(exc))
@@ -2135,8 +2530,15 @@ class RESTfulAPI(CancelMixin):
                         ):
                             await model.decrease_serve_count()
 
+            anthropic_events = anthropic_stream_events(
+                physical_chunks(), model_uid, request_id
+            )
             return EventSourceResponse(
-                anthropic_stream_events(physical_chunks(), model_uid, request_id),
+                observe_stream(
+                    anthropic_events,
+                    get_stream_outcome_reporter(request),
+                    failure_origin=FailureOrigin.PROTOCOL,
+                ),
                 ping=XINFERENCE_SSE_PING_ATTEMPTS_SECONDS,
                 headers={"request-id": request_id},
             )
@@ -2163,6 +2565,275 @@ class RESTfulAPI(CancelMixin):
             await self._report_error_event(model_uid, str(exc))
             status_code = 429 if "Rate limit reached" in str(exc) else 500
             return self._anthropic_error(status_code, str(exc), request_id)
+
+    @staticmethod
+    def _responses_error(
+        status_code: int,
+        message: str,
+        *,
+        param: Optional[str] = None,
+        code: Optional[str] = None,
+        headers: Optional[Dict[str, str]] = None,
+    ) -> JSONResponse:
+        error_type = {
+            400: "invalid_request_error",
+            401: "authentication_error",
+            403: "permission_error",
+            404: "not_found_error",
+            429: "rate_limit_error",
+        }.get(status_code, "server_error")
+        return JSONResponse(
+            status_code=status_code,
+            headers=headers,
+            content=responses_error(message, error_type, param, code),
+        )
+
+    @classmethod
+    def _responses_model_error(cls, exc: Exception) -> JSONResponse:
+        message = str(exc)
+        code = responses_error_code(message)
+        # A 400 keeps clients from retrying a request that can never fit.
+        if code == "context_length_exceeded":
+            return cls._responses_error(400, message, code=code)
+        status_code = 429 if "Rate limit reached" in message else 500
+        return cls._responses_error(status_code, message, code=code)
+
+    async def create_response(self, request: Request) -> Response:
+        try:
+            raw_body = await request.json()
+        except Exception:
+            return self._responses_error(400, "Request body must be valid JSON")
+        try:
+            req = parse_responses_request(raw_body)
+        except ResponsesProtocolError as exc:
+            return self._responses_error(
+                exc.status_code, exc.message, param=exc.param, code=exc.code
+            )
+        except (AttributeError, KeyError, TypeError) as exc:
+            return self._responses_error(400, f"Invalid request: {exc}")
+
+        model_uid = req.model
+        self._set_trace_model(model_uid)
+        self._set_trace_model_type("llm")
+        try:
+            self._check_model_access(request, model_uid, "LLM")
+        except HTTPException as exc:
+            return self._responses_error(
+                exc.status_code, str(exc.detail), headers=exc.headers
+            )
+
+        try:
+            supervisor_ref = await self._get_supervisor_ref()
+            token_router_runtime = await supervisor_ref.resolve_token_router_runtime(
+                model_uid
+            )
+        except Exception:
+            logger.exception("Failed to resolve Responses model target: %s", model_uid)
+            return self._responses_error(500, "Failed to resolve the requested model")
+        if token_router_runtime is not None:
+            return await self._create_response_via_token_router(
+                request, req, token_router_runtime
+            )
+
+        try:
+            model = await require_model(
+                self._get_supervisor_ref, model_uid, self._report_error_event
+            )
+        except HTTPException as exc:
+            return self._responses_error(
+                exc.status_code, str(exc.detail), headers=exc.headers
+            )
+        except Exception as exc:
+            logger.error(exc, exc_info=True)
+            return self._responses_error(500, str(exc))
+
+        messages = req.chat_body["messages"]
+        kwargs = {
+            key: value
+            for key, value in req.chat_body.items()
+            if key not in {"model", "messages"}
+        }
+        raw_kwargs = dict(kwargs)
+
+        if not req.stream:
+            try:
+                data = await model.chat(messages, kwargs, raw_params=raw_kwargs)
+                if isinstance(data, bytes):
+                    data = data.decode("utf-8")
+                chat = json.loads(data) if isinstance(data, str) else data
+                return JSONResponse(content=chat_to_response(chat, req))
+            except Exception as exc:
+                exc = await self._get_model_last_error(model.uid, exc)
+                logger.error(exc, exc_info=True)
+                await self._report_error_event(model_uid, str(exc))
+                return self._responses_model_error(exc)
+
+        iterator = None
+        try:
+            iterator = await model.chat(messages, kwargs, raw_params=raw_kwargs)
+        except Exception as exc:
+            exc = await self._get_model_last_error(model.uid, exc)
+            logger.error(exc, exc_info=True)
+            await self._report_error_event(model_uid, str(exc))
+            return self._responses_model_error(exc)
+
+        async def release_serve_count() -> None:
+            from xoscar.api import IteratorWrapper
+
+            if (
+                inspect.isasyncgen(iterator)
+                or inspect.isgenerator(iterator)
+                or isinstance(iterator, IteratorWrapper)
+            ):
+                await model.decrease_serve_count()
+
+        cleanup_task: asyncio.Task[None] | None = None
+
+        # Also run as the response's background task: a client that disconnects
+        # before the body starts never enters the generator's finally block.
+        async def release_resources() -> None:
+            nonlocal cleanup_task
+            if cleanup_task is None:
+                cleanup_task = asyncio.create_task(release_serve_count())
+            await asyncio.shield(cleanup_task)
+
+        async def physical_chunks() -> AsyncIterator[Dict[str, Any]]:
+            reporter = get_stream_outcome_reporter(request)
+            model_chunks = observe_stream(
+                iterator, reporter, failure_origin=FailureOrigin.MODEL_GENERATOR
+            )
+            protocol_chunks = observe_stream(
+                self._iter_model_openai_chunks(model_chunks),
+                reporter,
+                failure_origin=FailureOrigin.PROTOCOL,
+            )
+            try:
+                async for chunk in protocol_chunks:
+                    if await request.is_disconnected():
+                        report_client_disconnect(request)
+                        break
+                    yield chunk
+            except asyncio.CancelledError as exc:
+                report_client_disconnect(request, exc)
+                raise
+            except Exception as exc:
+                report_stream_failure(request, exc, FailureOrigin.MODEL_GENERATOR)
+                exc = await self._get_model_last_error(model.uid, exc)
+                logger.exception("Responses physical model stream failed")
+                await self._report_error_event(model_uid, str(exc))
+                yield {"error": {"message": str(exc)}}
+            finally:
+                await release_resources()
+
+        return EventSourceResponse(
+            observe_stream(
+                responses_stream_events(physical_chunks(), req),
+                get_stream_outcome_reporter(request),
+                failure_origin=FailureOrigin.PROTOCOL,
+            ),
+            ping=XINFERENCE_SSE_PING_ATTEMPTS_SECONDS,
+            background=BackgroundTask(release_resources),
+        )
+
+    async def _create_response_via_token_router(
+        self,
+        request: Request,
+        req: ResponsesRequest,
+        runtime: Dict[str, Any],
+    ) -> Response:
+        if not runtime.get("available"):
+            return self._responses_error(
+                503,
+                f"No ready Token Router runtime is available for virtual model {req.model}",
+                headers={"Retry-After": "1"},
+            )
+        try:
+            upstream_response, _ = await self._open_token_router_chat_completion(
+                request, req.chat_body, runtime, forward_external_credential=False
+            )
+        except httpx.HTTPError:
+            logger.exception(
+                "Responses Token Router connection failed: virtual_model_uid=%s",
+                req.model,
+            )
+            return self._responses_error(
+                502,
+                "Token Router runtime is temporarily unavailable",
+                headers={"Retry-After": "1"},
+            )
+
+        if upstream_response.status_code >= 400:
+            retry_after = upstream_response.headers.get("retry-after")
+            try:
+                raw_error = await upstream_response.aread()
+                error_payload = json.loads(raw_error) if raw_error else {}
+            except Exception:
+                error_payload = {}
+            finally:
+                await upstream_response.aclose()
+            error = error_payload.get("error") or {}
+            message = error.get("message") if isinstance(error, dict) else str(error)
+            return self._responses_error(
+                upstream_response.status_code,
+                message or "Token Router request failed",
+                headers={"Retry-After": retry_after} if retry_after else None,
+            )
+
+        if not req.stream:
+            try:
+                chat = json.loads(await upstream_response.aread())
+                return JSONResponse(content=chat_to_response(chat, req))
+            except json.JSONDecodeError as exc:
+                logger.error("Invalid Token Router response: %s", exc)
+                return self._responses_error(502, str(exc))
+            finally:
+                await upstream_response.aclose()
+
+        cleanup_task: asyncio.Task[None] | None = None
+
+        async def release_resources() -> None:
+            nonlocal cleanup_task
+            if cleanup_task is None:
+                cleanup_task = asyncio.create_task(upstream_response.aclose())
+            await asyncio.shield(cleanup_task)
+
+        async def router_chunks() -> AsyncIterator[Dict[str, Any]]:
+            reporter = get_stream_outcome_reporter(request)
+            upstream_chunks = observe_stream(
+                upstream_response.aiter_raw(),
+                reporter,
+                failure_origin=FailureOrigin.UPSTREAM,
+            )
+            protocol_chunks = observe_stream(
+                self._iter_openai_sse_bytes(upstream_chunks),
+                reporter,
+                failure_origin=FailureOrigin.PROTOCOL,
+            )
+            try:
+                async for chunk in protocol_chunks:
+                    if await request.is_disconnected():
+                        report_client_disconnect(request)
+                        break
+                    yield chunk
+            except asyncio.CancelledError as exc:
+                report_client_disconnect(request, exc)
+                raise
+            except Exception as exc:
+                report_stream_failure(request, exc, FailureOrigin.PROTOCOL)
+                logger.exception("Responses Token Router stream failed")
+                yield {"error": {"message": str(exc)}}
+            finally:
+                await release_resources()
+
+        return EventSourceResponse(
+            observe_stream(
+                responses_stream_events(router_chunks(), req),
+                get_stream_outcome_reporter(request),
+                failure_origin=FailureOrigin.PROTOCOL,
+            ),
+            ping=XINFERENCE_SSE_PING_ATTEMPTS_SECONDS,
+            background=BackgroundTask(release_resources),
+        )
 
     async def create_embedding(self, request: Request) -> Response:
         payload = await request.json()
@@ -2320,6 +2991,9 @@ class RESTfulAPI(CancelMixin):
                 **parsed_kwargs,
             )
             return Response(content=transcription, media_type="application/json")
+        except InvalidAudioInputError as e:
+            logger.warning("Invalid transcription audio for model %s: %s", model_uid, e)
+            raise HTTPException(status_code=400, detail=e.client_message) from e
         except Exception as e:
             e = await self._get_model_last_error(model_ref.uid, e)
             logger.error(e, exc_info=True)
@@ -2416,7 +3090,11 @@ class RESTfulAPI(CancelMixin):
 
                 async def stream_results():
                     try:
-                        async for item in out:
+                        async for item in observe_stream(
+                            out,
+                            get_stream_outcome_reporter(request),
+                            failure_origin=FailureOrigin.MODEL_GENERATOR,
+                        ):
                             yield item
                     finally:
                         await model.decrease_serve_count()
@@ -2431,6 +3109,9 @@ class RESTfulAPI(CancelMixin):
                     media_type=_audio_response_media_type(body.response_format),
                     content=out,
                 )
+        except InvalidAudioInputError as e:
+            logger.warning("Invalid speech audio for model %s: %s", model_uid, e)
+            raise HTTPException(status_code=400, detail=e.client_message) from e
         except Exception as e:
             e = await self._get_model_last_error(model.uid, e)
             logger.error(e, exc_info=True)
@@ -2493,7 +3174,12 @@ class RESTfulAPI(CancelMixin):
         try:
             if not model_uid:
                 raise ValueError("Unknown model")
-            await (await self._get_supervisor_ref()).get_model(model_uid)
+            await actor_call(
+                await self._get_supervisor_ref(),
+                "get_model",
+                model_uid,
+                _rpc_correlation_id=get_model_request_id(request),
+            )
             return Response()
         except ModelNotReadyError as e:
             raise HTTPException(
@@ -2847,6 +3533,64 @@ class RESTfulAPI(CancelMixin):
             self.handle_request_limit_error(e)
             raise HTTPException(status_code=500, detail=str(e))
 
+    async def create_doc_analyze(
+        self,
+        request: Request,
+        model: str = Form(...),
+        file: UploadFile = File(media_type="application/octet-stream"),
+        kwargs: Optional[str] = Form(None),
+    ) -> Response:
+        if not file.filename or file.size == 0:
+            raise HTTPException(status_code=400, detail="File can't be empty")
+        model_uid = model
+        self._set_trace_model(model_uid)
+        self._set_trace_model_type("image")
+        self._check_model_access(request, model_uid, "image")
+        model_ref = await require_model(
+            self._get_supervisor_ref, model_uid, self._report_error_event
+        )
+
+        request_id = None
+        try:
+            if kwargs is not None:
+                try:
+                    parsed_kwargs = json.loads(kwargs)
+                except json.JSONDecodeError:
+                    raise HTTPException(
+                        status_code=400, detail="kwargs must be a valid JSON object"
+                    )
+                if not isinstance(parsed_kwargs, dict):
+                    raise HTTPException(
+                        status_code=400, detail="kwargs must be a JSON object"
+                    )
+            else:
+                parsed_kwargs = {}
+            request_id = parsed_kwargs.get("request_id")
+            self._add_running_task(request_id)
+            file_bytes = await file.read()
+            if not file_bytes:
+                raise HTTPException(status_code=400, detail="File can't be empty")
+            file_name = file.filename
+            data = await model_ref.docanalyze(
+                file_bytes=file_bytes,
+                file_name=file_name,
+                **parsed_kwargs,
+            )
+            return Response(content=data, media_type="application/json")
+        except asyncio.CancelledError:
+            err_str = f"The request has been cancelled: {request_id}"
+            logger.error(err_str)
+            await self._report_error_event(model_uid, err_str)
+            raise HTTPException(status_code=409, detail=err_str)
+        except HTTPException:
+            raise
+        except Exception as e:
+            e = await self._get_model_last_error(model_ref.uid, e)
+            logger.error(e, exc_info=True)
+            await self._report_error_event(model_uid, str(e))
+            self.handle_request_limit_error(e)
+            raise HTTPException(status_code=500, detail=str(e))
+
     async def create_image_edits(
         self,
         request: Request,
@@ -2931,13 +3675,24 @@ class RESTfulAPI(CancelMixin):
         try:
             self._add_running_task(request_id)
 
-            # Read and convert all uploaded images to RGB PIL Images.
+            description = await (await self._get_supervisor_ref()).describe_model(
+                model_uid
+            )
+            preserve_alpha = description.get("model_name", "").lower() in {
+                "qwen-image-2.1",
+                "ming-image-0.1-design",
+                "ming-image-0.1-design-layer",
+            }
+
+            # Preserve transparent references for models with RGBA inputs.
             pil_images: list[Image.Image] = []
             for img_file in image_files:
                 image_content = await img_file.read()
                 pil_image = Image.open(io.BytesIO(image_content))
 
-                if pil_image.mode == "RGBA":
+                if preserve_alpha:
+                    pil_image = pil_image.convert("RGBA")
+                elif pil_image.mode == "RGBA":
                     background = Image.new("RGB", pil_image.size, (255, 255, 255))
                     background.paste(pil_image, mask=pil_image.split()[3])
                     pil_image = background
@@ -2976,6 +3731,7 @@ class RESTfulAPI(CancelMixin):
             if stream:
                 return EventSourceResponse(
                     self._stream_image_edit(
+                        request,
                         model_ref,
                         primary_image,
                         reference_images,
@@ -3014,6 +3770,7 @@ class RESTfulAPI(CancelMixin):
 
     async def _stream_image_edit(
         self,
+        request: Request,
         model_ref,
         primary_image: Image.Image,
         reference_images: list,
@@ -3078,6 +3835,7 @@ class RESTfulAPI(CancelMixin):
             }
 
         except Exception as e:
+            report_stream_failure(request, e, FailureOrigin.MODEL_GENERATOR)
             yield {
                 "event": "error",
                 "data": json.dumps(
@@ -3428,6 +4186,7 @@ class RESTfulAPI(CancelMixin):
 
         raw_kwargs = {k: v for k, v in raw_body.items() if k not in exclude}
         kwargs = body.dict(exclude_unset=True, exclude=exclude)
+        request_id = str(kwargs.get("request_id") or uuid.uuid4().hex)
 
         enable_thinking = raw_body.get("enable_thinking")
         if enable_thinking is None:
@@ -3504,6 +4263,12 @@ class RESTfulAPI(CancelMixin):
         model = await require_model(
             self._get_supervisor_ref, model_uid, self._report_error_event
         )
+        is_vllm_backend = await model.is_vllm_backend()
+        model_call_kwargs: Dict[str, Any] = {"raw_params": raw_kwargs}
+        if is_vllm_backend:
+            kwargs.pop("request_id", None)
+            raw_kwargs.pop("request_id", None)
+            model_call_kwargs["request_id"] = request_id
 
         try:
             desc = await (await self._get_supervisor_ref()).describe_model(model_uid)
@@ -3571,37 +4336,52 @@ class RESTfulAPI(CancelMixin):
             except MessageRoleOrderError as ve:
                 raise HTTPException(status_code=400, detail=str(ve))
 
-        if "skip_special_tokens" in raw_kwargs and await model.is_vllm_backend():
+        if "skip_special_tokens" in raw_kwargs and is_vllm_backend:
             kwargs["skip_special_tokens"] = raw_kwargs["skip_special_tokens"]
         if body.stream:
+            abort_controller = _SSERequestAbortController(
+                model, request_id, request, "chat"
+            )
 
             async def stream_results():
+                abort_controller.bind_stream_task()
                 iterator = None
+                observed_iterator = None
+                completed = False
                 try:
                     try:
                         iterator = await model.chat(
                             messages,
                             kwargs,
-                            raw_params=raw_kwargs,
+                            **model_call_kwargs,
                         )
                     except RuntimeError as re:
                         await self._report_error_event(model_uid, str(re))
                         self.handle_request_limit_error(re)
-                    async for item in iterator:
+                    observed_iterator = observe_stream(
+                        iterator,
+                        get_stream_outcome_reporter(request),
+                        failure_origin=FailureOrigin.MODEL_GENERATOR,
+                    )
+                    async for item in observed_iterator:
                         yield item
+                    completed = True
                     yield "[DONE]"
                 # Note that asyncio.CancelledError does not inherit from Exception.
                 # When the user uses ctrl+c to cancel the streaming chat, asyncio.CancelledError would be triggered.
                 # See https://github.com/sysid/sse-starlette/blob/main/examples/example.py#L48
-                except asyncio.CancelledError:
+                except asyncio.CancelledError as exc:
+                    report_client_disconnect(request, exc)
                     logger.info(
                         f"Disconnected from client (via refresh/close) {request.client} during chat."
                     )
+                    await abort_controller.abort()
                     # See https://github.com/sysid/sse-starlette/blob/main/examples/error_handling.py#L13
                     # Use return to stop the generator from continuing.
                     # TODO: Cannot yield here. Yield here would leads to error for the next streaming request.
                     return
                 except Exception as ex:
+                    report_stream_failure(request, ex, FailureOrigin.MODEL_GENERATOR)
                     ex = await self._get_model_last_error(model.uid, ex)
                     logger.exception("Chat completion stream got an error: %s", ex)
                     await self._report_error_event(model_uid, str(ex))
@@ -3609,25 +4389,29 @@ class RESTfulAPI(CancelMixin):
                     yield dict(data=json.dumps({"error": str(ex)}))
                     return
                 finally:
-                    if iterator is not None:
-                        from xoscar.api import IteratorWrapper
+                    await _cleanup_model_stream(
+                        abort_controller=abort_controller,
+                        interrupted=not completed,
+                        observed_iterator=observed_iterator,
+                        model_iterator=iterator,
+                        model=model,
+                        request_id=request_id,
+                        kind="chat",
+                    )
 
-                        if (
-                            inspect.isasyncgen(iterator)
-                            or inspect.isgenerator(iterator)
-                            or isinstance(iterator, IteratorWrapper)
-                        ):
-                            await model.decrease_serve_count()
-
-            return EventSourceResponse(
-                stream_results(), ping=XINFERENCE_SSE_PING_ATTEMPTS_SECONDS
+            body_iterator = stream_results()
+            response = EventSourceResponse(
+                body_iterator, ping=XINFERENCE_SSE_PING_ATTEMPTS_SECONDS
             )
+            abort_controller.bind_body_iterator(body_iterator)
+            _observe_sse_disconnect(response, abort_controller.handle_disconnect)
+            return response
         else:
             try:
                 data = await model.chat(
                     messages,
                     kwargs,
-                    raw_params=raw_kwargs,
+                    **model_call_kwargs,
                 )
                 return Response(content=data, media_type="application/json")
             except Exception as e:
@@ -3636,6 +4420,30 @@ class RESTfulAPI(CancelMixin):
                 await self._report_error_event(model_uid, str(e))
                 self.handle_request_limit_error(e)
                 raise HTTPException(status_code=500, detail=str(e))
+
+    async def recommend_model(self, request: Request) -> JSONResponse:
+        from .._compat import ValidationError
+        from ..core.model_recommendation import (
+            ModelRecommendationRequest,
+            RecommendationModelNotFound,
+        )
+
+        try:
+            body = ModelRecommendationRequest.parse_obj(await request.json())
+        except (ValidationError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        try:
+            result = await (await self._get_supervisor_ref()).recommend_model(
+                body.dict(exclude_unset=True)
+            )
+            return JSONResponse(content=result)
+        except RecommendationModelNotFound as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except Exception as exc:
+            logger.error("Model recommendation failed", exc_info=True)
+            raise HTTPException(
+                status_code=500, detail="Model recommendation failed"
+            ) from exc
 
     async def query_engines_by_model_name(
         self, request: Request, model_name: str, model_type: Optional[str] = None
@@ -3791,8 +4599,14 @@ class RESTfulAPI(CancelMixin):
                 block_duration,
             )
             supervisor_ref = await self._get_supervisor_ref()
-            res = await supervisor_ref.abort_request(
-                model_uid, request_id, block_duration
+            res = await actor_call(
+                supervisor_ref,
+                "abort_request",
+                model_uid,
+                request_id,
+                block_duration,
+                _rpc_correlation_id=get_model_request_id(request),
+                _rpc_operation_request_id=request_id,
             )
             self._cancel_running_task(request_id, block_duration)
             return JSONResponse(content=res)
@@ -3940,7 +4754,13 @@ class RESTfulAPI(CancelMixin):
         try:
             result = {
                 "progress": float(
-                    await (await self._get_supervisor_ref()).get_progress(request_id)
+                    await actor_call(
+                        await self._get_supervisor_ref(),
+                        "get_progress",
+                        request_id,
+                        _rpc_correlation_id=get_model_request_id(request),
+                        _rpc_operation_request_id=request_id,
+                    )
                 )
             }
             return JSONResponse(content=result)
@@ -3958,9 +4778,18 @@ class RESTfulAPI(CancelMixin):
             if not sd_models:
                 raise ValueError("No running sd models")
 
+            correlation_id = get_model_request_id(request)
             model_list = []
             for model_uid in sd_models:
-                model = await (await self._get_supervisor_ref()).get_model(model_uid)
+                model = correlate_model_ref(
+                    await actor_call(
+                        supervisor_ref,
+                        "get_model",
+                        model_uid,
+                        _rpc_correlation_id=correlation_id,
+                    ),
+                    correlation_id,
+                )
                 result = json.loads(await model.controlnet_model_list())
                 model_list.extend(result["model_list"])
             return Response(
@@ -4004,7 +4833,16 @@ class RESTfulAPI(CancelMixin):
                 raise ValueError("No running sd models")
 
             # random pick one model to process detect
-            model = await supervisor_ref.get_model(sd_models[0])
+            correlation_id = get_model_request_id(request)
+            model = correlate_model_ref(
+                await actor_call(
+                    supervisor_ref,
+                    "get_model",
+                    sd_models[0],
+                    _rpc_correlation_id=correlation_id,
+                ),
+                correlation_id,
+            )
             result = await model.controlnet_module_list()
             return Response(content=result, media_type="application/json")
         except ValueError as e:
@@ -4022,7 +4860,16 @@ class RESTfulAPI(CancelMixin):
                 raise ValueError("No running sd models")
 
             # random pick one model to process detect
-            model = await supervisor_ref.get_model(sd_models[0])
+            correlation_id = get_model_request_id(request)
+            model = correlate_model_ref(
+                await actor_call(
+                    supervisor_ref,
+                    "get_model",
+                    sd_models[0],
+                    _rpc_correlation_id=correlation_id,
+                ),
+                correlation_id,
+            )
             result = await model.controlnet_control_types()
             return Response(content=result, media_type="application/json")
         except ValueError as e:
@@ -4045,7 +4892,16 @@ class RESTfulAPI(CancelMixin):
                 raise ValueError("No running sd models")
 
             # random pick one model to process detect
-            model = await supervisor_ref.get_model(sd_models[0])
+            correlation_id = get_model_request_id(request)
+            model = correlate_model_ref(
+                await actor_call(
+                    supervisor_ref,
+                    "get_model",
+                    sd_models[0],
+                    _rpc_correlation_id=correlation_id,
+                ),
+                correlation_id,
+            )
 
             kwargs = dict(body)
             kwargs.pop("controlnet_images", None)
@@ -4080,7 +4936,13 @@ class RESTfulAPI(CancelMixin):
         model = await require_model(
             self._get_supervisor_ref, body.model, self._report_error_event
         )
-        result = await model.abort_request(body.request_id)
+        result = await actor_call(
+            model,
+            "abort_request",
+            body.request_id,
+            _rpc_correlation_id=get_model_request_id(request),
+            _rpc_operation_request_id=body.request_id,
+        )
         return JSONResponse(content={"status": result})
 
 
@@ -4089,7 +4951,15 @@ def run(
     host: str,
     port: int,
     logging_conf: Optional[dict] = None,
+    api_role: str = "supervisor",
 ):
+    from ..deploy.utils import (
+        update_all_formatter_addresses,
+        update_logging_config_addresses,
+    )
+
+    update_all_formatter_addresses(api_role, supervisor_address)
+    update_logging_config_addresses(logging_conf, api_role, supervisor_address)
     logger.info("Starting Xinference at endpoint: http://%s:%s", host, port)
     try:
         api = RESTfulAPI(
@@ -4122,10 +4992,11 @@ def run_in_subprocess(
     port: int,
     logging_conf: Optional[dict] = None,
     environment: Optional[Dict[str, str]] = None,
+    api_role: str = "supervisor",
 ) -> multiprocessing.Process:
     p = multiprocessing.Process(
         target=_run_with_environment,
-        args=(supervisor_address, host, port, logging_conf, environment),
+        args=(supervisor_address, host, port, logging_conf, environment, api_role),
     )
     p.daemon = True
     p.start()
@@ -4138,7 +5009,8 @@ def _run_with_environment(
     port: int,
     logging_conf: Optional[dict],
     environment: Optional[Dict[str, str]],
+    api_role: str = "supervisor",
 ):
     if environment:
         os.environ.update(environment)
-    run(supervisor_address, host, port, logging_conf)
+    run(supervisor_address, host, port, logging_conf, api_role=api_role)

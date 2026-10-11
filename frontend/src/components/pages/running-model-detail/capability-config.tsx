@@ -56,6 +56,7 @@ import {
   uploadList,
 } from './utils';
 import { parseScalarSeed } from './seed-utils';
+import { validateDocumentFile } from './document-upload-utils';
 
 function appendKwargsIfPresent(formData: FormData, kwargs: Record<string, unknown>) {
   if (isEmpty(kwargs)) {
@@ -182,7 +183,7 @@ function appendCommonVideoFormData(formData: FormData, context: TransformContext
 }
 
 async function commonWorldBody(context: TransformContext, mediaKey?: 'image' | 'video') {
-  const { modelUid, model, values, requestId } = context;
+  const { modelUid, model, values, requestId, t } = context;
   const media = mediaKey ? firstUpload(values, mediaKey) : undefined;
   const extraBody = parseJsonObject(values.model_kwargs);
   const generationConfig = parseJsonObject(values.generation_config);
@@ -193,12 +194,16 @@ async function commonWorldBody(context: TransformContext, mediaKey?: 'image' | '
       const kwargsCameraMotion = extraBody.cam_type;
       const configCameraMotion = generationConfig.cam_type;
       if (kwargsCameraMotion !== undefined && configCameraMotion !== undefined) {
-        throw new Error('Set Astra cam_type in only one advanced JSON field.');
+        throw new Error(
+          t?.('runningModels.detail.astraCameraMotionDuplicate') ||
+            'Set Astra cam_type in only one advanced JSON field.'
+        );
       }
       const advancedCameraMotion = kwargsCameraMotion ?? configCameraMotion;
       if (advancedCameraMotion !== undefined && Number(advancedCameraMotion) !== cameraMotion) {
         throw new Error(
-          'Astra cam_type conflicts with the selected Camera motion. Use the selector as the source of truth.'
+          t?.('runningModels.detail.astraCameraMotionConflict') ||
+            'Astra cam_type conflicts with the selected Camera motion. Use the selector as the source of truth.'
         );
       }
       if (advancedCameraMotion === undefined) {
@@ -260,6 +265,7 @@ export const CAPABILITY_CONFIGS: Partial<Record<ModelAbility, CapabilityConfig>>
   [ModelAbility.Generate]: {
     ability: ModelAbility.Generate,
     label: 'Generate',
+    labelKey: 'launchModel.generate',
     icon: FileText,
     requestApi: '/v1/completions',
     stream: true,
@@ -293,6 +299,7 @@ export const CAPABILITY_CONFIGS: Partial<Record<ModelAbility, CapabilityConfig>>
   [ModelAbility.Embed]: {
     ability: ModelAbility.Embed,
     label: 'Embedding',
+    labelKey: 'launchModel.embed',
     icon: Binary,
     requestApi: '/v1/embeddings',
     codeExample: {
@@ -308,18 +315,37 @@ export const CAPABILITY_CONFIGS: Partial<Record<ModelAbility, CapabilityConfig>>
       ],
     },
     initialValues: {
+      model_ability: ModelAbility.Embed,
       input: '',
+      image: [],
+      video: '',
+      audio: '',
     },
     formPanel: EmbedPanel,
     resultPanel: ResultPanels.Universal,
-    transformValues: ({ modelUid, values }) => ({
-      model: modelUid,
-      input: stringValue(values.input),
-    }),
+    transformValues: async ({ modelUid, values }) => {
+      const ability = stringValue(values.model_ability, ModelAbility.Embed);
+      let input: string | Record<string, string> = stringValue(values.input);
+
+      if (ability === ModelAbility.EmbedVision) {
+        const image = firstUpload(values, 'image');
+        input = { image: image ? await fileToDataUrl(image.file) : '' };
+      } else if (ability === ModelAbility.EmbedVideo) {
+        input = { video: stringValue(values.video) };
+      } else if (ability === ModelAbility.EmbedAudio) {
+        input = { audio: stringValue(values.audio) };
+      }
+
+      return {
+        model: modelUid,
+        input,
+      };
+    },
   },
   [ModelAbility.SpeakerEmbedding]: {
     ability: ModelAbility.SpeakerEmbedding,
     label: 'Speaker Embedding',
+    labelKey: 'launchModel.speaker_embedding',
     icon: Binary,
     requestApi: '/v1/audio/embeddings',
     codeExample: {
@@ -332,6 +358,7 @@ export const CAPABILITY_CONFIGS: Partial<Record<ModelAbility, CapabilityConfig>>
     },
     initialValues: { file: [] },
     submitLabel: 'Extract embedding',
+    submitLabelKey: 'runningModels.detail.extractEmbedding',
     formPanel: SpeakerEmbeddingPanel,
     resultPanel: ResultPanels.Universal,
     transformValues: audioEmbeddingFormData,
@@ -339,6 +366,7 @@ export const CAPABILITY_CONFIGS: Partial<Record<ModelAbility, CapabilityConfig>>
   [ModelAbility.Rerank]: {
     ability: ModelAbility.Rerank,
     label: 'Rerank',
+    labelKey: 'launchModel.rerank',
     icon: ListFilter,
     requestApi: '/v1/rerank',
     codeExample: {
@@ -359,23 +387,35 @@ export const CAPABILITY_CONFIGS: Partial<Record<ModelAbility, CapabilityConfig>>
       ],
     },
     initialValues: {
+      model_ability: ModelAbility.Rerank,
       query: '',
       documents: ['', ''],
     },
     formPanel: RerankPanel,
     resultPanel: ResultPanels.Universal,
-    transformValues: ({ modelUid, values }) => ({
-      model: modelUid,
-      query: stringValue(values.query),
-      documents: Array.isArray(values.documents)
+    transformValues: ({ modelUid, values }) => {
+      const ability = stringValue(values.model_ability, ModelAbility.Rerank);
+      const documents = Array.isArray(values.documents)
         ? values.documents.map((item) => stringValue(item).trim()).filter(Boolean)
-        : [],
-    }),
+        : [];
+
+      return {
+        model: modelUid,
+        query: stringValue(values.query),
+        documents: documents.map((document) => {
+          if (ability === ModelAbility.RerankVideo) return { video: document };
+          if (ability === ModelAbility.RerankVision) return { image: document };
+          if (ability === ModelAbility.RerankAudio) return { audio: document };
+          return document;
+        }),
+      };
+    },
   },
 
   [ModelAbility.Ocr]: {
     ability: ModelAbility.Ocr,
     label: 'OCR',
+    labelKey: 'launchModel.ocr',
     icon: ScanText,
     requestApi: '/v1/images/ocr',
     codeExample: {
@@ -425,23 +465,19 @@ export const CAPABILITY_CONFIGS: Partial<Record<ModelAbility, CapabilityConfig>>
   [ModelAbility.Docanalyze]: {
     ability: ModelAbility.Docanalyze,
     label: 'Document Parsing',
+    labelKey: 'launchModel.docanalyze',
+    descriptionKey: 'launchModel.docanalyzeDescription',
     icon: FileSearch,
-    requestApi: '/v1/images/ocr',
+    requestApi: '/v1/images/docanalyze',
     codeExample: {
       method: 'POST',
       contentType: 'form',
       fields: [
         { key: 'model', required: true },
-        { key: 'image', required: true, type: 'file', value: './document.pdf' },
+        { key: 'file', required: true, type: 'file', value: '/path/to/document.pdf' },
         {
           key: 'kwargs',
-          value: {
-            backend: 'hybrid-auto-engine',
-            parse_method: 'auto',
-            language: 'ch',
-            output_format: 'markdown',
-            return_dict: true,
-          },
+          value: { request_id: 'document-request-1' },
           stringify: true,
           comment: 'Optional(other key/value)',
         },
@@ -449,29 +485,23 @@ export const CAPABILITY_CONFIGS: Partial<Record<ModelAbility, CapabilityConfig>>
     },
     initialValues: {
       file: [],
-      backend: 'hybrid-auto-engine',
-      parse_method: 'auto',
-      language: 'ch',
-      output_format: 'markdown',
     },
+    submitLabel: 'Parse document',
+    submitLabelKey: 'documentParsing.submit',
     formPanel: DocumentParsingPanel,
     resultPanel: ResultPanels.Universal,
-    transformValues: ({ modelUid, values }) => {
+    transformValues: ({ modelUid, values, requestId, t }) => {
       const file = firstUpload(values, 'file');
+      if (!file)
+        throw new Error(
+          t?.('documentParsing.uploadRequired') || 'Upload a PDF or image before parsing.'
+        );
+      validateDocumentFile(file.file, t);
       const formData = new FormData();
 
       formData.append('model', modelUid);
-      if (file) formData.append('image', file.file);
-      formData.append(
-        'kwargs',
-        JSON.stringify({
-          backend: stringValue(values.backend, 'hybrid-auto-engine'),
-          parse_method: stringValue(values.parse_method, 'auto'),
-          language: stringValue(values.language, 'ch'),
-          output_format: stringValue(values.output_format, 'markdown'),
-          return_dict: true,
-        })
-      );
+      formData.append('file', file.file);
+      appendKwargsIfPresent(formData, requestId ? { request_id: requestId } : {});
 
       return formData;
     },
@@ -479,6 +509,7 @@ export const CAPABILITY_CONFIGS: Partial<Record<ModelAbility, CapabilityConfig>>
   [ModelAbility.Text2image]: {
     ability: ModelAbility.Text2image,
     label: 'Text to Image',
+    labelKey: 'launchModel.text2image',
     icon: ImagePlus,
     requestApi: '/v1/images/generations',
     codeExample: {
@@ -512,6 +543,7 @@ export const CAPABILITY_CONFIGS: Partial<Record<ModelAbility, CapabilityConfig>>
   [ModelAbility.Image2image]: {
     ability: ModelAbility.Image2image,
     label: 'Image to Image',
+    labelKey: 'launchModel.image2image',
     icon: ImageUp,
     requestApi: '/v1/images/variations',
     codeExample: {
@@ -554,6 +586,7 @@ export const CAPABILITY_CONFIGS: Partial<Record<ModelAbility, CapabilityConfig>>
   [ModelAbility.Inpainting]: {
     ability: ModelAbility.Inpainting,
     label: 'Inpainting',
+    labelKey: 'launchModel.inpainting',
     icon: Paintbrush,
     requestApi: '/v1/images/inpainting',
     codeExample: {
@@ -596,6 +629,7 @@ export const CAPABILITY_CONFIGS: Partial<Record<ModelAbility, CapabilityConfig>>
   [ModelAbility.Text2video]: {
     ability: ModelAbility.Text2video,
     label: 'Text to Video',
+    labelKey: 'launchModel.text2video',
     icon: Video,
     requestApi: '/v1/video/generations',
     codeExample: {
@@ -626,6 +660,7 @@ export const CAPABILITY_CONFIGS: Partial<Record<ModelAbility, CapabilityConfig>>
   [ModelAbility.Image2video]: {
     ability: ModelAbility.Image2video,
     label: 'Image to Video',
+    labelKey: 'launchModel.image2video',
     icon: Video,
     requestApi: '/v1/video/generations/image',
     codeExample: {
@@ -659,6 +694,7 @@ export const CAPABILITY_CONFIGS: Partial<Record<ModelAbility, CapabilityConfig>>
   [ModelAbility.Firstlastframe2video]: {
     ability: ModelAbility.Firstlastframe2video,
     label: 'First/Last Frame Video',
+    labelKey: 'launchModel.firstlastframe2video',
     icon: Video,
     requestApi: '/v1/video/generations/flf',
     codeExample: {
@@ -695,6 +731,7 @@ export const CAPABILITY_CONFIGS: Partial<Record<ModelAbility, CapabilityConfig>>
   [ModelAbility.Text2world]: {
     ability: ModelAbility.Text2world,
     label: 'Text to World',
+    labelKey: 'launchModel.text2world',
     icon: Video,
     requestApi: '/v1/worlds/generations',
     codeExample: {
@@ -720,6 +757,7 @@ export const CAPABILITY_CONFIGS: Partial<Record<ModelAbility, CapabilityConfig>>
   [ModelAbility.Image2world]: {
     ability: ModelAbility.Image2world,
     label: 'Image to World',
+    labelKey: 'launchModel.image2world',
     icon: Video,
     requestApi: '/v1/worlds/generations',
     codeExample: {
@@ -750,6 +788,7 @@ export const CAPABILITY_CONFIGS: Partial<Record<ModelAbility, CapabilityConfig>>
   [ModelAbility.Video2world]: {
     ability: ModelAbility.Video2world,
     label: 'Video to World',
+    labelKey: 'launchModel.video2world',
     icon: Video,
     requestApi: '/v1/worlds/generations',
     codeExample: {
@@ -780,6 +819,7 @@ export const CAPABILITY_CONFIGS: Partial<Record<ModelAbility, CapabilityConfig>>
   [ModelAbility.Audio2text]: {
     ability: ModelAbility.Audio2text,
     label: 'Audio to Text',
+    labelKey: 'launchModel.audio2text',
     icon: Mic,
     requestApi: '/v1/audio/transcriptions',
     codeExample: {
@@ -807,6 +847,7 @@ export const CAPABILITY_CONFIGS: Partial<Record<ModelAbility, CapabilityConfig>>
   [ModelAbility.Text2audio]: {
     ability: ModelAbility.Text2audio,
     label: 'Text to Audio',
+    labelKey: 'launchModel.text2audio',
     icon: AudioLines,
     requestApi: '/v1/audio/speech',
     codeExample: {
@@ -920,6 +961,7 @@ export const CAPABILITY_CONFIGS: Partial<Record<ModelAbility, CapabilityConfig>>
   [ModelAbility.Text2music]: {
     ability: ModelAbility.Text2music,
     label: 'Music Generation',
+    labelKey: 'launchModel.text2music',
     icon: Music2,
     requestApi: '/v1/audio/speech',
     codeExample: {

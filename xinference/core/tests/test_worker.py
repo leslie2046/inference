@@ -30,12 +30,20 @@ import xoscar as xo
 from xoscar import MainActorPoolType, create_actor_pool, get_pool_config
 
 from ...model.core import VirtualEnvSettings
+from .. import supervisor as supervisor_module
 from .. import system_settings_store as system_settings_store_module
 from .. import worker as worker_module
 from ..status_guard import InstanceInfo, LaunchStatus, ReplicaStatus
 from ..supervisor import ReplicaInfo, SupervisorActor
 from ..utils import merge_virtual_env_packages
 from ..worker import ModelStatus, WorkerActor, _inject_jina_v3_allocator_env
+
+
+@pytest.mark.asyncio
+async def test_worker_node_metadata_returns_only_software_version():
+    metadata = await WorkerActor.get_node_metadata(None)  # type: ignore[arg-type]
+
+    assert metadata == {"software_version": worker_module.__version__}
 
 
 class MockWorkerActor(WorkerActor):
@@ -540,6 +548,46 @@ class DummySupervisorRef:
         return None
 
 
+class _ActorLoopThread:
+    def __init__(self):
+        self.loop: Optional[asyncio.AbstractEventLoop] = None
+        self.thread: Optional[threading.Thread] = None
+        self.thread_id: Optional[int] = None
+        self._ready = threading.Event()
+
+    def __enter__(self):
+        def run_loop():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            self.loop = loop
+            self.thread_id = threading.get_ident()
+            self._ready.set()
+            try:
+                loop.run_forever()
+            finally:
+                pending = asyncio.all_tasks(loop)
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    loop.run_until_complete(
+                        asyncio.gather(*pending, return_exceptions=True)
+                    )
+                loop.close()
+
+        self.thread = threading.Thread(target=run_loop, daemon=True)
+        self.thread.start()
+        assert self._ready.wait(timeout=5)
+        assert self.loop is not None
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        assert self.loop is not None
+        assert self.thread is not None
+        self.loop.call_soon_threadsafe(self.loop.stop)
+        self.thread.join(timeout=5)
+        assert not self.thread.is_alive()
+
+
 class DummyActorRef:
     def __init__(self, address: str):
         self.address = address
@@ -553,10 +601,15 @@ async def test_worker_heartbeat_failure_clears_cached_supervisor_refs():
 
     class DummyWorker:
         heartbeat = WorkerActor.heartbeat
+        _run_on_actor_loop = WorkerActor._run_on_actor_loop
+        _call_supervisor_on_actor_loop = WorkerActor._call_supervisor_on_actor_loop
+        _call_supervisor = WorkerActor._call_supervisor
         _clear_supervisor_refs = WorkerActor._clear_supervisor_refs
 
         def __init__(self):
             self.address = "test://worker"
+            self._actor_loop = None
+            self._supervisor_init_lock = None
             self._supervisor_ref = FailingSupervisorRef()
             self._supervisor_ref_address = "test://supervisor"
             self._supervisor_ref_lock = threading.Lock()
@@ -584,6 +637,181 @@ async def test_worker_heartbeat_failure_clears_cached_supervisor_refs():
     assert worker._progress_tracker_ref is None
 
 
+@pytest.mark.asyncio
+async def test_run_on_actor_loop_invokes_coroutine_factory_after_loop_switch():
+    factory_loops = []
+    coroutine_loops = []
+
+    with _ActorLoopThread() as actor_thread:
+        worker = SimpleNamespace(
+            _actor_loop=actor_thread.loop,
+            _supervisor_init_lock=None,
+        )
+
+        def coroutine_factory():
+            factory_loops.append(asyncio.get_running_loop())
+
+            async def run():
+                coroutine_loops.append(asyncio.get_running_loop())
+                return "ok"
+
+            return run()
+
+        result = await WorkerActor._run_on_actor_loop(worker, coroutine_factory)
+
+        assert result == "ok"
+        assert factory_loops == [actor_thread.loop]
+        assert coroutine_loops == [actor_thread.loop]
+
+
+@pytest.mark.asyncio
+async def test_worker_heartbeat_rpc_runs_on_actor_loop():
+    rpc_loops = []
+    ref_lookup_loops = []
+
+    class SupervisorRef:
+        async def receive_heartbeat(self, worker_address: str):
+            assert worker_address == "test://worker"
+            rpc_loops.append(asyncio.get_running_loop())
+
+    class DummyWorker:
+        heartbeat = WorkerActor.heartbeat
+        _run_on_actor_loop = WorkerActor._run_on_actor_loop
+        _call_supervisor_on_actor_loop = WorkerActor._call_supervisor_on_actor_loop
+        _call_supervisor = WorkerActor._call_supervisor
+
+        def __init__(self, actor_loop):
+            self.address = "test://worker"
+            self._actor_loop = actor_loop
+            self._supervisor_init_lock = None
+
+        async def _get_supervisor_ref_with_generation(self, add_worker=True):
+            assert add_worker is False
+            ref_lookup_loops.append(asyncio.get_running_loop())
+            return SupervisorRef(), 1
+
+        def _clear_supervisor_refs(self, **kwargs):
+            pytest.fail("a successful heartbeat must not clear the supervisor ref")
+
+    with _ActorLoopThread() as actor_thread:
+        worker = DummyWorker(actor_thread.loop)
+        caller_loop = asyncio.get_running_loop()
+
+        await worker.heartbeat()
+
+        assert caller_loop is not actor_thread.loop
+        assert ref_lookup_loops == [actor_thread.loop]
+        assert rpc_loops == [actor_thread.loop]
+
+
+@pytest.mark.asyncio
+async def test_worker_report_status_upload_runs_on_actor_loop(monkeypatch):
+    rpc_loops = []
+    ref_lookup_loops = []
+
+    class SupervisorRef:
+        async def report_worker_status(self, worker_address: str, status):
+            rpc_loops.append(asyncio.get_running_loop())
+            assert worker_address == "test://worker"
+            assert status == {"cpu": "ok"}
+
+    class DummyWorker:
+        report_status = WorkerActor.report_status
+        _run_on_actor_loop = WorkerActor._run_on_actor_loop
+        _call_supervisor_on_actor_loop = WorkerActor._call_supervisor_on_actor_loop
+        _call_supervisor = WorkerActor._call_supervisor
+
+        def __init__(self, actor_loop):
+            self.address = "test://worker"
+            self._actor_loop = actor_loop
+            self._supervisor_init_lock = None
+            self._total_gpu_devices = []
+
+        async def _get_supervisor_ref_with_generation(self, add_worker=True):
+            assert add_worker is True
+            ref_lookup_loops.append(asyncio.get_running_loop())
+            return SupervisorRef(), 1
+
+        def _clear_supervisor_refs(self, **kwargs):
+            pytest.fail("a successful status upload must not clear the supervisor ref")
+
+    monkeypatch.setattr(
+        "xinference.core.worker.gather_node_info", lambda: {"cpu": "ok"}
+    )
+
+    with _ActorLoopThread() as actor_thread:
+        worker = DummyWorker(actor_thread.loop)
+        caller_loop = asyncio.get_running_loop()
+
+        await worker.report_status()
+
+        assert caller_loop is not actor_thread.loop
+        assert ref_lookup_loops == [actor_thread.loop]
+        assert rpc_loops == [actor_thread.loop]
+
+
+@pytest.mark.asyncio
+async def test_actor_loop_dispatch_cancellation_releases_registration_lock():
+    registration_started = threading.Event()
+    registration_cancelled = threading.Event()
+
+    class DummyWorker:
+        _run_on_actor_loop = WorkerActor._run_on_actor_loop
+        _call_supervisor_on_actor_loop = WorkerActor._call_supervisor_on_actor_loop
+        _call_supervisor = WorkerActor._call_supervisor
+
+        def __init__(self, actor_loop):
+            self._actor_loop = actor_loop
+            self._supervisor_init_lock = None
+
+        async def _get_supervisor_ref_with_generation(self, add_worker=True):
+            assert add_worker is True
+            if self._supervisor_init_lock is None:
+                self._supervisor_init_lock = asyncio.Lock()
+            try:
+                async with self._supervisor_init_lock:
+                    registration_started.set()
+                    await asyncio.Event().wait()
+            finally:
+                registration_cancelled.set()
+            raise AssertionError("registration wait should be cancelled")
+
+    with _ActorLoopThread() as actor_thread:
+        worker = DummyWorker(actor_thread.loop)
+        task = asyncio.create_task(
+            worker._call_supervisor(
+                "report_worker_status",
+                "test://worker",
+                {},
+                add_worker=True,
+            )
+        )
+        assert await asyncio.to_thread(registration_started.wait, 5)
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert await asyncio.to_thread(registration_cancelled.wait, 5)
+
+        async def inspect_actor_loop():
+            current_task = asyncio.current_task()
+            pending_tasks = [
+                task
+                for task in asyncio.all_tasks()
+                if task is not current_task and not task.done()
+            ]
+            assert worker._supervisor_init_lock is not None
+            return worker._supervisor_init_lock.locked(), pending_tasks
+
+        inspection = asyncio.run_coroutine_threadsafe(
+            inspect_actor_loop(), actor_thread.loop
+        )
+        lock_is_held, pending_tasks = await asyncio.wrap_future(inspection)
+
+        assert lock_is_held is False
+        assert pending_tasks == []
+
+
 class DummyReplicaWorkerRef(DummyActorRef):
     def __init__(self, address: str, models=None):
         super().__init__(address)
@@ -592,6 +820,9 @@ class DummyReplicaWorkerRef(DummyActorRef):
 
     async def update_system_settings(self, settings):
         self.system_settings_updates.append(settings)
+
+    async def get_node_metadata(self):
+        return {"software_version": "test"}
 
     async def list_models(self):
         return dict(self._models)
@@ -604,6 +835,22 @@ class DummyReplicaWorkerRef(DummyActorRef):
 
     async def get_model(self, model_uid: str):
         return {"model_uid": model_uid, "worker_address": self.address}
+
+
+class DummyMetadataReplicaWorkerRef(DummyReplicaWorkerRef):
+    def __init__(self, address: str, metadata):
+        super().__init__(address)
+        self.metadata = metadata
+        self.metadata_calls = 0
+
+    async def get_node_metadata(self):
+        self.metadata_calls += 1
+        metadata = (
+            self.metadata.pop(0) if isinstance(self.metadata, list) else self.metadata
+        )
+        if isinstance(metadata, Exception):
+            raise metadata
+        return metadata
 
 
 class DummyStatusGuardRef:
@@ -652,21 +899,57 @@ class DummyStatusGuardRef:
         return [] if info is None else info.replica_statuses
 
 
-def test_prepare_virtual_env_injects_engine_vars():
+def test_prepare_virtual_env_injects_engine_vars(tmp_path):
     manager = DummyVirtualEnvManager()
+    manager.env_path = str(tmp_path / "venv")
     settings = VirtualEnvSettings(packages=["pkgA==1.0.0"], inherit_pip_config=False)
+    stages = []
     WorkerActor._prepare_virtual_env(
         manager,
         settings,
         ["pkgB==2.0.0"],
         model_engine="vllm",
+        report_install_stage=stages.append,
     )
 
+    assert stages == ["installing_dependencies"]
     assert len(manager.calls) == 1
     packages, kwargs = manager.calls[0]
     assert packages == ["pkgA==1.0.0", "pkgB==2.0.0"]
     assert kwargs["engine"] == "vllm"
     assert kwargs["model_engine"] == "vllm"
+
+
+def test_prepare_virtual_env_reports_dependency_plan_per_replica(tmp_path, monkeypatch):
+    manager = DummyVirtualEnvManager()
+    manager.env_path = str(tmp_path / "venv")
+    plan = [("example", "2.0"), ("child-pkg", "3.0")]
+    monkeypatch.setattr(
+        "xinference.core.virtual_env_manager.resolve_dependency_install_plan",
+        lambda *_args: plan,
+    )
+    stopped = threading.Event()
+    monkeypatch.setattr(
+        "xinference.core.virtual_env_manager.observe_dependency_install",
+        lambda *_args: (stopped, SimpleNamespace(join=lambda timeout: None)),
+    )
+    reported = []
+
+    WorkerActor._prepare_virtual_env(
+        manager,
+        VirtualEnvSettings(packages=["example>=1"], inherit_pip_config=False),
+        None,
+        model_engine=None,
+        report_install_progress=lambda completed, total, packages: reported.append(
+            (completed, total, packages)
+        ),
+    )
+
+    assert reported == [
+        (0, 2, ["example==2.0", "child-pkg==3.0"]),
+        (2, 2, ["example==2.0", "child-pkg==3.0"]),
+    ]
+    assert stopped.is_set()
 
 
 def test_prepare_virtual_env_merges_validated_find_links(tmp_path, monkeypatch):
@@ -1126,6 +1409,131 @@ async def test_supervisor_add_worker_idempotent_rebuilds_replica_state(monkeypat
         supervisor._system_settings,
         supervisor._system_settings,
     ]
+
+
+@pytest.mark.asyncio
+async def test_supervisor_refreshes_optional_worker_metadata_on_registration(
+    monkeypatch,
+):
+    supervisor = SupervisorActor()
+    supervisor._status_guard_ref = DummyStatusGuardRef()
+    worker_ref = DummyMetadataReplicaWorkerRef(
+        "worker-1", {"software_version": "3.4.0"}
+    )
+
+    async def fake_actor_ref(address, uid):
+        assert address == "worker-1"
+        return worker_ref
+
+    monkeypatch.setattr(xo, "actor_ref", fake_actor_ref)
+
+    await supervisor.add_worker("worker-1")
+    assert supervisor._worker_metadata["worker-1"] == {"software_version": "3.4.0"}
+
+    worker_ref.metadata = {"software_version": "3.4.1.dev9+gabcdef"}
+    await supervisor.add_worker("worker-1")
+    assert supervisor._worker_metadata["worker-1"] == {
+        "software_version": "3.4.1.dev9+gabcdef"
+    }
+
+    worker_ref.metadata = RuntimeError("old worker has no metadata RPC")
+    await supervisor.add_worker("worker-1")
+
+    assert "worker-1" in supervisor._worker_address_to_worker
+    assert "worker-1" not in supervisor._worker_metadata
+    assert "worker-1" in supervisor._worker_metadata_refresh_tasks
+    assert len(worker_ref.system_settings_updates) == 3
+
+    supervisor._discard_worker_metadata("worker-1")
+    await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_supervisor_retries_optional_worker_metadata_after_registration_failure(
+    monkeypatch,
+):
+    supervisor = SupervisorActor()
+    supervisor._status_guard_ref = DummyStatusGuardRef()
+    worker_ref = DummyMetadataReplicaWorkerRef(
+        "worker-1",
+        [
+            RuntimeError("metadata RPC temporarily unavailable"),
+            {"software_version": "3.4.1.dev9+gabcdef"},
+        ],
+    )
+
+    async def fake_actor_ref(address, uid):
+        assert address == "worker-1"
+        return worker_ref
+
+    monkeypatch.setattr(xo, "actor_ref", fake_actor_ref)
+    monkeypatch.setattr(supervisor_module, "_WORKER_METADATA_RETRY_DELAYS", (0, 0, 0))
+
+    await supervisor.add_worker("worker-1")
+
+    assert "worker-1" in supervisor._worker_address_to_worker
+    metadata_task = supervisor._worker_metadata_refresh_tasks["worker-1"]
+    await metadata_task
+    assert worker_ref.metadata_calls == 2
+    assert supervisor._worker_metadata["worker-1"] == {
+        "software_version": "3.4.1.dev9+gabcdef"
+    }
+    assert "worker-1" not in supervisor._worker_metadata_refresh_tasks
+
+
+@pytest.mark.asyncio
+async def test_stale_worker_metadata_retry_cannot_overwrite_new_registration(
+    monkeypatch,
+):
+    supervisor = SupervisorActor()
+    old_worker_ref = DummyMetadataReplicaWorkerRef(
+        "worker-1", {"software_version": "3.4.0"}
+    )
+    new_worker_ref = DummyMetadataReplicaWorkerRef(
+        "worker-1", {"software_version": "3.4.1"}
+    )
+    supervisor._worker_address_to_worker["worker-1"] = old_worker_ref
+    old_generation = supervisor._start_worker_metadata_generation("worker-1")
+
+    supervisor._discard_worker_metadata("worker-1")
+    supervisor._worker_address_to_worker["worker-1"] = new_worker_ref
+    new_generation = supervisor._start_worker_metadata_generation("worker-1")
+
+    assert not await supervisor._refresh_worker_metadata(
+        "worker-1", old_worker_ref, old_generation
+    )
+    assert await supervisor._refresh_worker_metadata(
+        "worker-1", new_worker_ref, new_generation
+    )
+    assert supervisor._worker_metadata["worker-1"] == {"software_version": "3.4.1"}
+
+
+@pytest.mark.asyncio
+async def test_supervisor_remove_worker_clears_cached_metadata(monkeypatch):
+    supervisor = SupervisorActor()
+    worker_ref = DummyMetadataReplicaWorkerRef(
+        "worker-1", RuntimeError("metadata unavailable")
+    )
+    supervisor._worker_address_to_worker["worker-1"] = worker_ref
+    supervisor._worker_metadata["worker-1"] = {"software_version": "3.4.0"}
+    generation = supervisor._start_worker_metadata_generation("worker-1")
+    supervisor._schedule_worker_metadata_retry("worker-1", worker_ref, generation)
+    metadata_task = supervisor._worker_metadata_refresh_tasks["worker-1"]
+
+    async def fake_handle_dead_worker(worker_address):
+        assert worker_address == "worker-1"
+
+    monkeypatch.setattr(supervisor, "_handle_dead_worker", fake_handle_dead_worker)
+
+    await supervisor.remove_worker("worker-1")
+
+    assert "worker-1" not in supervisor._worker_address_to_worker
+    assert "worker-1" not in supervisor._worker_metadata
+    assert "worker-1" not in supervisor._worker_metadata_generation
+    assert "worker-1" not in supervisor._worker_metadata_refresh_tasks
+    with pytest.raises(asyncio.CancelledError):
+        await metadata_task
+    assert metadata_task.cancelled()
 
 
 @pytest.mark.asyncio
@@ -3104,6 +3512,9 @@ async def test_periodical_report_status_reregisters_after_heartbeat_failure(
         _clear_unregistered_supervisor_refs = (
             WorkerActor._clear_unregistered_supervisor_refs
         )
+        _run_on_actor_loop = WorkerActor._run_on_actor_loop
+        _call_supervisor_on_actor_loop = WorkerActor._call_supervisor_on_actor_loop
+        _call_supervisor = WorkerActor._call_supervisor
         heartbeat = WorkerActor.heartbeat
         report_status = WorkerActor.report_status
 

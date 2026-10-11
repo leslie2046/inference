@@ -16,12 +16,15 @@ import hashlib
 import importlib.util
 import io
 import json
+import shlex
+import shutil
 import subprocess
 import sys
 from http.client import IncompleteRead
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
+import pytest
 from packaging.requirements import InvalidRequirement, Requirement
 
 SCRIPT_DIR = Path(__file__).resolve().parents[1]
@@ -69,6 +72,46 @@ def test_generate_package_list_classification():
     )
     standard_marker = 'decord2==3.4.0 ; platform_machine == "aarch64"'
     assert generator.normalize_mirror_spec(standard_marker) == standard_marker
+
+
+@pytest.mark.parametrize("platform", ["amd64", "arm64"])
+def test_generate_package_lists_from_docker_sources(tmp_path, platform):
+    src_root = tmp_path / "src"
+    dockerfile = (SCRIPT_DIR / "Dockerfile.pypiserver").read_text(encoding="utf-8")
+    for line in dockerfile.replace("\\\n", " ").splitlines():
+        fields = shlex.split(line)
+        if not fields or fields[0] != "COPY":
+            continue
+        destination = fields[-1]
+        if not destination.startswith("/build/src/"):
+            continue
+        target = src_root / destination.removeprefix("/build/src/")
+        target.mkdir(parents=True, exist_ok=True)
+        for source in fields[1:-1]:
+            source_path = REPO_ROOT / source
+            if source_path.is_dir():
+                shutil.copytree(source_path, target, dirs_exist_ok=True)
+            else:
+                shutil.copy2(source_path, target)
+
+    out = tmp_path / "out"
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT_DIR / "generate_package_lists.py"),
+            "--platform",
+            platform,
+            "--src-root",
+            str(src_root),
+            "--out",
+            str(out),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (out / "manifest.json").is_file()
+    assert (out / "engines" / "transformers.in").is_file()
 
 
 def test_load_xinference_modules_restores_sys_modules():
@@ -177,6 +220,17 @@ def test_selfcheck_wheel_url_to_spec():
     )
     assert selfcheck.wheel_url_to_spec("https://example.com/pkg.tar.gz") is None
     assert selfcheck.wheel_url_to_spec("https://example.com/invalid.whl") is None
+
+
+@pytest.mark.parametrize("marker", ["", ' ; platform_machine == "aarch64"'])
+def test_selfcheck_named_wheel_reference(marker):
+    selfcheck = _load_script("selfcheck")
+    assert (
+        selfcheck.wheel_url_to_spec(
+            "torchao @ https://example.com/torchao-0.16.0-py3-none-any.whl" + marker
+        )
+        == "torchao==0.16.0" + marker
+    )
 
 
 def test_download_report_wheel_filename_parsing():
@@ -494,8 +548,8 @@ def test_transformers_optional_dependencies_are_scoped_and_mirrored(
         {
             "spec": "flash-attn==2.8.3.post1",
             "sources": [
-                "embedding/model_spec.json:jina-embeddings-v3",
-                "embedding/model_spec.json:jina-embeddings-v3 (sentence_transformers)",
+                "embedding/models/jina-embeddings-v3.json:jina-embeddings-v3",
+                "embedding/models/jina-embeddings-v3.json:jina-embeddings-v3 (sentence_transformers)",
             ],
         }
     ]
@@ -524,7 +578,7 @@ def test_transformers_optional_dependencies_are_scoped_and_mirrored(
         if item["spec"].split(";", 1)[0].strip().lower() == "qwen-vl-utils!=0.0.9"
     )
     for model_name in ("qwen3.5", "qwen3.6"):
-        source = "llm/llm_family.json:" + model_name + " (Transformers)"
+        source = "llm/models/" + model_name + ".json:" + model_name + " (Transformers)"
         assert source in qwen_vl_sources
 
 
@@ -717,6 +771,8 @@ def test_selfcheck_main_orchestration(monkeypatch, tmp_path, capsys):
     )
     (manifest / "urls.txt").write_text(
         "https://example.invalid/direct-1.0-py3-none-any.whl\n"
+        "torchao @ https://example.invalid/torchao-0.16.0-py3-none-any.whl"
+        ' ; platform_machine == "aarch64"\n'
     )
     git_source = "git-package @ git+https://example.invalid/repo.git@abc"
     (manifest / "git.txt").write_text(git_source + "\n")
@@ -753,6 +809,7 @@ def test_selfcheck_main_orchestration(monkeypatch, tmp_path, capsys):
         ["engine-pkg>=1.0"],
         ["model-pin==1.0"],
         ["direct==1.0"],
+        ['torchao==0.16.0 ; platform_machine == "aarch64"'],
     ]
     output = capsys.readouterr().out
     assert "UNSUPPORTED offline direct reference " + git_source in output

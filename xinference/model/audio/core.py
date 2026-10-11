@@ -21,6 +21,7 @@ from .ace_step import AceStepModel, is_ace_step_python_supported
 from .auk import AukModel
 from .breeze_tts import BreezeTTS2Model
 from .chattts import ChatTTSModel
+from .confucius4_tts import Confucius4TTSModel
 from .cosyvoice import CosyVoiceModel
 from .engine_family import AudioEngineModel
 from .f5tts import F5TTSModel
@@ -43,6 +44,7 @@ from .speaker_embedding import ModelScopeSpeakerEmbeddingModel
 from .voxcpm import VoxCPMModel
 from .whisper import WhisperModel
 from .whisper_mlx import WhisperMLXModel
+from .yue2 import YuE2Model
 
 logger = logging.getLogger(__name__)
 
@@ -195,6 +197,12 @@ def match_audio(
             family.quantization is not None for family in model_families
         ):
             selected_quantization = (quantization or "none").lower()
+            if quantization is None:
+                available_quantizations = {
+                    (family.quantization or "none").lower() for family in model_families
+                }
+                if len(available_quantizations) == 1:
+                    selected_quantization = next(iter(available_quantizations))
             quantized_families = [
                 family
                 for family in model_families
@@ -252,12 +260,14 @@ def create_audio_model_instance(
     FunASRModel,
     ChatTTSModel,
     CosyVoiceModel,
+    Confucius4TTSModel,
     FishSpeechModel,
     F5TTSModel,
     F5TTSMLXModel,
     FireRedTTS3Model,
     MeloTTSModel,
     MiniMaxMusic3Model,
+    YuE2Model,
     KokoroModel,
     KokoroMLXModel,
     KokoroZHModel,
@@ -277,7 +287,7 @@ def create_audio_model_instance(
 
     enable_virtual_env = kwargs.pop("enable_virtual_env", None)
     model_name, model_engine = resolve_audio_model_name_and_engine(
-        model_name, model_engine
+        model_name, model_engine, use_default_engine=True
     )
     model_spec = match_audio(
         model_name,
@@ -295,7 +305,12 @@ def create_audio_model_instance(
         model_spec.model_family == "minimax_music3"
         and model_spec.model_name not in AUDIO_ENGINES
     ):
-        raise ValueError("MiniMax-Music3 requires an NVIDIA CUDA device.")
+        raise ValueError(
+            "MiniMax-Music3 requires an NVIDIA CUDA device or Apple Silicon MLX."
+        )
+
+    if model_spec.model_family == "yue2" and model_spec.model_name not in AUDIO_ENGINES:
+        raise ValueError("YuE2 requires an NVIDIA CUDA device.")
 
     # Engine-aware dispatch for model families with multiple engines
     # (e.g. qwen3_asr on transformers or vLLM). Families without registered
@@ -352,6 +367,7 @@ def create_audio_model_instance(
         FunASRModel,
         ChatTTSModel,
         CosyVoiceModel,
+        Confucius4TTSModel,
         FishSpeechModel,
         F5TTSModel,
         F5TTSMLXModel,
@@ -388,6 +404,8 @@ def create_audio_model_instance(
         model = ChatTTSModel(model_uid, model_path, model_spec, **kwargs)
     elif model_spec.model_family == "CosyVoice":
         model = CosyVoiceModel(model_uid, model_path, model_spec, **kwargs)
+    elif model_spec.model_family == "Confucius4-TTS":
+        model = Confucius4TTSModel(model_uid, model_path, model_spec, **kwargs)
     elif model_spec.model_family == "FishAudio":
         model = FishSpeechModel(model_uid, model_path, model_spec, **kwargs)
     elif model_spec.model_family == "F5-TTS":

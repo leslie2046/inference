@@ -15,6 +15,7 @@ import { Button } from '@/components/ui/button';
 import { Form } from '@/components/ui/form';
 import { ModelAbility, ModelType, RequestEvents } from '@/constants';
 import { createForm } from '@/hooks/use-form';
+import { useI18n } from '@/contexts/i18n-context';
 import request from '@/lib/request';
 import { EventStreamController, postEventStreamFetcher } from '@/lib/eventStream';
 import { eventBus } from '@/lib/event-bus';
@@ -65,6 +66,7 @@ function audioFileName(modelName: string, blob: Blob) {
 
 const CapabilityTaskPanel = forwardRef<CapabilityTaskPanelMethod, CapabilityTaskPanelProps>(
   ({ config, model, modelUid }, ref) => {
+    const { t } = useI18n();
     const form = useMemo(() => createForm(), []);
     const runTokenRef = useRef(0);
     const activeRequestRef = useRef<
@@ -222,7 +224,7 @@ const CapabilityTaskPanel = forwardRef<CapabilityTaskPanelMethod, CapabilityTask
       let requestStarted = false;
       let streamResponseStarted = false;
       const requestPromise = Promise.resolve(
-        config.transformValues({ modelUid, model, values, requestId })
+        config.transformValues({ modelUid, model, values, requestId, t })
       ).then(async (body) => {
         if (runTokenRef.current !== runToken) return;
 
@@ -290,7 +292,7 @@ const CapabilityTaskPanel = forwardRef<CapabilityTaskPanelMethod, CapabilityTask
           );
 
           if (!stream || typeof stream.getReader !== 'function') {
-            throw new Error('The browser did not return a readable audio stream.');
+            throw new Error(t('runningModels.detail.audioStreamUnavailable'));
           }
 
           streamResponseStarted = true;
@@ -399,7 +401,9 @@ const CapabilityTaskPanel = forwardRef<CapabilityTaskPanelMethod, CapabilityTask
       <div className="flex items-center gap-3">
         <Button type="submit" className="h-11 flex-1 rounded-full" loading={loading}>
           <Sparkles className={cn('size-4', loading && 'hidden')} />
-          {config.submitLabel || 'Generate'}
+          {config.submitLabelKey
+            ? t(config.submitLabelKey)
+            : config.submitLabel || t('runningModels.detail.generate')}
         </Button>
         <Button
           type="button"
@@ -413,6 +417,7 @@ const CapabilityTaskPanel = forwardRef<CapabilityTaskPanelMethod, CapabilityTask
             !completionStreaming
           }
           onClick={reset}
+          aria-label={t('runningModels.detail.reset')}
         >
           <RotateCcw className="size-4" />
         </Button>
@@ -427,8 +432,15 @@ const CapabilityTaskPanel = forwardRef<CapabilityTaskPanelMethod, CapabilityTask
               <span className="flex size-8 items-center justify-center rounded-2xl bg-primary/10 text-primary">
                 <Icon className="size-4" />
               </span>
-              <h2 className="min-w-0 truncate text-lg font-semibold">{config.label}</h2>
+              <h2 className="min-w-0 truncate text-lg font-semibold">
+                {config.labelKey ? t(config.labelKey) : config.label}
+              </h2>
             </div>
+            {config.descriptionKey && (
+              <p className="mt-2 text-xs leading-5 text-muted-foreground">
+                {t(config.descriptionKey)}
+              </p>
+            )}
           </div>
 
           <Form
@@ -457,10 +469,10 @@ const CapabilityTaskPanel = forwardRef<CapabilityTaskPanelMethod, CapabilityTask
         >
           <div className="flex shrink-0 items-center justify-between border-b bg-card/80 p-4">
             <div className="flex items-center gap-3">
-              <h3 className="text-base font-semibold">Results</h3>
+              <h3 className="text-base font-semibold">{t('runningModels.detail.results')}</h3>
               {latencyMs !== undefined && !loading && (
                 <span className="text-xs font-medium text-muted-foreground">
-                  Latency {formatLatency(latencyMs)}
+                  {t('runningModels.detail.latency')} {formatLatency(latencyMs)}
                 </span>
               )}
             </div>
@@ -470,7 +482,7 @@ const CapabilityTaskPanel = forwardRef<CapabilityTaskPanelMethod, CapabilityTask
                 variant="ghost"
                 size="icon"
                 className="size-8 rounded-full text-muted-foreground"
-                aria-label="Copy result"
+                aria-label={t('runningModels.detail.copyResult')}
                 onClick={() => copyToClipboard(copyResultValue)}
               >
                 <Copy className="size-4" />

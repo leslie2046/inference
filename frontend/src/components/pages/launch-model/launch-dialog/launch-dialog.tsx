@@ -1,7 +1,7 @@
 'use client';
 
 import { useCallback, useEffect, useId, useMemo, useState, useRef } from 'react';
-import { Ban, Download, Rocket } from 'lucide-react';
+import { Ban, Download, LoaderCircle, Rocket, Sparkles } from 'lucide-react';
 import { toast } from 'sonner';
 import { useRouter } from 'next/navigation';
 import request from '@/lib/request';
@@ -16,7 +16,6 @@ import { cn } from '@/lib/utils';
 import { Progress } from '@/components/ui/progress';
 import { Button } from '@/components/ui/button';
 import { Switch } from '@/components/ui/switch';
-import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
 import {
   Dialog,
   DialogContent,
@@ -58,10 +57,13 @@ import {
   GPU_IDX_PATTERN,
 } from '../utils';
 import CommandLine from './command-line';
+import { audioSpecsForEngine } from './audio-quantization';
 import DownloadProgressDetails, { type DownloadProgressFile } from './download-progress-details';
 import ReplicaPlacementConfig from './replica-placement-config';
 import { FormField } from '@/components/ui/form-field';
 import { shouldApplyPreferredDownloadSource } from './download-source-utils.mjs';
+import { recommendationUnavailable, recommendationWarningKeys } from './recommendation';
+import { useRecommendation } from './use-recommendation';
 
 interface LaunchDialogProps {
   model?: CatalogModel;
@@ -80,6 +82,10 @@ interface LaunchProgressReplica {
   info: string | null;
   updated_at: number | null;
   download_files: DownloadProgressFile[];
+  dependency_install_completed?: number | null;
+  dependency_install_total?: number | null;
+  dependency_install_plan?: string[] | null;
+  dependency_install_status?: 'performed' | 'skipped' | null;
 }
 
 interface LaunchProgressResponse {
@@ -94,6 +100,14 @@ interface SystemSettingsResponse {
 }
 
 const DOWNLOAD_TERMINAL_STAGES = new Set(['completed', 'failed', 'cancelled']);
+
+function getLaunchStageKey(stage?: string, status?: string): string {
+  if (stage === 'downloading') return 'launchModel.stageDownloading';
+  if (stage === 'waiting_for_dependencies') return 'launchModel.stageWaitingDependencies';
+  if (stage === 'installing_dependencies') return 'launchModel.stageInstallingDependencies';
+  if (stage === 'loading' || status === 'LOADING') return 'launchModel.stageLoading';
+  return 'launchModel.stagePreparing';
+}
 
 const DOWNLOAD_ONLY_EXCLUDED_FIELDS = new Set([
   'model_uid',
@@ -148,6 +162,12 @@ export default function LaunchDialog({
   const isCanceledDownloadRef = useRef(false);
   const modelEngineRequestIdRef = useRef(0);
   const isLLM = modelType === ModelType.LLM;
+  const supportsRecommendation = [
+    ModelType.LLM,
+    ModelType.Embedding,
+    ModelType.Rerank,
+    ModelType.Audio,
+  ].includes(modelType);
   const [modelEngineMap, setModelEngineMap] = useState<ModelEngine>({});
   const launchFormValues = useFormValues(form);
   const modelEngineValue = toOptionValue(useWatch('model_engine', form));
@@ -164,6 +184,34 @@ export default function LaunchDialog({
   const replicaValue = Number(useWatch('replica', form)) || 1;
   const modelUidValue = toOptionValue(useWatch('model_uid', form));
   const isCustomPlacement = replicaPlacementModeValue === 'custom';
+  const enableVirtualEnvValue = useWatch('enable_virtual_env', form);
+  const effectiveVirtualEnv =
+    typeof enableVirtualEnvValue === 'boolean' ? enableVirtualEnvValue : undefined;
+  const recommendationEngineContext = useRef<{
+    modelName?: string;
+    enableVirtualEnv: boolean;
+  } | null>(null);
+  const applyRecommendationEngines = useCallback(
+    (engines: ModelEngine, enableVirtualEnv: boolean) => {
+      modelEngineRequestIdRef.current += 1;
+      recommendationEngineContext.current = { modelName: model?.model_name, enableVirtualEnv };
+      setModelEngineMap(engines);
+    },
+    [model?.model_name]
+  );
+  const recommendation = useRecommendation(
+    form,
+    model?.model_name,
+    isOpen && supportsRecommendation && !loading,
+    markLaunchHistoryFormEdited,
+    applyRecommendationEngines,
+    modelType,
+    (model?.modelSpecs || []).map((spec) => toOptionValue(spec.quantization)).filter(Boolean)
+  );
+  const cannotRecommend = recommendationUnavailable(launchFormValues);
+  const recommendationWarnings = recommendation.result
+    ? recommendationWarningKeys(recommendation.result)
+    : [];
 
   const fetchWorkers = useCallback(async () => {
     if (clusterAuth?.auth && !isAdmin) {
@@ -182,6 +230,15 @@ export default function LaunchDialog({
   }, [clusterAuth?.auth, isAdmin, t]);
   const fetchModelEngine = useCallback(async () => {
     const requestId = ++modelEngineRequestIdRef.current;
+    // Applying an effective environment can trigger this effect. Its catalog
+    // was already refreshed and validated with that exact environment.
+    const recommendedContext = recommendationEngineContext.current;
+    recommendationEngineContext.current = null;
+    if (
+      recommendedContext?.modelName === model?.model_name &&
+      recommendedContext?.enableVirtualEnv === effectiveVirtualEnv
+    )
+      return;
 
     if (!model?.model_name || !MODEL_ENGINE_TYPES.includes(modelType)) {
       setModelEngineMap({});
@@ -194,7 +251,10 @@ export default function LaunchDialog({
 
     setModelEngineMap({});
 
-    const res = await request.get<ModelEngine>(url);
+    const res = await request.get<ModelEngine>(url, {
+      params:
+        effectiveVirtualEnv !== undefined ? { enable_virtual_env: effectiveVirtualEnv } : undefined,
+    });
 
     if (requestId !== modelEngineRequestIdRef.current) return;
 
@@ -210,7 +270,7 @@ export default function LaunchDialog({
         form.setFieldValue('model_engine', soleEngine);
       }
     }
-  }, [form, isLLM, model?.model_name, modelType]);
+  }, [form, isLLM, model?.model_name, modelType, effectiveVirtualEnv]);
 
   const engineIndex = useMemo(() => buildEngineIndex(modelEngineMap), [modelEngineMap]);
   const cacheIndex = useMemo(() => {
@@ -297,24 +357,16 @@ export default function LaunchDialog({
 
   const quantizationOptions = useMemo(() => {
     if (modelType === ModelType.Audio) {
+      const audioSpecs = audioSpecsForEngine(model?.modelSpecs || [], modelEngineValue);
       const quantizations = Array.from(
-        new Set(
-          (model?.modelSpecs || [])
-            .map((spec) => toOptionValue(spec.quantization))
-            .filter(Boolean)
-        )
+        new Set(audioSpecs.map((spec) => toOptionValue(spec.quantization)).filter(Boolean))
       );
 
       return quantizations.map((quantization) => {
-        const matchingSpecs = (model?.modelSpecs || []).filter(
+        const matchingSpecs = audioSpecs.filter(
           (spec) => toOptionValue(spec.quantization) === quantization
         );
-        const cached = matchingSpecs.some(
-          (spec) =>
-            cacheIndex.quantizations.has(
-              createCacheKey(toOptionValue(spec.model_format), '', quantization)
-            )
-        );
+        const cached = matchingSpecs.some(isCachedSpec);
 
         return {
           label: quantization,
@@ -345,6 +397,7 @@ export default function LaunchDialog({
   }, [
     cacheIndex.quantizations,
     model?.modelSpecs,
+    modelEngineValue,
     modelFormatValue,
     modelSizeInBillionsKey,
     modelType,
@@ -412,6 +465,9 @@ export default function LaunchDialog({
     let options = [];
     if ([ModelType.LLM, ModelType.Image].includes(modelType)) {
       options = gpuAvailable > 0 ? ['auto', 'CPU', ...range(1, gpuAvailable)] : ['auto', 'CPU'];
+    } else if (supportsRecommendation) {
+      // A zero GPU count does not rule out Metal/MLX on Apple Silicon.
+      options = ['auto', 'CPU'];
     } else {
       options = gpuAvailable === 0 ? ['CPU'] : ['GPU', 'CPU'];
     }
@@ -424,7 +480,7 @@ export default function LaunchDialog({
         });
       },
     };
-  }, [gpuAvailable, modelType, form]);
+  }, [gpuAvailable, modelType, supportsRecommendation, form]);
 
   const downloadHubOptions = useMemo(() => {
     const allSpecHubs = Array.from(
@@ -542,11 +598,7 @@ export default function LaunchDialog({
   }, [form, modelFormatValue, modelSizeInBillionsOptions, modelSizeInBillionsValue, modelType]);
 
   useEffect(() => {
-    if (
-      modelType !== ModelType.Audio &&
-      modelFormatValue &&
-      quantizationOptions.length === 0
-    ) {
+    if (modelType !== ModelType.Audio && modelFormatValue && quantizationOptions.length === 0) {
       return;
     }
 
@@ -1613,27 +1665,20 @@ export default function LaunchDialog({
 
   const fetchProgress = useCallback(async () => {
     const modelUid = form.getFieldValue('model_uid') || model?.model_name;
-    try {
-      const [progressRes, replicaRes] = await Promise.all([
-        request.get<number | string | LaunchProgressResponse>(`/v1/models/${modelUid}/progress`),
-        request.get<unknown>(`/v1/models/${modelUid}/replicas`),
-      ]);
+    const [progressResult, replicaResult] = await Promise.allSettled([
+      request.get<number | string | LaunchProgressResponse>(`/v1/models/${modelUid}/progress`),
+      request.get<unknown>(`/v1/models/${modelUid}/replicas`),
+    ]);
+    if (pollingRef.current === null) return;
 
-      const progressValue =
-        progressRes && typeof progressRes === 'object' ? progressRes.progress : progressRes;
-      const nextProgress = normalizeProgress(progressValue);
-
-      setProgress(nextProgress);
+    if (progressResult.status === 'fulfilled') {
+      const progressRes = progressResult.value;
       setProgressDetails(progressRes && typeof progressRes === 'object' ? progressRes : null);
-      setReplicaStatuses(normalizeReplicaStatuses(replicaRes));
-
-      if (nextProgress >= 100) {
-        stopPolling();
-      }
-    } catch {
-      stopPolling();
     }
-  }, [stopPolling, form, model]);
+    if (replicaResult.status === 'fulfilled') {
+      setReplicaStatuses(normalizeReplicaStatuses(replicaResult.value));
+    }
+  }, [form, model]);
 
   const fetchDownloadProgress = useCallback(async () => {
     const cacheUid = cacheUidRef.current;
@@ -1676,14 +1721,29 @@ export default function LaunchDialog({
       );
     }
 
+    const progressByReplicaId = new Map(
+      (progressDetails?.replicas ?? []).map((replica) => [replica.replica_id, replica])
+    );
+
     return (
-      <div className="space-y-2">
+      <div className="space-y-3 rounded-lg border bg-muted/20 p-4">
         <div className="text-sm font-medium">{t('launchModel.launchProgress')}</div>
         <div
-          className="grid max-h-[min(60vh,32rem)] grid-cols-1 gap-2 overflow-y-auto pr-1 sm:grid-cols-2 lg:grid-cols-3"
+          className="grid max-h-[min(40vh,24rem)] grid-cols-[repeat(auto-fit,minmax(min(100%,20rem),1fr))] gap-3 overflow-y-auto pr-1"
           aria-live="polite"
         >
           {replicaStatuses.map((replica) => {
+            const replicaProgress = progressByReplicaId.get(replica.replica_id);
+            const replicaReady = replica.status === 'READY';
+            const replicaFailed = replica.status === 'ERROR';
+            const replicaPercent = replicaReady
+              ? 100
+              : Math.min(normalizeProgress(replicaProgress?.progress), 99);
+            const replicaStageKey = replicaReady
+              ? 'launchModel.stageReady'
+              : replicaFailed
+                ? 'launchModel.stageFailed'
+                : getLaunchStageKey(replicaProgress?.stage, replica.status);
             const statusClassName =
               replica.status === 'READY'
                 ? 'border-emerald-200 bg-emerald-50 text-emerald-700'
@@ -1692,41 +1752,106 @@ export default function LaunchDialog({
                   : 'border-border bg-muted/40 text-muted-foreground';
 
             return (
-              <div
+              <article
                 key={replica.replica_id}
-                className="flex min-w-0 items-start justify-between gap-3 rounded-md border bg-background/60 p-3"
+                aria-label={`${t('launchModel.replica')} ${replica.replica_id}`}
+                className="flex min-w-0 flex-col gap-3 rounded-md border bg-background/60 p-3"
               >
-                <div className="flex min-w-0 flex-col gap-1 text-xs">
-                  <span className="font-semibold">
-                    {t('launchModel.replica')}&nbsp;{replica.replica_id}
-                  </span>
-                  <span
-                    className="truncate font-mono text-muted-foreground"
-                    title={replica.worker_address || '-'}
-                  >
-                    {replica.worker_address || '-'}
-                  </span>
-                  {replica.replica_uid && (
-                    <span className="truncate text-muted-foreground" title={replica.replica_uid}>
-                      {replica.replica_uid}
+                <div className="flex min-w-0 items-start justify-between gap-3">
+                  <div className="flex min-w-0 flex-col gap-1 text-xs">
+                    <span className="font-semibold">
+                      {t('launchModel.replica')}&nbsp;{replica.replica_id}
                     </span>
-                  )}
-                  <span className="text-muted-foreground">
-                    {t('launchModel.GPUIdx')}:{' '}
-                    {replica.gpu_idx && replica.gpu_idx.length > 0
-                      ? replica.gpu_idx.join(', ')
-                      : 'auto'}
-                  </span>
+                    <span
+                      className="break-all font-mono text-muted-foreground"
+                      title={replica.worker_address || '-'}
+                    >
+                      {replica.worker_address || '-'}
+                    </span>
+                    {replica.replica_uid && (
+                      <span className="truncate text-muted-foreground" title={replica.replica_uid}>
+                        {replica.replica_uid}
+                      </span>
+                    )}
+                    <span className="text-muted-foreground">
+                      {t('launchModel.GPUIdx')}:{' '}
+                      {replica.gpu_idx && replica.gpu_idx.length > 0
+                        ? replica.gpu_idx.join(', ')
+                        : 'auto'}
+                    </span>
+                  </div>
+                  <div
+                    className={cn(
+                      'shrink-0 rounded-md border px-2 py-1 text-xs font-medium leading-none',
+                      statusClassName
+                    )}
+                  >
+                    {replica.status}
+                  </div>
                 </div>
-                <div
-                  className={cn(
-                    'shrink-0 rounded-md border px-2 py-1 text-xs font-medium leading-none',
-                    statusClassName
+                <div className="space-y-1.5 text-xs text-muted-foreground">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="flex min-w-0 items-center gap-1.5">
+                      {!replicaReady && !replicaFailed && (
+                        <LoaderCircle
+                          className="size-3.5 shrink-0 animate-spin text-primary"
+                          aria-hidden="true"
+                        />
+                      )}
+                      <span>{t(replicaStageKey)}</span>
+                    </span>
+                    {(replicaProgress || replicaReady) && (
+                      <span className="shrink-0 tabular-nums">{Math.round(replicaPercent)}%</span>
+                    )}
+                  </div>
+                  {(replicaProgress || replicaReady) && (
+                    <Progress
+                      value={replicaPercent}
+                      className="h-1.5"
+                      aria-label={`${t('launchModel.replica')} ${replica.replica_id}: ${t(replicaStageKey)}`}
+                    />
                   )}
-                >
-                  {replica.status}
                 </div>
-              </div>
+                {(replicaProgress?.stage === 'downloading' ||
+                  Boolean(replicaProgress?.download_files?.length)) && (
+                  <DownloadProgressDetails files={replicaProgress?.download_files ?? []} compact />
+                )}
+                {(replicaProgress?.stage === 'installing_dependencies' ||
+                  replicaProgress?.stage === 'loading') &&
+                  typeof replicaProgress.dependency_install_total === 'number' &&
+                  replicaProgress.dependency_install_total > 0 &&
+                  typeof replicaProgress.dependency_install_completed === 'number' && (
+                    <div className="space-y-1.5 text-xs text-muted-foreground">
+                      <div className="tabular-nums">
+                        {t('launchModel.dependencyInstallCount', {
+                          completed: replicaProgress.dependency_install_completed,
+                          total: replicaProgress.dependency_install_total,
+                        })}
+                      </div>
+                      {Boolean(replicaProgress.dependency_install_plan?.length) && (
+                        <details>
+                          <summary className="cursor-pointer">
+                            {t('launchModel.dependencyInstallPlan')}
+                          </summary>
+                          <ul className="mt-1 max-h-32 space-y-0.5 overflow-y-auto pl-4 font-mono">
+                            {replicaProgress.dependency_install_plan?.map((packageSpec) => (
+                              <li key={packageSpec} className="break-all">
+                                {packageSpec}
+                              </li>
+                            ))}
+                          </ul>
+                        </details>
+                      )}
+                    </div>
+                  )}
+                {replicaProgress?.stage === 'loading' &&
+                  (replicaProgress.dependency_install_status === 'skipped' ||
+                    replicaProgress.dependency_install_total === 0) && (
+                    <div className="text-xs text-muted-foreground">
+                      {t('launchModel.dependencyInstallSkipped')}
+                    </div>
+                  )}
+              </article>
             );
           })}
         </div>
@@ -1743,7 +1868,6 @@ export default function LaunchDialog({
       isCanceledLaunchRef.current = true;
       stopPolling();
       setLoading(false);
-      setProgress(0);
       setProgressDetails(null);
       setReplicaStatuses([]);
       toast.success(t('launchModel.launchCanceled'));
@@ -1785,7 +1909,6 @@ export default function LaunchDialog({
     const newValues = transformFormToFetch(values);
     isCanceledLaunchRef.current = false;
     setLoading(true);
-    setProgress(0);
     setProgressDetails(null);
     setReplicaStatuses([]);
 
@@ -1796,6 +1919,9 @@ export default function LaunchDialog({
         if (isCanceledLaunchRef.current) {
           return;
         }
+
+        stopPolling();
+        setProgressDetails({ stage: 'completed' });
 
         const launchedValues = {
           ...newValues,
@@ -1842,6 +1968,8 @@ export default function LaunchDialog({
       })
       .catch(() => {
         stopPolling();
+        setProgressDetails(null);
+        setReplicaStatuses([]);
       })
       .finally(() => {
         setLoading(false);
@@ -1894,6 +2022,8 @@ export default function LaunchDialog({
   };
 
   const handleClose = () => {
+    recommendation.invalidate();
+    recommendationEngineContext.current = null;
     modelEngineRequestIdRef.current += 1;
     setLoading(false);
     setIsDownloading(false);
@@ -1971,11 +2101,12 @@ export default function LaunchDialog({
   const initialValues = {
     model_name: model?.model_name,
     model_type: modelType,
-    n_gpu: [ModelType.LLM, ModelType.Image].includes(modelType)
-      ? 'auto'
-      : gpuAvailable === 0
-        ? 'CPU'
-        : 'GPU',
+    n_gpu:
+      supportsRecommendation || modelType === ModelType.Image
+        ? 'auto'
+        : gpuAvailable === 0
+          ? 'CPU'
+          : 'GPU',
     n_gpu_layers: -1,
     replica: 1,
     replica_placement_mode: 'auto' as const,
@@ -2001,9 +2132,22 @@ export default function LaunchDialog({
           maskClosable={false}
         >
           <DialogHeader>
-            <div className="flex min-w-0 items-center justify-between gap-3 pr-10">
+            <div className="flex min-w-0 flex-wrap items-center justify-between gap-3 pr-10">
               <DialogTitle className="min-w-0 truncate">{model?.model_name}</DialogTitle>
-              <div className="flex gap-2">
+              <div className="ml-auto flex max-w-full flex-wrap justify-end gap-2">
+                {supportsRecommendation && (
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    className="bg-primary/10 text-primary hover:bg-primary/15 hover:text-primary"
+                    disabled={loading || recommendation.pending || cannotRecommend}
+                    loading={recommendation.pending}
+                    onClick={recommendation.recommend}
+                  >
+                    {!recommendation.pending && <Sparkles aria-hidden="true" />}
+                    {t('launchModel.recommendConfiguration')}
+                  </Button>
+                )}
                 <ConfigCache
                   form={form}
                   modelName={model?.model_name}
@@ -2020,6 +2164,31 @@ export default function LaunchDialog({
               </div>
             </div>
           </DialogHeader>
+          {supportsRecommendation &&
+            (cannotRecommend || recommendation.failed || recommendation.result) && (
+              <div className="space-y-2">
+                {cannotRecommend && (
+                  <p className="text-sm text-muted-foreground">
+                    {t('launchModel.recommendUnavailable')}
+                  </p>
+                )}
+                <div role="status" aria-live="polite" className="text-sm text-muted-foreground">
+                  {recommendation.failed && t('launchModel.recommendFailed')}
+                  {recommendation.result && (
+                    <p>
+                      {t(
+                        recommendation.result.status === 'recommended'
+                          ? 'launchModel.recommendApplied'
+                          : 'launchModel.noRecommendation'
+                      )}
+                      {recommendationWarnings.map((key) => (
+                        <span key={key}> {t(key)}</span>
+                      ))}
+                    </p>
+                  )}
+                </div>
+              </div>
+            )}
           <Form
             id={formId}
             form={form}
@@ -2035,16 +2204,24 @@ export default function LaunchDialog({
           <DialogFooter className={cn(loading ? '!flex-col' : '')}>
             {loading && (
               <div className="w-full space-y-2 pr-3">
-                <div className="flex items-center gap-3">
-                  <Progress value={progress} className="flex-1" />
-                  <span className="w-10 shrink-0 text-right text-xs tabular-nums text-muted-foreground">
-                    {Math.round(progress)}%
-                  </span>
-                </div>
-                {(progressDetails?.stage === 'downloading' ||
-                  Boolean(progressDetails?.download_files?.length)) && (
-                  <DownloadProgressDetails files={progressDetails?.download_files ?? []} />
+                {isDownloading && (
+                  <div className="flex items-center gap-3">
+                    <Progress
+                      value={progress}
+                      className="flex-1"
+                      aria-label={t('launchModel.overallProgress')}
+                    />
+                    <span className="w-10 shrink-0 text-right text-xs tabular-nums text-muted-foreground">
+                      {Math.round(progress)}%
+                    </span>
+                  </div>
                 )}
+                {isDownloading &&
+                  (progressDetails?.stage === 'downloading' ||
+                    Boolean(progressDetails?.download_files?.length)) && (
+                    <DownloadProgressDetails files={progressDetails?.download_files ?? []} />
+                  )}
+                {!isDownloading && renderReplicaStatuses()}
               </div>
             )}
             <div className="flex w-full flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
@@ -2053,67 +2230,40 @@ export default function LaunchDialog({
                 {t('launchModel.saveAutostart')}
               </label>
               <div className="ml-auto flex items-center justify-end gap-2">
-                <TooltipProvider>
-                  <Button variant="outline" disabled={loading} onClick={handleClose}>
-                    {t('common.cancel')}
+                <Button variant="outline" disabled={loading} onClick={handleClose}>
+                  {t('common.cancel')}
+                </Button>
+                {loading ? (
+                  <Button
+                    type="button"
+                    variant="outline"
+                    disabled={canceling}
+                    loading={canceling}
+                    onClick={isDownloading ? handleCancelDownload : handleCancelLaunch}
+                    className="border-destructive text-destructive hover:bg-destructive/10 hover:text-destructive"
+                  >
+                    <Ban />
+                    {t('common.stop')}
                   </Button>
-                  {loading ? (
-                    isDownloading ? (
+                ) : (
+                  <>
+                    {allowDownloadOnly && (
                       <Button
                         type="button"
                         variant="outline"
-                        disabled={canceling}
-                        loading={canceling}
-                        onClick={handleCancelDownload}
-                        className="border-destructive text-destructive hover:bg-destructive/10 hover:text-destructive"
+                        disabled={!isDownloadReady}
+                        onClick={handleDownload}
                       >
-                        <Ban />
-                        {t('common.stop')}
+                        <Download />
+                        {t('launchModel.downloadOnly')}
                       </Button>
-                    ) : (
-                      <Tooltip>
-                        <TooltipTrigger asChild>
-                          <Button
-                            type="button"
-                            variant="outline"
-                            disabled={canceling}
-                            loading={canceling}
-                            onClick={handleCancelLaunch}
-                            className="border-destructive text-destructive hover:bg-destructive/10 hover:text-destructive"
-                          >
-                            <Ban />
-                            {t('common.stop')}
-                          </Button>
-                        </TooltipTrigger>
-                        <TooltipContent
-                          side="top"
-                          align="end"
-                          className="w-[min(42rem,calc(100vw-2rem))] max-w-none p-3"
-                        >
-                          {renderReplicaStatuses()}
-                        </TooltipContent>
-                      </Tooltip>
-                    )
-                  ) : (
-                    <>
-                      {allowDownloadOnly && (
-                        <Button
-                          type="button"
-                          variant="outline"
-                          disabled={!isDownloadReady}
-                          onClick={handleDownload}
-                        >
-                          <Download />
-                          {t('launchModel.downloadOnly')}
-                        </Button>
-                      )}
-                      <Button type="submit" form={formId}>
-                        <Rocket />
-                        {t('common.deploy')}
-                      </Button>
-                    </>
-                  )}
-                </TooltipProvider>
+                    )}
+                    <Button type="submit" form={formId}>
+                      <Rocket />
+                      {t('common.deploy')}
+                    </Button>
+                  </>
+                )}
               </div>
             </div>
           </DialogFooter>

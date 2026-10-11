@@ -34,6 +34,7 @@ from logging import getLogger
 from typing import (
     TYPE_CHECKING,
     Any,
+    Awaitable,
     Callable,
     Dict,
     List,
@@ -42,6 +43,7 @@ from typing import (
     Set,
     Tuple,
     Type,
+    TypeVar,
     Union,
     no_type_check,
 )
@@ -50,6 +52,7 @@ import xoscar as xo
 from async_timeout import timeout
 from xoscar import MainActorPoolType
 
+from .. import __version__
 from ..client.restful.restful_client import Client as RESTfulClient
 from ..constants import (
     XINFERENCE_ALLOW_MULTI_REPLICA_PER_GPU,
@@ -142,6 +145,8 @@ if TYPE_CHECKING:
 
 logger = getLogger(__name__)
 
+_T = TypeVar("_T")
+
 # Track which virtualenv paths have already been set up (install_packages +
 # post-install hooks) within the current process lifetime. Maps venv_path to
 # a fingerprint of the resolved package list so that a change in package
@@ -150,6 +155,36 @@ logger = getLogger(__name__)
 # subsequent replicas skip it to avoid downgrade/upgrade churn that can
 # corrupt .so files while child subprocesses are importing torch/vllm.
 _venv_setup_done: Dict[str, str] = {}
+
+# Building the SGLang source snapshot used by Spark-X2.5 normally discovers
+# optional Rust extensions through cargo.  Xinference runtime images do not
+# carry a Rust toolchain; SGLang explicitly supports a pure-Python build for
+# serving workloads that do not use those extensions.
+_sglang_source_build_env_lock = threading.Lock()
+
+
+@contextmanager
+def _sglang_source_build_environment(packages: List[str]):
+    uses_sglang_source_snapshot = any(
+        package.split(";", 1)[0]
+        .strip()
+        .startswith("sglang @ git+https://github.com/sgl-project/sglang.git@")
+        for package in packages
+    )
+    if not uses_sglang_source_snapshot:
+        yield
+        return
+
+    with _sglang_source_build_env_lock:
+        old_value = os.environ.get("SGLANG_BUILD_RUST_EXTS")
+        os.environ["SGLANG_BUILD_RUST_EXTS"] = "none"
+        try:
+            yield
+        finally:
+            if old_value is None:
+                os.environ.pop("SGLANG_BUILD_RUST_EXTS", None)
+            else:
+                os.environ["SGLANG_BUILD_RUST_EXTS"] = old_value
 
 
 def _normalize_fingerprint_value(value: Any) -> Any:
@@ -1526,6 +1561,75 @@ class WorkerActor(xo.StatelessActor):
             # clear the leader's in-flight initialization.
             self._clear_unregistered_supervisor_refs()
             raise
+
+    async def _run_on_actor_loop(
+        self, coroutine_factory: Callable[[], Awaitable[_T]]
+    ) -> _T:
+        """Run a coroutine factory on the worker actor's event loop."""
+        running_loop = asyncio.get_running_loop()
+        if self._actor_loop is None:
+            # Test/local fallback. Production initializes the actor loop in
+            # __post_create__ before starting the status-reporting isolation.
+            self._actor_loop = running_loop
+            if self._supervisor_init_lock is None:
+                self._supervisor_init_lock = asyncio.Lock()
+
+        if running_loop is self._actor_loop:
+            return await coroutine_factory()
+
+        async def _invoke() -> _T:
+            # Invoke the factory only after execution has moved to the actor
+            # loop. This keeps xoscar coroutine/future creation loop-local.
+            return await coroutine_factory()
+
+        future = asyncio.run_coroutine_threadsafe(_invoke(), self._actor_loop)
+        try:
+            return await asyncio.wrap_future(future)
+        except asyncio.CancelledError:
+            # Do not leave the actor-loop RPC running after the isolation-loop
+            # caller has been cancelled during worker shutdown.
+            future.cancel()
+            raise
+
+    async def _call_supervisor_on_actor_loop(
+        self,
+        method_name: str,
+        *args: Any,
+        add_worker: bool,
+    ) -> Any:
+        """Execute one complete Supervisor RPC lifecycle on the actor loop."""
+        supervisor_ref, supervisor_generation = (
+            await self._get_supervisor_ref_with_generation(add_worker)
+        )
+        try:
+            method = getattr(supervisor_ref, method_name)
+            return await xo.wait_for(
+                method(*args),
+                XINFERENCE_TCP_REQUEST_TIMEOUT,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self._clear_supervisor_refs(
+                expected_supervisor_ref=supervisor_ref,
+                expected_generation=supervisor_generation,
+            )
+            raise
+
+    async def _call_supervisor(
+        self,
+        method_name: str,
+        *args: Any,
+        add_worker: bool,
+    ) -> Any:
+        """Call Supervisor without creating xoscar clients on isolation loops."""
+        return await self._run_on_actor_loop(
+            lambda: self._call_supervisor_on_actor_loop(
+                method_name,
+                *args,
+                add_worker=add_worker,
+            )
+        )
 
     async def _get_supervisor_ref_on_actor_loop(
         self, add_worker: bool
@@ -3065,6 +3169,106 @@ class WorkerActor(xo.StatelessActor):
             model_type, model_name, enable_virtual_env=enable_virtual_env
         )
 
+    async def get_model_recommendation_info(
+        self,
+        model_name: str,
+        enable_virtual_env: Optional[bool] = None,
+        model_type: str = "LLM",
+    ) -> dict:
+        """Worker-local discovery only; never prepare environments or allocate GPUs."""
+        from ..device_utils import get_available_device
+
+        family = await self.get_model_registration(model_type, model_name)
+        if family is None:
+            return {"model_exists": False}
+        effective_venv = (
+            XINFERENCE_ENABLE_VIRTUAL_ENV
+            if enable_virtual_env is None
+            else enable_virtual_env
+        )
+        installed = await self.query_engines_by_model_name(
+            model_name, model_type, False
+        )
+        engines = (
+            await self.query_engines_by_model_name(model_name, model_type, True)
+            if effective_venv
+            else installed
+        )
+        if model_type != "LLM":
+            from .model_recommendation import non_llm_candidates
+
+            return {
+                "model_exists": True,
+                "platform": platform.system(),
+                "device": get_available_device(),
+                "gpu_indices": list(self._total_gpu_devices),
+                "gpu_count": gpu_count(),
+                "enable_virtual_env": effective_venv,
+                "candidates": non_llm_candidates(
+                    model_type, model_name, engines or {}, installed or {}
+                ),
+            }
+        from ..model.llm.cache_manager import LLMCacheManager
+        from ..model.llm.llm_family import convert_model_size_to_float, match_llm
+        from ..model.llm.memory import ModelLayersInfo, estimate_llm_gpu_memory_details
+        from .model_recommendation import recommendation_memory_snapshot, spec_key
+
+        launch_specs, cached_specs = set(), set()
+        memory_estimates = {}
+        for params in (engines or {}).values():
+            if not isinstance(params, list):
+                continue
+            for param in params:
+                for quant in param["quantizations"]:
+                    # Resolve the same default hub and exact spec as launch.
+                    matched = match_llm(
+                        model_name,
+                        param["model_format"],
+                        param["model_size_in_billions"],
+                        quant,
+                    )
+                    if matched is None:
+                        continue
+                    key = spec_key(param, quant)
+                    launch_specs.add(key)
+                    metadata = getattr(matched.model_specs[0], "model_metadata", None)
+                    if metadata is not None and key not in memory_estimates:
+                        try:
+                            memory_estimates[key] = estimate_llm_gpu_memory_details(
+                                ModelLayersInfo.from_metadata(metadata),
+                                convert_model_size_to_float(
+                                    param["model_size_in_billions"]
+                                ),
+                                quant,
+                                2048,
+                                param["model_format"],
+                            ).total
+                        except (KeyError, ValueError, AssertionError):
+                            # Unsupported quantizations remain compatible candidates,
+                            # but must not be represented as a verified memory fit.
+                            pass
+                    path = LLMCacheManager.get_cache_dir_for_spec(
+                        model_name, matched.model_specs[0]
+                    )
+                    # Launch reuses this exact format/size/quantization path.
+                    # Do not instantiate CacheManager: its constructor mkdirs.
+                    if os.path.exists(path):
+                        cached_specs.add(key)
+        return {
+            "model_exists": True,
+            "platform": platform.system(),
+            "device": get_available_device(),
+            "gpu_indices": list(self._total_gpu_devices),
+            "gpu_count": gpu_count(),
+            "enable_virtual_env": effective_venv,
+            "installed_engines": installed or {},
+            "engines": engines or {},
+            "launch_specs": launch_specs,
+            "cached_specs": cached_specs,
+            "memory_estimates": memory_estimates,
+            "memory": recommendation_memory_snapshot(),
+        }
+
     async def _get_model_ability(self, model: Any, model_type: str) -> List[str]:
         from ..model.llm.core import LLM
 
@@ -3395,6 +3599,8 @@ class WorkerActor(xo.StatelessActor):
         model_uid: Optional[str] = None,
         reserve_usage: Optional[Callable[[str, str, str, bool], None]] = None,
         release_usage: Optional[Callable[[str, Optional[str]], None]] = None,
+        report_install_stage: Optional[Callable[[str], None]] = None,
+        report_install_progress: Optional[Callable[[int, int, List[str]], None]] = None,
     ) -> Optional[str]:
         engine_defaults = get_engine_model_format_virtualenv_packages(
             model_engine, model_format
@@ -3748,6 +3954,8 @@ class WorkerActor(xo.StatelessActor):
                     reserve_usage(venv_path, fingerprint, model_uid, not setup_matches)
                     usage_reserved = True
                 if not setup_matches:
+                    if report_install_stage is not None:
+                        report_install_stage("installing_dependencies")
                     if modern_sglang_kernel:
                         # SGLang 0.5.11 renamed the distribution while retaining the
                         # same import package.  Remove the cached legacy owner before
@@ -3755,9 +3963,48 @@ class WorkerActor(xo.StatelessActor):
                         cls._uninstall_venv_package(virtual_env_manager, "sgl-kernel")
                     if force_reinstall_xllamacpp:
                         cls._uninstall_venv_package(virtual_env_manager, "xllamacpp")
-                    virtual_env_manager.install_packages(
-                        regular_packages, **conf, **variables
+                    from .virtual_env_manager import (
+                        observe_dependency_install,
+                        resolve_dependency_install_plan,
                     )
+
+                    plan = (
+                        resolve_dependency_install_plan(
+                            virtual_env_manager, regular_packages, conf, variables
+                        )
+                        if report_install_progress is not None
+                        else None
+                    )
+                    observer = None
+                    if plan is not None and report_install_progress is not None:
+                        plan_labels = [f"{name}=={version}" for name, version in plan]
+                        report_install_progress(0, len(plan), plan_labels)
+                        if plan:
+                            try:
+                                observer = observe_dependency_install(
+                                    virtual_env_manager,
+                                    plan,
+                                    lambda completed, total: report_install_progress(
+                                        completed, total, plan_labels
+                                    ),
+                                )
+                            except Exception:
+                                logger.debug(
+                                    "Could not observe dependency installation",
+                                    exc_info=True,
+                                )
+                    try:
+                        with _sglang_source_build_environment(regular_packages):
+                            virtual_env_manager.install_packages(
+                                regular_packages, **conf, **variables
+                            )
+                    finally:
+                        if observer is not None:
+                            stopped, thread = observer
+                            stopped.set()
+                            thread.join(timeout=1)
+                    if plan is not None and report_install_progress is not None:
+                        report_install_progress(len(plan), len(plan), plan_labels)
 
                     from .virtual_env_manager import apply_flash_attn_wheel_post_install
 
@@ -4509,8 +4756,49 @@ class WorkerActor(xo.StatelessActor):
                         # check cancel before prepare virtual env
                         check_cancel()
 
+                        progressor.activate_stage()
                         # install packages in virtual env
+                        dependency_install_details: Dict[str, Any] = {}
                         if virtual_env_manager:
+                            progressor.set_progress(
+                                0.0,
+                                "Waiting to prepare model dependencies",
+                                {
+                                    "stage": "waiting_for_dependencies",
+                                    "updated_at": time.time(),
+                                },
+                            )
+
+                            def report_install_stage(stage: str) -> None:
+                                dependency_install_details[
+                                    "dependency_install_status"
+                                ] = "performed"
+                                progressor.set_progress(
+                                    0.0,
+                                    "Installing model dependencies",
+                                    {"stage": stage, "updated_at": time.time()},
+                                )
+
+                            def report_install_progress(
+                                completed: int, total: int, plan: List[str]
+                            ) -> None:
+                                dependency_install_details.update(
+                                    dependency_install_completed=completed,
+                                    dependency_install_total=total,
+                                    dependency_install_plan=plan,
+                                )
+                                progressor.set_progress(
+                                    0.0,
+                                    "Installing model dependencies",
+                                    {
+                                        "stage": "installing_dependencies",
+                                        "dependency_install_completed": completed,
+                                        "dependency_install_total": total,
+                                        "dependency_install_plan": plan,
+                                        "updated_at": time.time(),
+                                    },
+                                )
+
                             prepare_task = asyncio.create_task(
                                 asyncio.to_thread(
                                     self._prepare_virtual_env,
@@ -4531,6 +4819,8 @@ class WorkerActor(xo.StatelessActor):
                                     model_uid=model_uid,
                                     reserve_usage=self._reserve_virtual_env_usage,
                                     release_usage=self._release_virtual_env_usage,
+                                    report_install_stage=report_install_stage,
+                                    report_install_progress=report_install_progress,
                                 )
                             )
                             try:
@@ -4547,12 +4837,29 @@ class WorkerActor(xo.StatelessActor):
                                     pass
                                 raise
                             assert virtual_env_fingerprint is not None
+                            if (
+                                "dependency_install_status"
+                                not in dependency_install_details
+                            ):
+                                dependency_install_details[
+                                    "dependency_install_status"
+                                ] = "skipped"
                             self._activate_virtual_env_usage(
                                 virtual_env_path,
                                 virtual_env_fingerprint,
                                 model_uid,
                             )
                             launch_info.virtual_env_manager = virtual_env_manager
+
+                        progressor.set_progress(
+                            0.1,
+                            "Loading model",
+                            {
+                                "stage": "loading",
+                                "updated_at": time.time(),
+                                **dependency_install_details,
+                            },
+                        )
 
                         # check before creating subpool and model actor
                         check_cancel()
@@ -5471,6 +5778,7 @@ class WorkerActor(xo.StatelessActor):
                     exc_info=True,
                 )
 
+    @log_sync(logger=logger)
     def get_model(self, model_uid: str) -> xo.ActorRefType["ModelActor"]:
         model_status = self._model_uid_to_model_status.get(model_uid)
         if model_status:
@@ -5646,33 +5954,26 @@ class WorkerActor(xo.StatelessActor):
             raise
         except Exception:
             logger.exception("Report status got error.")
-        supervisor_ref = None
-        supervisor_generation = None
         try:
-            (
-                supervisor_ref,
-                supervisor_generation,
-            ) = await self._get_supervisor_ref_with_generation()
-            await xo.wait_for(
-                supervisor_ref.report_worker_status(self.address, status),
-                XINFERENCE_TCP_REQUEST_TIMEOUT,
+            await self._call_supervisor(
+                "report_worker_status",
+                self.address,
+                status,
+                add_worker=True,
             )
+        except asyncio.CancelledError:
+            raise
         except Exception:
             logger.warning(
-                "Failed to report worker status, clearing cached supervisor references",
+                "Failed to report worker status, retrying after supervisor "
+                "re-registration",
                 exc_info=True,
             )
-            if supervisor_ref is not None and supervisor_generation is not None:
-                self._clear_supervisor_refs(
-                    expected_supervisor_ref=supervisor_ref,
-                    expected_generation=supervisor_generation,
-                )
-            supervisor_ref, _ = await self._get_supervisor_ref_with_generation(
-                add_worker=True
-            )
-            await xo.wait_for(
-                supervisor_ref.report_worker_status(self.address, status),
-                XINFERENCE_TCP_REQUEST_TIMEOUT,
+            await self._call_supervisor(
+                "report_worker_status",
+                self.address,
+                status,
+                add_worker=True,
             )
 
     async def ping(self) -> bool:
@@ -5692,24 +5993,11 @@ class WorkerActor(xo.StatelessActor):
         next attempt can refresh a supervisor whose internal address changed
         after a restart.
         """
-        (
-            supervisor_ref,
-            supervisor_generation,
-        ) = await self._get_supervisor_ref_with_generation(add_worker=False)
-        try:
-            await xo.wait_for(
-                supervisor_ref.receive_heartbeat(self.address),
-                XINFERENCE_TCP_REQUEST_TIMEOUT,
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            if supervisor_generation is not None:
-                self._clear_supervisor_refs(
-                    expected_supervisor_ref=supervisor_ref,
-                    expected_generation=supervisor_generation,
-                )
-            raise
+        await self._call_supervisor(
+            "receive_heartbeat",
+            self.address,
+            add_worker=False,
+        )
 
     async def _periodical_report_status(self):
         """Periodically send independent heartbeat and full status reports."""
@@ -6329,6 +6617,10 @@ class WorkerActor(xo.StatelessActor):
                         and result
                     )
             return result
+
+    async def get_node_metadata(self) -> Dict[str, Any]:
+        """Return lightweight, static metadata describing this worker node."""
+        return {"software_version": __version__}
 
     async def get_workers_info(self) -> Dict[str, Any]:
         ret = {

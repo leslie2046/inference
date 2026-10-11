@@ -55,6 +55,7 @@ logger = logging.getLogger(__name__)
 
 from ..device_utils import empty_cache
 from .exceptions import ModelNotReadyError
+from .rpc_context import rpc_context
 from .utils import CancelMixin, json_dumps, log_async, parse_replica_model_uid
 
 try:
@@ -70,7 +71,6 @@ except ImportError:
 # !!!!! DO NOT add model_name to this list, using `register_batching_multimodal_models` below instead.
 XINFERENCE_BATCHING_ALLOWED_VISION_MODELS = []
 
-XINFERENCE_TEXT_TO_IMAGE_BATCHING_ALLOWED_MODELS = ["FLUX.1-dev", "FLUX.1-schnell"]
 XINFERENCE_TEST_OUT_OF_MEMORY_ERROR = bool(
     os.getenv("XINFERENCE_TEST_OUT_OF_MEMORY_ERROR", False)
 )
@@ -362,6 +362,7 @@ class ModelActor(xo.StatelessActor, CancelMixin):
     def __getattr__(self, attr: str):
         return getattr(self._model, attr)
 
+    @rpc_context
     async def decrease_serve_count(self):
         self._serve_count = max(0, self._serve_count - 1)
         await self.record_metrics(
@@ -927,6 +928,7 @@ class ModelActor(xo.StatelessActor, CancelMixin):
                     },
                 )
 
+    @log_async(logger=logger)
     async def abort_request(
         self,
         request_id: str,
@@ -1305,6 +1307,26 @@ class ModelActor(xo.StatelessActor, CancelMixin):
                 **kwargs,
             )
         raise AttributeError(f"Model {self._model.model_spec} is not for ocr.")
+
+    @request_limit
+    @log_async(logger=logger, ignore_kwargs=["file_bytes"])
+    async def docanalyze(
+        self,
+        file_bytes: bytes,
+        file_name: str,
+        *args,
+        **kwargs,
+    ):
+        self._require_ready()
+        if hasattr(self._model, "docanalyze"):
+            return await self._call_wrapper_json(
+                self._model.docanalyze,
+                file_bytes,
+                file_name,
+                *args,
+                **kwargs,
+            )
+        raise AttributeError(f"Model {self._model.model_spec} is not for docanalyze.")
 
     @request_limit
     @log_async(logger=logger, ignore_kwargs=["image"])
