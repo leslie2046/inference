@@ -461,6 +461,11 @@ The following is a list of built-in LLM in Xinference:
      - 262144
      - MiniCPM-V 4.6 Thinking is a reasoning-tuned version of MiniCPM-V 4.6. It supports deep reasoning for more complex problem solving, while inheriting the single-image, multi-image, and video understanding capabilities of the MiniCPM-V family.
 
+   * - :ref:`minicpm-v-4.7 <models_llm_minicpm-v-4.7>`
+     - chat, vision, hybrid
+     - 262144
+     - MiniCPM-V 4.7 supports single-image, multi-image, and video understanding with canvas M-RoPE and 4x/16x visual compression. It provides 1B dense and 35B-A3B MoE variants. Transformers requires >=5.18.0; vLLM requires the nightly containing PR #58674. SGLang support currently requires an upstream fork with conflicting dependency pins and is not enabled. GGUF and llama.cpp support is not enabled.
+
    * - :ref:`minicpm3-4b <models_llm_minicpm3-4b>`
      - chat
      - 32768
@@ -740,6 +745,11 @@ The following is a list of built-in LLM in Xinference:
      - chat, vision, tools, reasoning, hybrid
      - 262144
      - Built on the architectural foundation of Qwen3.5, Qwen3.8 delivers substantial gains across coding, professional work, research, and long-horizon agentic tasks. Qwen3.8-27B brings these advances to a compact, deployment-friendly dense model: a native vision-language model that understands images and videos, with flexible thinking control.
+
+   * - :ref:`qwen3.8-flash-next <models_llm_qwen3.8-flash-next>`
+     - chat, vision, tools, reasoning, hybrid
+     - 262144
+     - Qwen3.8-Flash-Next is a native vision-language Mixture-of-Experts model with 125B main-model parameters, 6B activated per token, and an additional 51B n-gram embedding table. Its Qwen4 experimental architecture combines Gated DeltaNet, Qwen Sparse Attention, gated residuals, and flexible thinking control.
 
    * - :ref:`qwen3.8-max <models_llm_qwen3.8-max>`
      - chat, tools, reasoning
@@ -1033,6 +1043,8 @@ The following is a list of built-in LLM in Xinference:
    minicpm-v-4.6
   
    minicpm-v-4.6-thinking
+
+   minicpm-v-4.7
   
    minicpm3-4b
   
@@ -1145,6 +1157,7 @@ The following is a list of built-in LLM in Xinference:
    qwen3.6
   
    qwen3.8
+   qwen3.8-flash-next
   
    qwen3.8-max
   

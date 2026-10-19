@@ -45,6 +45,10 @@ jobs:
         run: cd frontend && npm ci
       - name: ESLint Check
         run: cd frontend && npx eslint .
+      - name: Test live account permissions
+        run: cd frontend && npm run test:permissions
+      - name: Test catalog refresh controls
+        run: cd frontend && npm run test:catalog-refresh
       - name: Build frontend (static export)
         run: cd frontend && npm run build
       - name: Verify static export output
@@ -347,6 +351,7 @@ jobs:
             python -m pip freeze > test-results/metal-host-packages.txt
             for test_file in \
               xinference/model/llm/mlx/tests/test_mlx.py \
+              xinference/model/llm/mlx/tests/test_structured.py \
               xinference/model/llm/mlx/tests/test_xavier.py \
               xinference/model/audio/tests/test_whisper_mlx.py \
               xinference/model/audio/tests/test_f5tts_mlx.py \
@@ -386,6 +391,14 @@ jobs:
               xinference/model/llm/sglang/tests/test_xavier_gpu_lifecycle.py \
               xinference/model/llm/sglang/tests/test_gc_lifecycle.py \
               xinference/model/llm/sglang/tests/test_runtime.py \
+              xinference/model/llm/sglang/tests/test_anthropic_controls.py \
+              xinference/model/llm/sglang/tests/test_reasoning_adapter.py \
+              xinference/model/llm/vllm/tests/test_anthropic_controls.py \
+              xinference/model/llm/vllm/tests/test_reasoning_adapter.py \
+              xinference/model/llm/vllm/tests/test_core_chat_model.py::TestVLLMSanitizeGenerateConfig \
+              xinference/model/llm/mlx/tests/test_anthropic_runtime.py \
+              xinference/model/llm/mlx/tests/test_structured.py \
+              xinference/model/llm/mlx/tests/test_context_length.py \
               xinference/model/llm/vllm/tests/test_distributed_executor_v1.py \
               xinference/model/llm/vllm/tests/test_executor_routing.py \
               xinference/model/llm/vllm/tests/test_speculative_config.py \

@@ -481,3 +481,92 @@ msgstr "XINFERENCE_TOKEN_ROUTER_AGENT_STARTUP_RETRY_TIMEOUT_SECONDS"
 #: ../../source/getting_started/environments.rst:244
 msgid "Total deadline in seconds for Router Agent startup registration and initial synchronization retries. Default value is 120."
 msgstr ""
+
+#: ../../source/getting_started/environments.rst:15
+msgid "XOSCAR_AUTH_KEY"
+msgstr "XOSCAR_AUTH_KEY"
+
+#: ../../source/getting_started/environments.rst:16
+msgid ""
+"Shared secret for Xoscar actor transport authentication, supported by Xoscar"
+" 0.12.0 and later. Unset or empty keeps the legacy unauthenticated "
+"transport; upgrading alone does not enable protection. HTTP API "
+"authentication does not protect actor ports. See the `security advisory "
+"<https://github.com/xorbitsai/xoscar/security/advisories/GHSA-"
+"mmvj-m246-m9vf>`_."
+msgstr ""
+"Gemeinsames Geheimnis zur Authentifizierung des Xoscar-Actor-Transports, "
+"unterstützt ab Xoscar 0.12.0. Ohne Wert oder bei leerem Wert bleibt der "
+"bisherige unauthentifizierte Transport aktiv; ein Upgrade allein aktiviert "
+"keinen Schutz. Die HTTP-API-Authentifizierung schützt keine Actor-Ports. "
+"Siehe den `Sicherheitshinweis "
+"<https://github.com/xorbitsai/xoscar/security/advisories/GHSA-"
+"mmvj-m246-m9vf>`_."
+
+#: ../../source/getting_started/environments.rst:22
+msgid ""
+"Generate one random secret per deployment with the following command. "
+"Distribute the same value through your secret-management system before "
+"starting ``xinference-local``, ``xinference-supervisor``, every "
+"``xinference-worker``, and any direct Xoscar actor clients. Child processes,"
+" including model virtual environments, inherit the variable. HTTP clients do"
+" not need this secret."
+msgstr ""
+"Erzeugen Sie mit dem folgenden Befehl genau ein zufälliges Geheimnis pro "
+"Bereitstellung. Verteilen Sie denselben Wert über Ihre Geheimnisverwaltung, "
+"bevor Sie ``xinference-local``, ``xinference-supervisor``, alle "
+"``xinference-worker`` und direkte Xoscar-Actor-Clients starten. "
+"Unterprozesse einschließlich der virtuellen Modellumgebungen erben die "
+"Variable. HTTP-Clients benötigen dieses Geheimnis nicht."
+
+#: ../../source/getting_started/environments.rst:33
+msgid ""
+"Upgrade all actor peers to Xoscar 0.12.0 or later before enabling the key, "
+"then coordinate a restart with the same key on every peer. Keyed and unkeyed"
+" peers cannot communicate; there is no automatic downgrade or mixed-mode "
+"rolling upgrade. Key rotation also requires a coordinated restart. For "
+"``docker run``, pass the exported variable with ``-e XOSCAR_AUTH_KEY``; for "
+"Kubernetes, inject the same Secret into each server container's environment."
+msgstr ""
+"Aktualisieren Sie vor dem Aktivieren des Schlüssels alle Actor-Gegenstellen "
+"auf Xoscar 0.12.0 oder neuer und starten Sie anschließend alle Gegenstellen "
+"koordiniert mit demselben Schlüssel neu. Gegenstellen mit und ohne Schlüssel"
+" können nicht kommunizieren; es gibt weder automatisches Downgrade noch "
+"rollierende Upgrades im Mischbetrieb. Auch ein Schlüsselwechsel erfordert "
+"einen koordinierten Neustart. Übergeben Sie bei ``docker run`` die "
+"exportierte Variable mit ``-e XOSCAR_AUTH_KEY``; injizieren Sie bei "
+"Kubernetes dasselbe Secret in die Umgebung jedes Server-Containers."
+
+#: ../../source/getting_started/environments.rst:40
+msgid ""
+"Socket and UCX messages are authenticated before deserialization. Anyone "
+"holding the key is a trusted peer with Python execution privileges. "
+"Deployment administrators must restrict actor ports to intended cluster "
+"peers. Authentication does not encrypt traffic or prevent replay; "
+"authenticated GPU transfers stage device buffers in host memory for hashing "
+"and add CPU and host-memory overhead."
+msgstr ""
+"Socket- und UCX-Nachrichten werden vor der Deserialisierung authentifiziert."
+" Jeder Schlüsselinhaber gilt als vertrauenswürdige Gegenstelle mit "
+"Berechtigung zur Ausführung von Python-Code. Administratoren müssen Actor-"
+"Ports auf die vorgesehenen Cluster-Gegenstellen beschränken. Die "
+"Authentifizierung verschlüsselt den Verkehr nicht und verhindert keine "
+"Replay-Angriffe; authentifizierte GPU-Transfers puffern Gerätespeicher zum "
+"Hashen im Hostspeicher und verursachen zusätzlichen CPU- und "
+"Hostspeicheraufwand."
+
+#: ../../source/getting_started/environments.rst:155
+msgid "For text-only ``sentence_transformers`` models, the engine may group similar character lengths to reduce padding while preserving response order. The internal ``encode()`` ``batch_size`` limits these groups; ``XINFERENCE_BATCH_SIZE`` controls input merging by the server."
+msgstr "Bei reinen Textmodellen mit ``sentence_transformers`` kann die Engine Eingaben mit ähnlicher Zeichenlänge gruppieren, um Padding zu reduzieren und dabei die Antwortreihenfolge beizubehalten. Der interne Parameter ``batch_size`` von ``encode()`` begrenzt diese Gruppen; ``XINFERENCE_BATCH_SIZE`` steuert das Zusammenführen von Eingaben auf dem Server."
+
+#: ../../source/getting_started/environments.rst:164
+msgid "XINFERENCE_EMBEDDING_GC_INTERVAL"
+msgstr "XINFERENCE_EMBEDDING_GC_INTERVAL"
+
+#: ../../source/getting_started/environments.rst:166
+msgid "Minimum interval (seconds) between full Python garbage collections during embedding cache cleanup. Default is 60. The first cleanup collects immediately. Set to 0 to collect on every cleanup. GPU cache release frequency is unchanged."
+msgstr "Mindestintervall (Sekunden) zwischen vollständigen Python-Garbage-Collections bei der Bereinigung des Embedding-Caches. Der Standardwert ist 60. Bei der ersten Bereinigung erfolgt die Sammlung sofort. Mit 0 wird sie bei jeder Bereinigung ausgeführt. Die Häufigkeit der GPU-Cache-Freigabe bleibt unverändert."
+
+#: ../../source/getting_started/environments.rst:171
+msgid "The cooldown also applies to token-triggered cleanup. Tensors kept alive by Python reference cycles may remain allocated until automatic GC or a later full collection; ``empty_cache()`` cannot release them. Set this interval to 0 for models that require full collection on every cleanup."
+msgstr "Die Wartezeit gilt auch für eine durch die Tokenanzahl ausgelöste Bereinigung. Durch zyklische Python-Referenzen gehaltene Tensoren können bis zur automatischen Garbage Collection oder einer späteren vollständigen Sammlung Speicher belegen; ``empty_cache()`` kann sie nicht freigeben. Setzen Sie das Intervall für Modelle, die bei jeder Bereinigung eine vollständige Sammlung benötigen, auf 0."

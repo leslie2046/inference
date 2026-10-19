@@ -28,6 +28,42 @@ def _tool_calls(invokes, dsml=True):
 
 
 @pytest.mark.parametrize("dsml", [True, False])
+@pytest.mark.parametrize(
+    "before, after", [("Checking. ", ""), ("", " Done."), (" \n", "\t")]
+)
+def test_nonstreaming_preserves_surrounding_content(dsml, before, after):
+    block = _tool_calls([("weather", [("city", True, "上海")])], dsml=dsml)
+    assert DeepseekV4ToolParser().extract_tool_calls(before + block + after) == [
+        *([(before, None, None)] if before else []),
+        (None, "weather", {"city": "上海"}),
+        *([(after, None, None)] if after else []),
+    ]
+
+
+@pytest.mark.parametrize("between", [" Next. ", " \n"])
+def test_nonstreaming_preserves_content_between_call_blocks(between):
+    block = _tool_calls([("weather", [("city", True, "上海")])])
+    text = block + between + block.replace("上海", "北京")
+    assert DeepseekV4ToolParser().extract_tool_calls(text) == [
+        (None, "weather", {"city": "上海"}),
+        (between, None, None),
+        (None, "weather", {"city": "北京"}),
+    ]
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "plain text",
+        '<tool_calls><invoke name="weather">',
+        "<tool_calls>broken</tool_calls>",
+    ],
+)
+def test_nonstreaming_keeps_unparseable_content(text):
+    assert DeepseekV4ToolParser().extract_tool_calls(text) == [(text, None, None)]
+
+
+@pytest.mark.parametrize("dsml", [True, False])
 def test_extract_tool_calls_preserves_json_parameter_types(dsml):
     parser = DeepseekV4ToolParser()
     model_output = _tool_calls(
@@ -135,3 +171,70 @@ def test_extract_tool_calls_streaming_returns_multiple_invokes_once_each():
         "second",
         {"value": 2},
     )
+
+
+def _stream(parser, history, chunk):
+    current = history[-1] + chunk
+    result = parser.extract_tool_calls_streaming(history, current, chunk)
+    history[-1] = current
+    if result is None:
+        return []
+    return result if isinstance(result, list) else [result]
+
+
+@pytest.mark.parametrize("chunk_size", [1, 7, 64, 1024])
+def test_extract_tool_calls_streaming_keeps_interleaved_requests_apart(chunk_size):
+    # One parser instance serves every request to the model, so concurrent
+    # streams feed it their chunks in turn.
+    parser = DeepseekV4ToolParser()
+    texts = [
+        _tool_calls([("a1", [("n", False, "1")]), ("a2", [("n", False, "2")])]),
+        _tool_calls([("b1", [("city", True, "杭州")]), ("b2", [])]),
+        "1 < 2.",
+    ]
+    histories = [[""] for _ in texts]
+    events = [[] for _ in texts]
+    for offset in range(0, max(map(len, texts)), chunk_size):
+        for text, history, received in zip(texts, histories, events):
+            chunk = text[offset : offset + chunk_size]
+            received.extend(_stream(parser, history, chunk))
+
+    assert events[0] == [(None, "a1", {"n": 1}), (None, "a2", {"n": 2})]
+    assert events[1] == [(None, "b1", {"city": "杭州"}), (None, "b2", {})]
+    assert "".join(event[0] for event in events[2]) == "1 < 2."
+
+
+def _stream_calls(parser, deltas):
+    previous_texts = [""]
+    calls = []
+    for delta in deltas:
+        current_text = previous_texts[-1] + delta
+        result = parser.extract_tool_calls_streaming(
+            previous_texts, current_text, delta
+        )
+        previous_texts[-1] = current_text
+        if result is None:
+            continue
+        for event in result if isinstance(result, list) else [result]:
+            if event[1] is not None:
+                calls.append(event[:3])
+    return calls
+
+
+def test_streaming_long_invoke_in_small_deltas():
+    parser = DeepseekV4ToolParser()
+    code = "print(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)\nprint(1)"
+    deltas = ["Writing.", "<｜DSML｜tool_calls>"]
+    for path, content in (("main.py", code), ("b.py", "x = 1")):
+        deltas += ['<｜DSML｜invoke name="write_file">']
+        deltas += ['<｜DSML｜parameter name="path" string="true">', path]
+        deltas += ["</｜DSML｜parameter>"]
+        deltas += ['<｜DSML｜parameter name="content" string="true">']
+        deltas += [content[i : i + 3] for i in range(0, len(content), 3)]
+        deltas += ["</｜DSML｜parameter>", "</｜DSML｜invoke>"]
+    deltas += ["</｜DSML｜tool_calls>"]
+
+    assert _stream_calls(parser, deltas) == [
+        (None, "write_file", {"path": "main.py", "content": code}),
+        (None, "write_file", {"path": "b.py", "content": "x = 1"}),
+    ]

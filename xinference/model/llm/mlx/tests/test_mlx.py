@@ -285,6 +285,7 @@ def test_mlx_vision_model_checkpoints_reusable_prompt_prefix(monkeypatch):
     model = object.__new__(MLXVisionModel)
     model._reusable_prompt_cache = FakePromptCache()
     model._reusable_prompt_cache_model_key = "vision-model-key"
+    model._model_config = {"prompt_cache_size": 2}
     initial_cache = [{"state": "initial"}]
     monkeypatch.setattr(
         model,
@@ -404,9 +405,13 @@ def test_mlx_vision_chat_marks_reusable_text_prompt_prefix(monkeypatch):
         captured["generate_config"] = generate_config
         return {"completion": "ok"}
 
+    def fake_post_process_completion(family, uid, completion, tools):
+        captured["tools"] = tools
+        return completion
+
     model.generate = fake_generate
     model._to_chat_completion = lambda completion, reasoning_parser: completion
-    model._post_process_completion = lambda family, uid, completion: completion
+    model._post_process_completion = fake_post_process_completion
 
     result = model.chat(
         [{"role": "user", "content": "dynamic question"}],
@@ -420,6 +425,7 @@ def test_mlx_vision_chat_marks_reusable_text_prompt_prefix(monkeypatch):
     assert captured["generate_config"]["prompt_cache_prefix_len"] == len(
         "tools:search:stable-prefix:"
     )
+    assert captured["tools"] == [{"type": "function", "function": {"name": "search"}}]
 
 
 @pytest.mark.asyncio
@@ -465,9 +471,13 @@ async def test_mlx_chat_marks_reusable_prompt_prefix():
         captured["generate_config"] = generate_config
         return {"completion": "ok"}
 
+    def fake_post_process_completion(family, uid, completion, tools):
+        captured["tools"] = tools
+        return completion
+
     model.async_generate = fake_async_generate
     model._to_chat_completion = lambda completion, reasoning_parser: completion
-    model._post_process_completion = lambda family, uid, completion: completion
+    model._post_process_completion = fake_post_process_completion
 
     result = await model.async_chat(
         [{"role": "user", "content": "dynamic question"}],
@@ -481,6 +491,7 @@ async def test_mlx_chat_marks_reusable_prompt_prefix():
     assert captured["generate_config"]["prompt_cache_prefix_len"] == len(
         "tools:search:stable-prefix:"
     )
+    assert captured["tools"] == [{"type": "function", "function": {"name": "search"}}]
 
 
 @pytest.mark.asyncio

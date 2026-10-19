@@ -504,6 +504,11 @@ const en = {
     emptyFile: 'The uploaded file cannot be empty.',
   },
   launchModel: {
+    updateOneModel: 'Update one model',
+    updateOneModelDescription:
+      'Update one model in the shared catalog while keeping other models. This does not download weights or restart running models.',
+    catalogModelNamePlaceholder: 'Exact model name, or world family name',
+    catalogUpdated: 'Model catalog updated.',
     enableWeightCache: 'Keep GPU weights for reload',
     enableWeightCacheTip:
       'Requires vLLM 0.31.0+ or SGLang 0.5.21+, Linux GPU, one worker and one replica. Weights stay in GPU memory between engine reloads.',
@@ -567,7 +572,7 @@ const en = {
     clickToLaunchModel: 'Click with mouse to launch the model',
     dimensions: 'dimensions',
     maxTokens: 'max tokens',
-    contextLength: 'context length',
+    contextLength: 'Context length',
     chatModel: 'chat model',
     generateModel: 'generate model',
     otherModel: 'other model',
@@ -653,6 +658,11 @@ const en = {
     replicaPlacementIncomplete:
       'Select a worker for every replica and use comma-separated non-negative GPU indexes.',
     replicaAliasDuplicate: 'Replica aliases must be unique.',
+    contextLengthTip:
+      'Maximum input plus output tokens per request. Leave unset to use the model default.',
+    contextLengthDefault: 'Model default',
+    contextLengthUnknown: 'Maximum context is unknown; enter a token limit.',
+    contextLengthInvalid: 'Enter a whole number between 1 and {{max}}.',
     advancedConfiguration: 'Advanced Configuration',
     runtimeEnvironment: 'Runtime Environment',
     engineParameters: 'Engine Parameters',
@@ -776,10 +786,13 @@ const en = {
     reload: {
       title: 'Reload parameters',
       description:
-        'Keeps GPU weights and rebuilds the engine. Serving pauses after current requests finish. Parallelism, precision and quantization cannot change.',
-      disabled: 'Enable GPU weight retention when launching this model to use reload.',
+        'Engine parameter changes rebuild the engine using retained GPU weights. Serving pauses while current requests finish and the change is applied; new requests receive HTTP 503. Parallelism, precision and quantization cannot change.',
+      disabled: 'Engine parameter changes require GPU weight retention at launch.',
+      reasoningHint:
+        'Reasoning parsing changes without restarting the engine. Current requests finish before applying the change.',
+      imageLimit: 'Maximum images per request',
       default: 'Engine default',
-      apply: 'Apply and reload',
+      apply: 'Apply',
       queued: 'Reload queued',
       draining: 'Waiting for current requests to finish',
       loading: 'Rebuilding engine',
@@ -1732,12 +1745,15 @@ const en = {
     loginDesc: 'Enter your account information to continue',
     username: 'Username',
     password: 'Password',
+    currentPassword: 'Current password',
     mustChangePasswordDesc: 'You need to change your password before continuing on first login.',
     changePasswordUserMissing: 'Unable to identify the current user. Please log in again.',
     or: 'or',
     ssoLogin: 'Sign in with SSO',
   },
   setup: {
+    token: 'Setup token',
+    tokenHelp: 'Copy the setup token from the Xinference server startup log.',
     welcome: 'Welcome to Xinference',
     welcomeDesc:
       'This instance has no accounts yet. Create the first administrator account to finish setting up your deployment.',

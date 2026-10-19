@@ -42,37 +42,41 @@ variable:
 Initial admin account
 =======================
 On first startup with authentication enabled, the user table is empty and
-Xinference does **not** create an admin account automatically. Instead, two
-unauthenticated endpoints handle first-run setup:
+Xinference does **not** create an admin account automatically. Two endpoints
+handle first-run setup without requiring an existing login:
 
 * ``GET /v1/admin/setup/status``: returns ``{"needs_setup": true, "initialized": false}``
   while no account exists yet.
 * ``POST /v1/admin/setup``: creates the first admin account (with all
-  permissions) given a ``username`` and ``password``.
+  permissions) given a ``username``, ``password``, and the ``setup_token``
+  printed in the server startup log.
 
 .. code-block:: bash
 
     curl -X POST "<endpoint>/v1/admin/setup" \
       -H "Content-Type: application/json" \
-      -d '{"username": "admin", "password": "choose-a-strong-password"}'
+      -d '{"setup_token": "<setup-token-from-startup-log>", "username": "admin", "password": "choose-a-strong-password"}'
 
-The web UI drives this automatically: opening it for the first time
-redirects to a setup page that asks for the new admin's username and
-password, then to the login page.
+The web UI redirects to a setup page that asks for the setup token from the
+server startup log and the new admin's username and password, then to the
+login page.
 
-``/v1/admin/setup`` permanently refuses to create a second account once one
-exists — the first successful call wins. On an instance exposed to untrusted
-networks before setup completes, whoever reaches this endpoint first becomes
-the administrator. If that isn't you, an operator with shell access to the
-deployment can take control back with ``xinference-reset-auth-password``
-(see `Resetting a lost admin password`_).
+Only a caller with the setup token can create the initial administrator. The
+token is stored in the auth database, shared across API processes using that
+database, and remains valid across restarts until setup completes. It is
+never returned by the setup status API. Once an account exists,
+``/v1/admin/setup`` refuses further calls. An operator with shell access can
+recover a lost admin password with ``xinference-reset-auth-password``.
+
+Deleting the final account starts a new setup cycle with a new token in the
+server log; consumed tokens stay invalid. Recreating a container without its
+auth database also requires the new instance's token.
 
 Resetting a lost admin password
 =================================
-If the admin password is lost — or someone else won the first-run setup
-race — an operator with shell access to the machine running the RESTful API
-can reset an admin's password directly against the auth database, without
-logging in:
+If the admin password is lost, an operator with shell access to the machine
+running the RESTful API can reset an admin password directly against the auth
+database, without logging in:
 
 .. code-block:: bash
 
@@ -169,6 +173,11 @@ For python SDK users:
    client = Client('<endpoint>')
    client.login('<name>', '<pass>')
 
+
+Direct HTTP clients must send ``POST /token`` a JSON object with string
+``username`` and ``password`` fields. Form-encoded, malformed, or non-object
+bodies and non-string credentials return ``400 Bad Request``; incorrect
+credentials return ``401 Unauthorized``.
 
 For web UI users, when opening the web UI, you will first be directed to the login page. After logging in, you can use the web UI normally.
 
@@ -273,6 +282,20 @@ database on every request, not the scopes baked into the JWT at login.
 Granting or revoking a permission takes effect on the user's next API
 call — no re-login required. This applies to JWT-based browser sessions;
 API keys are also live-read (they always have been).
+
+Administrator revocation also takes effect on the next API request.
+``GET /v1/auth/me`` returns current account permissions; the Web UI refreshes
+them periodically and when the window regains focus.
+
+Local users can change their own password through
+``PUT /v1/admin/users/{user_id}/password`` without ``users:manage``.
+Supply ``current_password`` and ``new_password``; a forced first password
+change only requires ``new_password``. After a password change, sign in again
+because existing access and refresh tokens are revoked.
+
+Administrators and callers with ``users:manage`` may reset passwords, including
+their own, without ``current_password``. When supplying it for a self-change,
+it is verified.
 
 Configurable access-token lifetime
 -------------------------------------

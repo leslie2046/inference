@@ -490,6 +490,11 @@ const ko = {
     emptyFile: '빈 파일은 업로드할 수 없습니다.',
   },
   launchModel: {
+    updateOneModel: '단일 모델 업데이트',
+    updateOneModelDescription:
+      '다른 모델을 유지하면서 공유 카탈로그의 단일 모델을 업데이트합니다. 가중치를 다운로드하거나 실행 중인 모델을 다시 시작하지 않습니다.',
+    catalogModelNamePlaceholder: '정확한 모델 이름 또는 world 패밀리 이름',
+    catalogUpdated: '모델 카탈로그가 업데이트되었습니다.',
     enableWeightCache: '재로드를 위해 GPU 가중치 유지',
     enableWeightCacheTip:
       'vLLM 0.31.0+ 또는 SGLang 0.5.21+, Linux GPU, 단일 워커 및 단일 복제본이 필요합니다. 엔진 재로드 중에도 가중치를 GPU 메모리에 유지합니다.',
@@ -638,6 +643,11 @@ const ko = {
     replicaPlacementIncomplete:
       '각 레플리카의 Worker를 선택하고 GPU 인덱스를 음이 아닌 정수의 쉼표 구분 형식으로 입력하세요.',
     replicaAliasDuplicate: '레플리카 별칭은 고유해야 합니다.',
+    contextLengthTip:
+      '요청별 입력과 출력의 총 토큰 상한입니다. 비워 두면 모델 기본값을 사용합니다.',
+    contextLengthDefault: '모델 기본값',
+    contextLengthUnknown: '최대 컨텍스트를 알 수 없습니다. 토큰 상한을 입력하세요.',
+    contextLengthInvalid: '1에서 {{max}} 사이의 정수를 입력하세요.',
     advancedConfiguration: '고급 설정',
     runtimeEnvironment: '실행 환경',
     engineParameters: '엔진 매개변수',
@@ -758,10 +768,13 @@ const ko = {
     reload: {
       title: '매개변수 재로드',
       description:
-        'GPU 가중치를 유지하며 엔진을 다시 구성합니다. 현재 요청이 끝나면 서비스를 일시 중지합니다. 병렬도, 정밀도 및 양자화는 변경할 수 없습니다.',
-      disabled: '모델 시작 시 GPU 가중치 유지를 활성화해야 재로드할 수 있습니다.',
+        '엔진 매개변수 변경 시 GPU 가중치를 유지하고 엔진을 재구축합니다. 현재 요청 완료 및 변경 적용을 기다리는 동안 서비스가 일시 중단되며 새 요청에는 HTTP 503을 반환합니다. 병렬도, 정밀도 및 양자화 방식은 변경할 수 없습니다.',
+      disabled: '엔진 매개변수를 변경하려면 시작 시 GPU 가중치 유지를 활성화하세요.',
+      reasoningHint:
+        '추론 내용 파싱은 엔진을 다시 시작하지 않고 변경됩니다. 현재 요청이 완료된 후 적용됩니다.',
+      imageLimit: '요청당 최대 이미지 수',
       default: '엔진 기본값',
-      apply: '적용 및 재로드',
+      apply: '적용',
       queued: '재로드 대기 중',
       draining: '현재 요청이 끝날 때까지 대기 중',
       loading: '엔진 재구성 중',
@@ -1538,12 +1551,15 @@ const ko = {
     loginDesc: '계속하려면 계정 정보를 입력하세요',
     username: '사용자 이름',
     password: '비밀번호',
+    currentPassword: '현재 비밀번호',
     mustChangePasswordDesc: '첫 로그인 시 계속하기 전에 비밀번호를 변경해야 합니다.',
     changePasswordUserMissing: '현재 사용자를 식별할 수 없습니다. 다시 로그인해주세요.',
     or: '또는',
     ssoLogin: 'SSO로 로그인',
   },
   setup: {
+    token: '설정 토큰',
+    tokenHelp: 'Xinference 서버 시작 로그에서 설정 토큰을 복사하세요.',
     welcome: 'Xinference에 오신 것을 환영합니다',
     welcomeDesc:
       '이 인스턴스에는 아직 계정이 없습니다. 배포 설정을 완료하려면 첫 번째 관리자 계정을 생성하세요.',

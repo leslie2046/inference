@@ -1,4 +1,43 @@
+import json
+
+import pytest
+
 from ..deepseek_v3_1_tool_parser import DeepseekV3_1ToolParser
+
+_WEATHER_CALL = (
+    '<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>weather<｜tool▁sep｜>{"city": "上海"}'
+    "<｜tool▁call▁end｜><｜tool▁calls▁end｜>"
+)
+
+
+@pytest.mark.parametrize(
+    "before, after", [("Checking. ", ""), ("", " Done."), (" \n", "\t")]
+)
+def test_nonstreaming_preserves_surrounding_content(before, after):
+    assert DeepseekV3_1ToolParser().extract_tool_calls(
+        before + _WEATHER_CALL + after
+    ) == [
+        *([(before, None, None)] if before else []),
+        (None, "weather", {"city": "上海"}),
+        *([(after, None, None)] if after else []),
+    ]
+
+
+@pytest.mark.parametrize("between", [" Next. ", " \n"])
+def test_nonstreaming_preserves_content_between_call_blocks(between):
+    text = _WEATHER_CALL + between + _WEATHER_CALL.replace("上海", "北京")
+    assert DeepseekV3_1ToolParser().extract_tool_calls(text) == [
+        (None, "weather", {"city": "上海"}),
+        (between, None, None),
+        (None, "weather", {"city": "北京"}),
+    ]
+
+
+@pytest.mark.parametrize(
+    "text", ["plain text", _WEATHER_CALL.split("<｜tool▁call▁end｜>")[0]]
+)
+def test_nonstreaming_keeps_unparseable_content(text):
+    assert DeepseekV3_1ToolParser().extract_tool_calls(text) == [(text, None, None)]
 
 
 def test_extract_tool_calls_single_call():
@@ -339,3 +378,29 @@ def test_extract_tool_calls_invalid_json():
     result_stream = parser.extract_tool_calls_streaming(previous, current, delta)
     # Since JSON is invalid, it won't extract. It returns None (swallowing content).
     assert result_stream is None
+
+
+def test_extract_tool_calls_streaming_long_calls_in_small_deltas():
+    parser = DeepseekV3_1ToolParser()
+    first = {"path": "main.py", "content": "print(1)\n" * 500}
+    second = {"path": "b.py", "content": "x = 1"}
+    deltas = ["Writing.", "<｜tool▁calls▁begin｜>"]
+    for arguments in (first, second):
+        args = json.dumps(arguments)
+        deltas += ["<｜tool▁call▁begin｜>", "write_file", "<｜tool▁sep｜>"]
+        deltas += [args[i : i + 3] for i in range(0, len(args), 3)]
+        deltas += ["<｜tool▁call▁end｜>"]
+    deltas += ["<｜tool▁calls▁end｜>"]
+
+    previous_texts = [""]
+    calls = []
+    for delta in deltas:
+        current_text = previous_texts[-1] + delta
+        result = parser.extract_tool_calls_streaming(
+            previous_texts, current_text, delta
+        )
+        previous_texts[-1] = current_text
+        if result is not None and result[1] is not None:
+            calls.append(result)
+
+    assert calls == [(None, "write_file", first), (None, "write_file", second)]

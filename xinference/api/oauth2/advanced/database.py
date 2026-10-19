@@ -12,11 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import logging
+import secrets
 import sqlite3
 import threading
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -122,7 +123,29 @@ class Database:
     def __init__(self, db_path: str):
         self._db_path = db_path
         self._lock = threading.Lock()
+        # A distribution may supply effective grants for externally managed
+        # accounts. All identity reads (login, refresh, API and admin UI) use it.
+        # Callbacks must be synchronous, return fresh data, and fail closed.
+        self.permission_resolver: Optional[Callable[[int, List[str]], List[str]]] = None
         self._init_db()
+
+    @property
+    def path(self) -> Path:
+        """Location of the auth store, for colocated distribution-owned state."""
+        return Path(self._db_path)
+
+    def _resolve_permissions(self, user_id: int, permissions: List[str]) -> List[str]:
+        """Return effective authentication grants, not editable local grants.
+
+        A distribution owning external grants must also guard both user-update
+        routes against writing resolved grants back to user_permissions, or
+        provide a separate local-grant editor. Otherwise an admin UI round-trip
+        can materialize external grants and outlive their external revocation.
+        The resolver itself must never persist its result to the local store.
+        """
+        if self.permission_resolver is None:
+            return permissions
+        return list(self.permission_resolver(user_id, list(permissions)))
 
     def _init_db(self):
         Path(self._db_path).parent.mkdir(parents=True, exist_ok=True)
@@ -280,11 +303,32 @@ class Database:
                     permissions,
                 )
 
+    def get_or_create_setup_token(self) -> Optional[str]:
+        """Share one bootstrap secret across restarts and concurrent API processes."""
+        with self._lock:
+            with self._get_conn() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                if conn.execute("SELECT 1 FROM users LIMIT 1").fetchone() is not None:
+                    conn.execute("DELETE FROM system_config WHERE key = 'setup_token'")
+                    return None
+                row = conn.execute(
+                    "SELECT value FROM system_config WHERE key = 'setup_token'"
+                ).fetchone()
+                if row is not None:
+                    return row["value"]
+                token = secrets.token_urlsafe(32)
+                conn.execute(
+                    "INSERT INTO system_config (key, value) VALUES ('setup_token', ?)",
+                    (token,),
+                )
+                return token
+
     def create_first_user(
         self,
         username: str,
         password_hash: Optional[str],
         permissions: Optional[List[str]] = None,
+        setup_token: Optional[str] = None,
     ) -> Optional[int]:
         """Atomically create ``username`` only if the users table is still
         empty. Returns the new user id, or None if a user already exists.
@@ -294,6 +338,9 @@ class Database:
         across multiple processes (e.g. supervisor + worker) sharing the same
         database file -- a plain SELECT would not block a concurrent writer
         until the following INSERT, leaving a race window.
+
+        The HTTP setup handler supplies setup_token, which is checked again
+        under this lock before insertion. Trusted local callers may omit it.
         """
         with self._lock:
             with self._get_conn() as conn:
@@ -301,7 +348,17 @@ class Database:
                 existing = conn.execute("SELECT COUNT(*) AS cnt FROM users").fetchone()
                 if existing["cnt"] > 0:
                     return None
-                return self._insert_user(
+                if setup_token is not None:
+                    row = conn.execute(
+                        "SELECT value FROM system_config WHERE key = 'setup_token'"
+                    ).fetchone()
+                    if (
+                        row is None
+                        or not setup_token.isascii()
+                        or not secrets.compare_digest(setup_token.strip(), row["value"])
+                    ):
+                        return None
+                user_id = self._insert_user(
                     conn,
                     username,
                     password_hash,
@@ -311,6 +368,7 @@ class Database:
                     0,
                     permissions,
                 )
+                return user_id
 
     @staticmethod
     def _insert_user(
@@ -341,6 +399,9 @@ class Database:
                     "INSERT INTO user_permissions (user_id, permission) VALUES (?, ?)",
                     (user_id, perm),
                 )
+        # Any first-user path (including external identity providers) completes
+        # setup. Never leave its bootstrap credential available for later reuse.
+        conn.execute("DELETE FROM system_config WHERE key = 'setup_token'")
         return user_id
 
     def get_user_by_id(self, user_id: int) -> Optional[Dict[str, Any]]:
@@ -354,7 +415,9 @@ class Database:
             perms = conn.execute(
                 "SELECT permission FROM user_permissions WHERE user_id = ?", (user_id,)
             ).fetchall()
-            user["permissions"] = [p["permission"] for p in perms]
+            user["permissions"] = self._resolve_permissions(
+                user["id"], [p["permission"] for p in perms]
+            )
             return user
 
     def get_user_by_username(
@@ -372,7 +435,9 @@ class Database:
                 "SELECT permission FROM user_permissions WHERE user_id = ?",
                 (user["id"],),
             ).fetchall()
-            user["permissions"] = [p["permission"] for p in perms]
+            user["permissions"] = self._resolve_permissions(
+                user["id"], [p["permission"] for p in perms]
+            )
             return user
 
     def get_user_by_oidc_sub(self, oidc_sub: str) -> Optional[Dict[str, Any]]:
@@ -387,7 +452,9 @@ class Database:
                 "SELECT permission FROM user_permissions WHERE user_id = ?",
                 (user["id"],),
             ).fetchall()
-            user["permissions"] = [p["permission"] for p in perms]
+            user["permissions"] = self._resolve_permissions(
+                user["id"], [p["permission"] for p in perms]
+            )
             return user
 
     def list_users(self, source: Optional[str] = None) -> List[Dict[str, Any]]:
@@ -412,7 +479,9 @@ class Database:
             for p in perms_rows:
                 perms_map.setdefault(p["user_id"], []).append(p["permission"])
             for user in users:
-                user["permissions"] = perms_map.get(user["id"], [])
+                user["permissions"] = self._resolve_permissions(
+                    user["id"], perms_map.get(user["id"], [])
+                )
             return users
 
     def update_user(self, user_id: int, **kwargs) -> bool:
@@ -434,10 +503,26 @@ class Database:
                 return True
 
     def delete_user(self, user_id: int) -> bool:
+        setup_token = None
         with self._lock:
             with self._get_conn() as conn:
-                conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
-                return True
+                conn.execute("BEGIN IMMEDIATE")
+                deleted = conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
+                if (
+                    deleted.rowcount
+                    and conn.execute("SELECT 1 FROM users LIMIT 1").fetchone() is None
+                ):
+                    setup_token = secrets.token_urlsafe(32)
+                    conn.execute(
+                        "INSERT OR REPLACE INTO system_config (key, value) "
+                        "VALUES ('setup_token', ?)",
+                        (setup_token,),
+                    )
+        if setup_token is not None:
+            logger.warning(
+                "Initial administrator setup reopened. Setup token: %s", setup_token
+            )
+        return True
 
     def set_user_permissions(self, user_id: int, permissions: List[str]):
         with self._lock:

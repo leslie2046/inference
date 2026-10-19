@@ -100,6 +100,7 @@ from .utils import (
 from .virtual_env_manager import VirtualEnvConflictError
 
 if TYPE_CHECKING:
+    from ..extensions import ModelCatalogCredentials
     from ..model.audio import AudioModelFamilyV2
     from ..model.embedding import EmbeddingModelFamilyV2
     from ..model.flexible import FlexibleModelSpec
@@ -2174,6 +2175,7 @@ class SupervisorActor(xo.StatelessActor):
 
     async def recommend_model(self, request: Dict[str, Any]) -> dict:
         from .model_recommendation import (
+            MEMORY_WORKLOAD_FIELDS,
             ModelRecommendationRequest,
             RecommendationModelNotFound,
             message,
@@ -2188,6 +2190,12 @@ class SupervisorActor(xo.StatelessActor):
                     body.model_name,
                     body.constraints.enable_virtual_env,
                     model_type=body.model_type,
+                    **(
+                        {"memory_options": body.constraints.memory_options()}
+                        if body.model_type == "LLM"
+                        and body.constraints.__fields_set__ & MEMORY_WORKLOAD_FIELDS
+                        else {}
+                    ),
                 )
                 for _, worker in workers
             ],
@@ -2195,7 +2203,29 @@ class SupervisorActor(xo.StatelessActor):
         )
         snapshots, warnings = [], []
         found = False
-        for (address, _), result in zip(workers, results):
+        for (address, worker), result in zip(workers, results):
+            if isinstance(
+                result, TypeError
+            ) and "unexpected keyword argument 'memory_options'" in str(result):
+                warnings.append(
+                    message(
+                        "worker_memory_options_unsupported",
+                        f"Worker {address} does not support memory workload options; its candidates are unverified. Upgrade the worker to enable workload estimates.",
+                    )
+                )
+                try:
+                    result = await worker.get_model_recommendation_info(
+                        body.model_name,
+                        body.constraints.enable_virtual_env,
+                        model_type=body.model_type,
+                    )
+                    result = {
+                        **result,
+                        "memory_estimates": {},
+                        "engine_memory_estimates": {},
+                    }
+                except Exception as exc:
+                    result = exc
             if isinstance(result, BaseException):
                 logger.warning(
                     "Recommendation discovery failed on %s: %s", address, result
@@ -2415,40 +2445,56 @@ class SupervisorActor(xo.StatelessActor):
         else:
             raise ValueError(f"Unsupported model type: {model_type}")
 
-    async def update_model_type(self, model_type: str):
+    async def update_model_type(
+        self,
+        model_type: str,
+        *,
+        credentials: Optional["ModelCatalogCredentials"] = None,
+        model_name: Optional[str] = None,
+    ) -> None:
         """
         Update model configurations for a specific model type by forwarding
         the request to all workers.
 
         Args:
             model_type: Type of model (LLM, embedding, image, etc.)
+            model_name: Refresh only this model when provided.
         """
 
-        try:
-            # Forward the update_model_type request to all workers
-            tasks = []
-            for worker_address, worker_ref in self._worker_address_to_worker.items():
-                tasks.append(worker_ref.update_model_type(model_type))
+        from .exceptions import ModelCatalogUnavailableError, ModelCatalogUpdateError
 
-            # Wait for all workers to complete the operation
-            if tasks:
-                results = await asyncio.gather(*tasks, return_exceptions=True)
-                for i, result in enumerate(results):
-                    if isinstance(result, Exception):
-                        pass  # Worker failed, continue
-                    else:
-                        pass  # Worker succeeded, continue
-            else:
-                logger.warning(
-                    f"No workers available to forward update_model_type request"
-                )
-
-        except Exception as e:
-            logger.error(
-                f"Error during update_model_type forwarding: {str(e)}",
-                exc_info=True,
+        workers = list(self._worker_address_to_worker.items())
+        if not workers:
+            logger.warning("No workers available to update the model catalog")
+            raise ModelCatalogUnavailableError(
+                "No workers available to update the model catalog"
             )
-            raise ValueError(f"Failed to update model type: {str(e)}")
+
+        async def update_worker(worker_ref: Any) -> None:
+            options: Dict[str, Any] = {}
+            if credentials is not None:
+                options["credentials"] = credentials
+            if model_name is not None:
+                options["model_name"] = model_name
+            await worker_ref.update_model_type(model_type, **options)
+
+        results = await asyncio.gather(
+            *(update_worker(worker_ref) for _, worker_ref in workers),
+            return_exceptions=True,
+        )
+        failed = False
+        for (address, _), result in zip(workers, results):
+            if isinstance(result, BaseException):
+                failed = True
+                logger.error(
+                    "Model catalog update failed on worker %s (%s)",
+                    address,
+                    type(result).__name__,
+                )
+        if failed:
+            raise ModelCatalogUpdateError(
+                "One or more workers failed to update the model catalog"
+            )
 
     def _gen_model_uid(self, model_name: str) -> str:
         if model_name not in self._model_uid_to_replica_info:
@@ -2996,6 +3042,9 @@ class SupervisorActor(xo.StatelessActor):
         **kwargs,
     ) -> str:
         n_worker = normalize_n_worker(n_worker)
+        from ..model.llm.context_length import validate_context_length_launch
+
+        validate_context_length_launch(model_type or "LLM", model_engine, kwargs)
         from ..model.llm.weight_cache import parse_weight_cache_option
 
         if parse_weight_cache_option(kwargs.get("enable_weight_cache", False)):
@@ -3930,6 +3979,7 @@ class SupervisorActor(xo.StatelessActor):
                 raise ValueError(
                     "n_worker cannot be larger than the number of available workers."
                 )
+            pending_shards: Dict[str, List[xo.ActorRefType["WorkerActor"]]] = {}
             try:
                 # Pre-check: ensure no replica uid already exists before
                 # launching, preventing partial-deploy-then-rollback.
@@ -4013,11 +4063,14 @@ class SupervisorActor(xo.StatelessActor):
                             driver_info=driver_info,
                             **kwargs,
                         )
+                        # Keep acknowledged shards local until launch completes or fails.
+                        pending_shards[rep_model_uid] = worker_refs[: i_worker + 1]
                         if i_worker == 0:
                             # info will be subpool address + driver info
                             # for shard 0
                             driver_info = info[1]
                     self._replica_model_uid_to_worker[rep_model_uid] = worker_refs
+                    pending_shards.pop(rep_model_uid, None)
 
                     # for distributed inference,
                     # launch will run asynchronously,
@@ -4025,6 +4078,7 @@ class SupervisorActor(xo.StatelessActor):
                     for worker_ref in worker_refs:
                         await worker_ref.wait_for_load(rep_model_uid)
             except (Exception, asyncio.CancelledError):
+                self._replica_model_uid_to_worker.update(pending_shards)
                 # terminate_model will remove the replica info.
                 await self.terminate_model(model_uid, suppress_exception=True)
                 await self._status_guard_ref.update_instance_info(
@@ -5113,13 +5167,13 @@ class SupervisorActor(xo.StatelessActor):
             raise ValueError(f"Model not found: {model_uid}")
         replicas = list(self._iter_active_replica_model_uids(model_uid))
         if len(replicas) != 1:
-            raise ValueError("Weight-preserving reload currently requires one replica")
+            raise ValueError("Parameter reload currently requires one replica")
         replica_uid = replicas[0]
         workers = self._replica_model_uid_to_worker.get(replica_uid)
         if not isinstance(workers, (list, tuple)):
             workers = [workers]
         if len(workers) != 1 or workers[0] is None:
-            raise ValueError("Weight-preserving reload currently requires one worker")
+            raise ValueError("Parameter reload currently requires one worker")
         return replica_uid, workers[0]
 
     async def get_model_reload_config(self, model_uid: str) -> Dict[str, Any]:
@@ -5145,7 +5199,9 @@ class SupervisorActor(xo.StatelessActor):
                 raise RuntimeError("This model already has a reload in progress")
             replica_uid, worker = self._get_reload_target(model_uid)
             # Preflight runs before scheduling any operation that stops serving.
-            await worker.validate_model_reload(replica_uid, config)
+            normalized = await worker.validate_model_reload(replica_uid, config)
+            if normalized is not None:
+                config = normalized
             status = {
                 "operation_id": str(uuid.uuid4()),
                 "model_uid": model_uid,
@@ -5161,8 +5217,9 @@ class SupervisorActor(xo.StatelessActor):
                     if self._get_reload_target(model_uid) != (replica_uid, worker):
                         raise ValueError("Model placement changed before reload")
                     status["stage"] = "draining"
-                    await worker.reload_model(replica_uid, config, drain_timeout)
-                    status["weights_reused"] = True
+                    status["weights_reused"] = (
+                        await worker.reload_model(replica_uid, config, drain_timeout)
+                    ) is True
                     async with self._autostart_store_lock:
                         await asyncio.to_thread(
                             self._launch_history_store.update_autostart_launch_config,
@@ -5180,7 +5237,7 @@ class SupervisorActor(xo.StatelessActor):
                         pass
                     logger.exception("Reload of %s failed", model_uid)
                 else:
-                    status.update(status="ready", stage="ready", weights_reused=True)
+                    status.update(status="ready", stage="ready")
                 finally:
                     status["finished_at"] = time.time()
                     if (

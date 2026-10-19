@@ -491,6 +491,11 @@ const ja = {
     emptyFile: '空のファイルはアップロードできません。',
   },
   launchModel: {
+    updateOneModel: '単一モデルを更新',
+    updateOneModelDescription:
+      '共有カタログの単一モデルを更新し、他のモデルを保持します。重みのダウンロードや実行中モデルの再起動は行いません。',
+    catalogModelNamePlaceholder: '正確なモデル名、または world ファミリー名',
+    catalogUpdated: 'モデルカタログを更新しました。',
     enableWeightCache: '再読み込み用に GPU の重みを保持',
     enableWeightCacheTip:
       'vLLM 0.31.0+ または SGLang 0.5.21+、Linux GPU、単一ワーカーと単一レプリカが必要です。エンジンの再読み込み中も重みを GPU メモリに保持します。',
@@ -640,6 +645,11 @@ const ja = {
     replicaPlacementIncomplete:
       '各レプリカの Worker を選択し、GPU インデックスを非負整数のカンマ区切りで入力してください。',
     replicaAliasDuplicate: 'レプリカの別名は一意である必要があります。',
+    contextLengthTip:
+      'リクエストごとの入力と出力の合計トークン上限です。未設定の場合はモデルの既定値を使用します。',
+    contextLengthDefault: 'モデルの既定値',
+    contextLengthUnknown: '最大コンテキストが不明です。トークン上限を入力してください。',
+    contextLengthInvalid: '1 から {{max}} までの整数を入力してください。',
     advancedConfiguration: '高度な設定',
     runtimeEnvironment: '実行環境',
     engineParameters: 'エンジンパラメータ',
@@ -762,10 +772,13 @@ const ja = {
     reload: {
       title: 'パラメータを再読み込み',
       description:
-        'GPU の重みを保持してエンジンを再構築します。現在のリクエスト完了後にサービスを一時停止します。並列度、精度、量子化は変更できません。',
-      disabled: 'モデル起動時に GPU の重みの保持を有効にしてください。',
+        'エンジンのパラメーター変更は GPU の重みを保持してエンジンを再構築します。現在のリクエストの完了と変更の適用を待つ間、サービスは一時停止し、新しいリクエストには HTTP 503 を返します。並列度、精度、量子化方式は変更できません。',
+      disabled: 'エンジンパラメーターを変更するには、起動時に GPU の重み保持を有効にしてください。',
+      reasoningHint:
+        '推論内容の解析はエンジンを再起動せずに更新されます。現在のリクエストが完了してから適用されます。',
+      imageLimit: 'リクエストあたりの最大画像数',
       default: 'エンジンの既定値',
-      apply: '適用して再読み込み',
+      apply: '適用',
       queued: '再読み込み待機中',
       draining: '現在のリクエストの完了を待機中',
       loading: 'エンジンを再構築中',
@@ -1548,12 +1561,15 @@ const ja = {
     loginDesc: '続行するにはアカウント情報を入力してください',
     username: 'ユーザー名',
     password: 'パスワード',
+    currentPassword: '現在のパスワード',
     mustChangePasswordDesc: '初回ログイン時は、続行する前にパスワードを変更してください。',
     changePasswordUserMissing: '現在のユーザーを識別できません。もう一度ログインしてください。',
     or: 'または',
     ssoLogin: 'SSO でログイン',
   },
   setup: {
+    token: 'セットアップトークン',
+    tokenHelp: 'Xinference サーバーの起動ログからセットアップトークンをコピーしてください。',
     welcome: 'Xinference へようこそ',
     welcomeDesc:
       'このインスタンスにはまだアカウントがありません。最初の管理者アカウントを作成してセットアップを完了してください。',

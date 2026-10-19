@@ -807,6 +807,12 @@ def remove_cache(
     help="Define the quantization settings for the model.",
 )
 @click.option(
+    "--context-length",
+    type=click.IntRange(1, 2**31 - 1),
+    default=None,
+    help="Per-request input plus output token limit for LLMs; mapped to the selected engine. Unset keeps the engine default.",
+)
+@click.option(
     "--replica",
     "-r",
     default=1,
@@ -944,6 +950,7 @@ def model_launch(
     size_in_billions: str,
     model_format: str,
     quantization: str,
+    context_length: Optional[int],
     replica: int,
     replica_config: Optional[str],
     n_worker: int,
@@ -981,6 +988,12 @@ def model_launch(
             else:
                 raise ValueError("Cannot set both for --model-path and --model_path")
         kwargs[param_name] = param_value
+    if context_length is not None:
+        if "context_length" in kwargs and kwargs["context_length"] != context_length:
+            raise click.BadParameter(
+                "conflicts with --context_length", param_hint="--context-length"
+            )
+        kwargs["context_length"] = context_length
     print(f"Launch model name: {model_name} with kwargs: {kwargs}", file=sys.stderr)
 
     if model_type == "LLM" and model_engine is None:
@@ -1140,6 +1153,24 @@ def model_launch(
                 pbar.update(percent - pbar.n)
 
                 time.sleep(0.5)
+
+            # Terminated instances are dropped from the instance info, so an
+            # empty result means the launch was cancelled or torn down.
+            if not status:
+                raise click.ClickException(
+                    f"Model {model_uid} was terminated before it became ready."
+                )
+            if any(s["status"] != "READY" for s in status):
+                errors = [
+                    replica["error_message"].strip()
+                    for s in status
+                    for replica in s.get("replica_statuses") or []
+                    if replica.get("error_message")
+                ]
+                raise click.ClickException(
+                    f"Failed to launch model {model_uid}: "
+                    + ("; ".join(errors) or "see the server logs for details.")
+                )
 
             # setting to 100%
             pbar.update(pbar.total - pbar.n)
@@ -1334,7 +1365,11 @@ def model_terminate(
     client.terminate_model(model_uid=model_uid)
 
 
-@cli.command("reload", help="Reload engine parameters while retaining GPU weights.")
+@cli.command(
+    "reload",
+    help="Reload parameters; engine changes require launch-time weight retention, "
+    "while standalone reasoning_content changes do not.",
+)
 @click.option("--endpoint", "-e", type=str, help="Xinference endpoint.")
 @click.option("--model-uid", required=True, type=str)
 @click.option(
@@ -1850,14 +1885,17 @@ def cal_model_mem(
     from ..model.llm.llm_family import convert_model_size_to_float
     from ..model.llm.memory import estimate_llm_gpu_memory
 
-    mem_info = estimate_llm_gpu_memory(
-        model_size_in_billions=size_in_billions,
-        quantization=quantization,
-        context_length=context_length,
-        model_format=model_format,
-        model_name=model_name,
-        kv_cache_dtype=kv_cache_dtype,
-    )
+    try:
+        mem_info = estimate_llm_gpu_memory(
+            model_size_in_billions=size_in_billions,
+            quantization=quantization,
+            context_length=context_length,
+            model_format=model_format,
+            model_name=model_name,
+            kv_cache_dtype=kv_cache_dtype,
+        )
+    except (KeyError, ValueError, ArithmeticError, AssertionError) as exc:
+        raise click.ClickException(f"Memory estimate unavailable: {exc}") from exc
     if mem_info is None:
         print("The Specified model parameters is not match: `%s`" % model_name)
         os._exit(1)
@@ -1870,6 +1908,8 @@ def cal_model_mem(
     print("gpu mem usage:")
     print("  model mem: %d MB" % (mem_info.model_mem))
     print("  kv_cache: %d MB" % (mem_info.kv_cache_mem))
+    print("  recurrent state: %d MB" % (mem_info.recurrent_state_mem))
+    print("  retained prefix cache: %d MB" % (mem_info.prefix_cache_mem))
     print("  overhead: %d MB" % (mem_info.overhead))
     print("  active: %d MB" % (mem_info.activation_mem))
     print("  total: %d MB (%d GB)" % (mem_info.total, total_mem_g))

@@ -593,22 +593,13 @@ class PytorchModel(LLM):
             real_len = seq_length - r.padding_len
             r.extra_kwargs["attention_mask_seq_len"] = real_len
 
-            if self._tokenizer.padding_side == "left":
-                # [PAD][PAD]...[TOKEN]
-                x = torch.cat(
-                    [
-                        torch.full((r.padding_len,), 0, dtype=torch.long),
-                        torch.ones((real_len,), dtype=torch.long),
-                    ]
-                )
-            else:  # right padding
-                # [TOKEN]...[PAD][PAD]
-                x = torch.cat(
-                    [
-                        torch.ones((real_len,), dtype=torch.long),
-                        torch.full((r.padding_len,), 0, dtype=torch.long),
-                    ]
-                )
+            # Batch tokens are left-padded regardless of tokenizer.padding_side.
+            x = torch.cat(
+                [
+                    torch.full((r.padding_len,), 0, dtype=torch.long),
+                    torch.ones((real_len,), dtype=torch.long),
+                ]
+            )
             data.append(x)
 
         return torch.stack(data).to(self._device)
@@ -630,24 +621,12 @@ class PytorchModel(LLM):
             real_len = r.extra_kwargs["attention_mask_seq_len"]
             pad_len = max_len - real_len
 
-            if self._tokenizer.padding_side == "left":
-                x = torch.cat(
-                    [
-                        (
-                            torch.full((pad_len,), 0, dtype=torch.long)
-                            if pad_len > 0
-                            else torch.tensor([], dtype=torch.long)
-                        ),
-                        torch.ones((real_len,), dtype=torch.long),
-                    ]
-                )
-            else:
-                x = torch.cat(
-                    [
-                        torch.ones((real_len,), dtype=torch.long),
-                        torch.full((pad_len,), 0, dtype=torch.long),
-                    ]
-                )
+            x = torch.cat(
+                [
+                    torch.full((pad_len,), 0, dtype=torch.long),
+                    torch.ones((real_len,), dtype=torch.long),
+                ]
+            )
             data.append(x)
 
         return torch.stack(data).to(self._device)
@@ -1083,6 +1062,11 @@ class PytorchChatModel(PytorchModel, ChatModelMixin):
                 False,
                 "Transformers chat engine supports pytorch/gptq/awq/bnb/fp4 formats only",
             )
+        if llm_family.has_architecture("Qwen4ExpForConditionalGeneration"):
+            return (
+                False,
+                "Qwen3.8-Flash-Next requires a dedicated multimodal Transformers adapter; use vLLM",
+            )
         if llm_family.has_architecture("KimiK3ForConditionalGeneration"):
             return (
                 False,
@@ -1144,6 +1128,7 @@ class PytorchChatModel(PytorchModel, ChatModelMixin):
         super().load()
 
     def _get_full_prompt(self, messages: List[Dict], tools, generate_config: dict):
+        messages = self.prefill_messages(messages)
         model_family = self.model_family.model_family or self.model_family.model_name
         chat_template_kwargs = (
             self._get_chat_template_kwargs_from_generate_config(
@@ -1193,6 +1178,7 @@ class PytorchChatModel(PytorchModel, ChatModelMixin):
                 self.model_family,
                 self.model_uid,
                 req.completion[0],
+                req.tools,
             )
         else:
             req.completion[0] = self._to_chat_completion(

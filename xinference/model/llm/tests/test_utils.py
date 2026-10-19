@@ -19,6 +19,7 @@ import pytest
 
 from ..core import chat_context_var
 from ..reasoning_parser import ReasoningParser
+from ..tool_parsers.deepseek_v4_tool_parser import DeepseekV4ToolParser
 from ..tool_parsers.llama3_tool_parser import Llama3ToolParser
 from ..tool_parsers.qwen_tool_parser import QwenToolParser
 from ..utils import ChatModelMixin
@@ -43,8 +44,13 @@ def test_is_valid_model_name():
     assert is_valid_model_name("foo@bar")
     assert is_valid_model_name("_foo")
     assert is_valid_model_name("-foo")
+    assert is_valid_model_name("my.model.v2")
     assert not is_valid_model_name("foo bar")
     assert not is_valid_model_name("foo/bar")
+    assert not is_valid_model_name("foo\\bar")
+    assert not is_valid_model_name("..\\..\\evil")
+    assert not is_valid_model_name(".")
+    assert not is_valid_model_name("..")
     assert not is_valid_model_name("   ")
     assert not is_valid_model_name("")
 
@@ -954,6 +960,72 @@ def test_async_to_chat_completion_chunks_preserves_usage_only_chunk():
     }
 
 
+@pytest.mark.parametrize(
+    "leading",
+    [
+        {"object": "text_completion", "choices": []},
+        {"object": "text_completion", "choices": [{"text": ""}]},
+        {"object": "chat.completion.chunk", "choices": [{"delta": None}]},
+        {"object": "chat.completion.chunk", "choices": [{"delta": {"content": ""}}]},
+    ],
+)
+def test_async_prepare_reasoning_keeps_leading_chunk_without_text(leading):
+    parser = ReasoningParser(True, "<think>", "</think>")
+    text = {
+        "id": "cmpl-test",
+        "model": "test-model",
+        "created": 123,
+        "object": "text_completion",
+        "choices": [{"index": 0, "text": "hi"}],
+    }
+
+    async def _chunks():
+        yield leading
+        yield text
+
+    async def _collect():
+        return [
+            chunk
+            async for chunk in parser.prepare_reasoning_content_streaming(_chunks())
+        ]
+
+    results = asyncio.run(_collect())
+
+    assert results[0] == leading
+    assert results[1]["choices"][0]["text"] == "<think>\n"
+    assert results[2] == text
+
+
+def test_async_to_chat_completion_chunks_with_reasoning_keeps_empty_stream():
+    parser = ReasoningParser(True, "<think>", "</think>")
+
+    async def _chunks():
+        yield {
+            "id": "cmpl-test",
+            "model": "test-model",
+            "created": 123,
+            "object": "text_completion",
+            "choices": [{"index": 0, "text": "", "finish_reason": "stop"}],
+        }
+        yield {
+            "choices": [],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 0, "total_tokens": 3},
+        }
+
+    async def _collect():
+        return [
+            chunk
+            async for chunk in ChatModelMixin._async_to_chat_completion_chunks(
+                _chunks(), parser
+            )
+        ]
+
+    results = asyncio.run(_collect())
+
+    assert results[-2]["choices"][0]["finish_reason"] == "stop"
+    assert results[-1]["usage"]["total_tokens"] == 3
+
+
 def test_transform_messages_preserves_tool_call_fields():
     mixin = ChatModelMixin()
     messages = [
@@ -986,7 +1058,7 @@ def test_transform_messages_preserves_tool_call_fields():
     }
     assert transformed[1] == {
         "role": "assistant",
-        "content": None,
+        "content": "",
         "tool_calls": [
             {
                 "id": "call_bed4c5f1",
@@ -1008,6 +1080,165 @@ def test_transform_messages_preserves_tool_call_fields():
         ],
         "tool_call_id": "call_bed4c5f1",
     }
+
+
+@pytest.mark.parametrize("model_name", ["Qwen3-VL-Instruct", "Qwen3-VL-Thinking"])
+@pytest.mark.parametrize("protocol", ["openai", "anthropic"])
+def test_qwen3_vl_renders_tool_only_history(model_name, protocol):
+    from copy import deepcopy
+
+    from ....api.protocols import parse_anthropic_request
+    from .. import BUILTIN_LLM_FAMILIES
+
+    tools = [
+        {
+            "name": "lookup",
+            "input_schema": {
+                "type": "object",
+                "properties": {"value": {"type": "string"}},
+            },
+        }
+    ]
+    urls = ["https://example.com/red.png", "https://example.com/blue.png"]
+    messages = [
+        {"role": "user", "content": "Inspect the images returned by lookup."},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_images",
+                    "type": "function",
+                    "function": {"name": "lookup", "arguments": '{"value":"images"}'},
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_images",
+            "content": [
+                {"type": "image_url", "image_url": {"url": url}} for url in urls
+            ],
+        },
+    ]
+    if protocol == "anthropic":
+        request = parse_anthropic_request(
+            {
+                "model": "test",
+                "max_tokens": 32,
+                "tools": tools,
+                "messages": [
+                    messages[0],
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": "call_images",
+                                "name": "lookup",
+                                "input": {"value": "images"},
+                            }
+                        ],
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "call_images",
+                                "content": [
+                                    {
+                                        "type": "image",
+                                        "source": {"type": "url", "url": url},
+                                    }
+                                    for url in urls
+                                ],
+                            }
+                        ],
+                    },
+                ],
+            }
+        )
+        messages = request.messages
+    original = deepcopy(messages)
+    mixin = ChatModelMixin()
+    family = next(f for f in BUILTIN_LLM_FAMILIES if f.model_name == model_name)
+    mixin.model_family = family
+    transformed = mixin._transform_messages(messages)
+    prompt = mixin.get_full_context(transformed, family.chat_template)
+
+    assert "<tool_call>" in prompt and '"name": "lookup"' in prompt
+    result = prompt.split("<tool_response>", 1)[1].split("</tool_response>", 1)[0]
+    assert result.count("<|image_pad|>") == 2
+    assert messages == original
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        None,
+        "",
+        "omitted",
+        "Visible answer",
+        "<think>\nInline reasoning.\n</think>\nVisible answer",
+    ],
+)
+@pytest.mark.parametrize("reasoning", [None, "I need to look up the value."])
+@pytest.mark.parametrize("enable_thinking", [False, True])
+def test_qwen3_renders_tool_only_history(content, reasoning, enable_thinking):
+    from copy import deepcopy
+
+    from .. import BUILTIN_LLM_FAMILIES
+
+    messages = [
+        {"role": "user", "content": "Look up alpha."},
+        {
+            "role": "assistant",
+            "content": content,
+            "tool_calls": [
+                {
+                    "id": "call_lookup",
+                    "type": "function",
+                    "function": {"name": "lookup", "arguments": '{"value":"alpha"}'},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_lookup", "content": "NATIVE_RESULT_42"},
+    ]
+    if content == "omitted":
+        del messages[1]["content"]
+    if reasoning is not None:
+        messages[1]["reasoning_content"] = reasoning
+    original = deepcopy(messages)
+    mixin = ChatModelMixin()
+    family = next(f for f in BUILTIN_LLM_FAMILIES if f.model_name == "qwen3")
+    mixin.model_family = family
+    prompt = mixin.get_full_context(
+        messages, family.chat_template, enable_thinking=enable_thinking
+    )
+
+    assert '<tool_call>\n{"name": "lookup", "arguments": {"value":"alpha"}}' in prompt
+    assert "<tool_response>\nNATIVE_RESULT_42\n</tool_response>" in prompt
+    assert "None" not in prompt
+    if content in (None, "", "omitted"):
+        prefix = "<|im_start|>assistant\n"
+        if reasoning is not None:
+            prefix += f"<think>\n{reasoning}\n</think>\n\n"
+        assert f"{prefix}<tool_call>" in prompt
+    if reasoning is not None:
+        assert f"<think>\n{reasoning}\n</think>" in prompt
+    if content and content.startswith("<think>"):
+        if reasoning is not None:
+            assert f"<think>\n{reasoning}\n</think>\n\n{content}" in prompt
+        else:
+            assert "<think>\nInline reasoning.\n</think>\n\nVisible answer" in prompt
+    if content and "Visible answer" in content:
+        assert "Visible answer" in prompt
+    suffix = "<|im_start|>assistant\n"
+    if not enable_thinking:
+        suffix += "<think>\n\n</think>\n\n"
+    assert prompt.endswith(suffix)
+    assert messages == original
 
 
 def test_transform_messages_materializes_tool_call_iterators():
@@ -1034,7 +1265,7 @@ def test_transform_messages_materializes_tool_call_iterators():
     assert transformed == [
         {
             "role": "assistant",
-            "content": None,
+            "content": "",
             "tool_calls": [
                 {
                     "type": "function",
@@ -2651,6 +2882,27 @@ def test_post_process_completion_chunk_with_parser():
             ), f"Mismatch at case {i}: expected {expected_filtered}, got {result_filtered}"
 
 
+def test_post_process_completion_preserves_deepseek_content():
+    mixin = ChatModelMixin()
+    mixin.tool_parser = DeepseekV4ToolParser()
+    preamble = "Let me check the weather. "
+    text = preamble + (
+        '<tool_calls><invoke name="weather">'
+        '<parameter name="city" string="true">上海</parameter></invoke></tool_calls>'
+    )
+    result = mixin._post_process_completion(
+        None, "deepseek-v4", {"choices": [{"text": text, "finish_reason": "stop"}]}
+    )
+    choice = result["choices"][0]
+    message = choice["message"]
+    assert message["content"] == preamble
+    assert choice["finish_reason"] == "tool_calls"
+    assert len(message["tool_calls"]) == 1
+    call = message["tool_calls"][0]
+    assert call["type"] == "function"
+    assert call["function"] == {"name": "weather", "arguments": '{"city": "上海"}'}
+
+
 def test_post_process_completion_without_thinking():
     mixin = ChatModelMixin()
     mixin.tool_parser = QwenToolParser()
@@ -2868,6 +3120,79 @@ def test_post_process_completion_stopped_while_thinking():
         choice["message"]["reasoning_content"]
         == "The user asks for the weather in Shanghai, so I should call"
     )
+
+
+@pytest.mark.parametrize("text", ["The user asks", "<think>\nThe user asks"])
+def test_to_chat_completion_stopped_while_thinking(text):
+    # Generation hits max_tokens inside the thinking block, so there is no end
+    # tag. The reasoning content is the text after the start tag, as in a stream.
+    parser = ReasoningParser(
+        reasoning_content=True,
+        reasoning_start_tag="<think>",
+        reasoning_end_tag="</think>",
+        enable_thinking=True,
+    )
+    completion = {
+        "id": "1",
+        "object": "text_completion",
+        "created": 0,
+        "model": "qwen3",
+        "choices": [
+            {
+                "text": text,
+                "index": 0,
+                "logprobs": None,
+                "finish_reason": "length",
+            }
+        ],
+        "usage": {"prompt_tokens": 159, "completion_tokens": 12, "total_tokens": 171},
+    }
+
+    result = ChatModelMixin._to_chat_completion(completion, parser)
+
+    choice = result["choices"][0]
+    assert choice["finish_reason"] == "length"
+    assert choice["message"]["content"] == ""
+    assert choice["message"]["reasoning_content"] == "\nThe user asks"
+
+
+@pytest.mark.parametrize(
+    "text, content",
+    [
+        ("\n<think>\nThe user asks\n</think>\n\nHello", "\n\nHello"),
+        ("\n<think>\nThe user asks\n</think>", ""),
+    ],
+)
+def test_to_chat_completion_text_before_start_tag(text, content):
+    # A newline comes before the start tag. The content is the text after the
+    # end tag, whatever comes before the start tag.
+    parser = ReasoningParser(
+        reasoning_content=True,
+        reasoning_start_tag="<think>",
+        reasoning_end_tag="</think>",
+        enable_thinking=True,
+    )
+    completion = {
+        "id": "1",
+        "object": "text_completion",
+        "created": 0,
+        "model": "reasoning-model",
+        "choices": [
+            {
+                "text": text,
+                "index": 0,
+                "logprobs": None,
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": {"prompt_tokens": 159, "completion_tokens": 12, "total_tokens": 171},
+    }
+
+    result = ChatModelMixin._to_chat_completion(completion, parser)
+
+    message = result["choices"][0]["message"]
+    assert message["reasoning_content"] == "\nThe user asks\n"
+    assert message["content"] == content
 
 
 # ── Security tests for Llama3ToolParser ────────────────────
@@ -3227,4 +3552,147 @@ def test_minicpm5_get_full_context_handles_string_arguments():
     assert "<tool_response>\nSunny\n</tool_response>" in prompt
     assert messages[1]["tool_calls"][0]["function"]["arguments"] == (
         '{"city":"Beijing"}'
+    )
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "glm4-chat",
+        "glm4-chat-1m",
+        "glm4-0414",
+        "glm-4.5",
+        "glm-4.6",
+        "glm-4.7",
+        "glm-4.7-flash",
+        "glm-4.5v",
+    ],
+)
+def test_glm_tool_history_uses_the_actual_family_template(name):
+    import copy
+    from types import SimpleNamespace
+
+    from ..llm_family import BUILTIN_LLM_FAMILIES
+    from ..tool_parsers.glm4_tool_parser import Glm4ToolParser
+
+    family = next(f for f in BUILTIN_LLM_FAMILIES if f.model_name.lower() == name)
+    mixin = ChatModelMixin()
+    mixin.model_family = SimpleNamespace(
+        model_family=name, model_name=name, model_ability=family.model_ability
+    )
+    mixin.tool_parser = Glm4ToolParser()
+    messages = [
+        {"role": "user", "content": "weather in Beijing?"},
+        {
+            "role": "assistant",
+            "content": "Let me check.",
+            "tool_calls": [
+                {
+                    "id": "call",
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "arguments": '{"city":"Beijing"}',
+                    },
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call", "content": "SUNNY_25C"},
+    ]
+    original = copy.deepcopy(messages)
+    prompt = mixin.get_full_context(messages, family.chat_template)
+    assert "Let me check." in prompt
+    assert "get_weather" in prompt
+    assert "SUNNY_25C" in prompt
+    assert messages == original
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("anthropic", [False, True])
+async def test_initial_prompt_usage_is_anthropic_only(anthropic):
+    usage = {
+        "prompt_tokens": 100,
+        "completion_tokens": 1,
+        "total_tokens": 101,
+        "prompt_tokens_details": {"cached_tokens": 60},
+    }
+
+    async def source():
+        yield {
+            "id": "test",
+            "model": "test",
+            "created": 1,
+            "choices": [{"index": 0, "text": "answer", "finish_reason": None}],
+            "usage": usage,
+        }
+
+    chunks = [
+        c
+        async for c in ChatModelMixin._async_to_chat_completion_chunks(
+            source(), ctx={"_anthropic_request": anthropic}
+        )
+    ]
+    if anthropic:
+        assert chunks[0]["usage"]["prompt_tokens"] == 100
+        assert chunks[0]["usage"]["prompt_tokens_details"]["cached_tokens"] == 60
+    else:
+        assert chunks[0].get("usage") is None
+
+
+@pytest.mark.asyncio
+async def test_synthetic_reasoning_start_preserves_initial_cache_usage():
+    from ..reasoning_parser import ReasoningParser
+
+    parser = ReasoningParser(
+        reasoning_start_tag="<think>",
+        reasoning_end_tag="</think>",
+        reasoning_content=True,
+        auto_insert_start_tag=True,
+    )
+    usage = {
+        "prompt_tokens": 100,
+        "completion_tokens": 1,
+        "total_tokens": 101,
+        "prompt_tokens_details": {"cached_tokens": 60},
+    }
+
+    async def source():
+        yield {
+            "id": "test",
+            "model": "test",
+            "created": 1,
+            "choices": [
+                {"index": 0, "text": "plan</think>answer", "finish_reason": None}
+            ],
+            "usage": usage,
+        }
+
+    chunks = [
+        c
+        async for c in ChatModelMixin._async_to_chat_completion_chunks(
+            source(),
+            parser,
+            ctx={
+                "_anthropic_request": True,
+                "reasoning_content": True,
+                "enable_thinking": True,
+            },
+        )
+    ]
+    assert chunks[0]["usage"]["prompt_tokens"] == 100
+    assert chunks[0]["usage"]["prompt_tokens_details"]["cached_tokens"] == 60
+
+
+def test_raw_template_can_omit_generation_prefix():
+    from ..utils import ChatModelMixin
+
+    model = ChatModelMixin()
+    template = (
+        "{{ messages[0].content }}{% if add_generation_prompt %}ASSISTANT{% endif %}"
+    )
+    messages = [{"role": "user", "content": "hello"}]
+    assert model._build_from_raw_template(messages, template) == "helloASSISTANT"
+    assert (
+        model._build_from_raw_template(messages, template, add_generation_prompt=False)
+        == "hello"
     )

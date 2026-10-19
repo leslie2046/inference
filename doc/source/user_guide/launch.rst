@@ -6,6 +6,11 @@ Model Launching Instructions
 
 This document aims to provide a functional overview of model launching.
 
+Updating the model catalog
+==========================
+
+On the **Launch Model** page, choose the model type beside **Update**. **Update** refreshes the whole category. Choose **Update one model** and enter the exact Hub model name (or world family name) to update just that model, including a model not yet listed. Other catalog entries are preserved. This updates shared metadata without downloading weights or restarting running models. With authentication enabled, both actions require administrator or ``models:register`` permission.
+
 .. _launch_recommendations:
 
 LLM launch recommendations
@@ -43,13 +48,22 @@ Q4_K_M and Int4 are preferred when supported. If choices are still tied, weights
 already cached on that worker get priority. A cached model does not override
 your selected size or the earlier preferences.
 
-Estimates use offline metadata, one sequence, 2048 tokens, FP16 KV cache and
-80% of currently free memory. Automatic GPU placement uses the lowest free memory
-among eligible GPUs; CPU and Apple Silicon use available system memory. Multiple
-GPUs are not added together: multi-GPU requests keep compatibility-only selection.
-Known oversized candidates are excluded. Missing data remains unverified. Longer
-contexts, concurrency and engine preallocation can need more memory. No resources
-are reserved, and you still review and launch the model yourself.
+Estimates use offline architecture facts and checkpoint sizes when available.
+MoE weights include all resident experts. Full-attention KV cache, Gated DeltaNet
+recurrent state and workspace are counted separately. MLX, Transformers, vLLM,
+SGLang and llama.cpp share this accounting with different workspace bounds.
+Unknown layouts, including MLA, remain unverified.
+
+Defaults are one sequence, the model's registered maximum context, FP16 KV cache, no image tokens and
+no retained prefix cache. The budget is 80% of currently free memory: the lowest
+free memory among eligible GPUs, or available system memory on CPU and Apple
+Silicon. The default vLLM GPU reservation is checked separately when total memory
+is known; SGLang budgets from memory available at initialization. Multi-GPU
+requests keep compatibility-only selection.
+Known oversized candidates are excluded. Workspace bounds are estimates, not
+measured peaks. Engine preallocation is not modeled beyond the separate vLLM
+default reservation check; custom engine settings require manual configuration.
+No resources are reserved.
 
 Using the API
 -------------
@@ -57,7 +71,29 @@ Using the API
 ``POST /v1/models/recommend`` is read-only. Supply ``model_name`` and
 ``model_type="LLM"``; the optional ``constraints`` object accepts
 ``model_size_in_billions``, ``worker_ip``, ``enable_virtual_env``, ``n_gpu``, and
-``gpu_idx``. Supplied constraints are hard requirements, never silently relaxed.
+``gpu_idx``. LLM constraints also accept ``context_length``. Supplied constraints
+are hard requirements, never silently relaxed.
+
+LLM constraints also accept positive integers ``context_length`` (text input plus
+output tokens) and ``concurrency``, and non-negative integers ``vision_tokens``
+(encoded image tokens per sequence) and ``prefix_cache_bytes`` (additional retained
+cache across the instance). Omitting ``context_length`` uses each candidate's
+registered maximum context, including encoded image tokens. Models without a
+known maximum remain unverified. Recommended vLLM ``max_model_len`` and SGLang
+``context_length`` equal text plus vision tokens per sequence. llama.cpp uses
+``n_parallel=concurrency`` and ``n_ctx=(context_length + vision_tokens) * concurrency``
+because its context is divided across slots. The Web UI applies these advanced
+launch parameters. Other workload fields affect estimates rather than request
+limits. Older workers that do not support workload options are retried without
+them and remain unverified, with a version warning. Image workloads require vision metadata.
+For multiple images, ``vision_tokens_per_image`` specifies their maximum encoded
+token count; zero assumes all image tokens belong to one image. Cached states grow
+with concurrency, while model weights are counted once. CUDA profiles for vLLM and SGLang share a
+16,384-token prefill workspace profile with fused attention and sampled-row logits.
+
+Recommendation configs expose ``context_length`` as the total per-request budget,
+including encoded image tokens. llama.cpp also returns ``n_parallel`` to match the
+estimated concurrency; the launch layer maps the unified budget to each engine.
 
 .. code-block:: bash
 
@@ -88,6 +124,34 @@ launch allocation policy rather than calculating the required GPU count.
 Both ``recommended`` and ``no_recommendation`` return HTTP 200. An unknown model
 returns HTTP 404; invalid requests return HTTP 422. Reason and warning codes use
 lower snake_case. The ``memory_not_verified`` warning is always included.
+
+Unified LLM context length
+==========================
+
+Set ``context_length`` in the launch API or use ``--context-length`` in the CLI
+to choose the input plus output token limit per request. In the Web UI, use the
+context slider or enter an exact integer; **Model default** clears the override.
+The slider's upper bound comes from the registered model. Context selections are
+preserved in configuration history and passed to the recommendation API.
+
+The launch layer maps this setting to vLLM's ``max_model_len``, SGLang,
+Transformers and MLX's ``context_length``, LMDeploy's ``session_len``, and
+llama.cpp's ``n_ctx=context_length*n_parallel`` total slot capacity. Existing engine
+parameters still work; contradictory unified and native values are rejected.
+Omitting the setting preserves engine defaults. This setting does not extend the
+model's positional embeddings or enable context scaling.
+
+With an explicit context limit, MLX rejects prompts that leave no room for output
+and caps ``max_tokens`` to the remaining budget. Cached prompt tokens and
+processed image tokens count toward the input limit. Non-streaming requests that
+exceed the input limit return HTTP 400; streaming requests report an SSE error
+without starting generation.
+
+.. code-block:: bash
+
+    xinference launch --model-name qwen3.5 --model-engine vLLM \
+      --size-in-billions 9 --model-format awq --quantization Int4 \
+      --context-length 32768
 
 Recommendations for other model types
 ======================================
@@ -452,7 +516,13 @@ Xinference keeps GPU weights in an upstream cache daemon while rebuilding the en
 
 vLLM supports changing ``max_num_seqs``, ``max_num_batched_tokens``, ``max_model_len``, ``gpu_memory_utilization`` and ``enforce_eager``.
 
+For reasoning-capable models, both engines also accept ``reasoning_content`` through the same reload API. This changes only the Xinference reasoning parser and leaves the engine and GPU weights intact. It works without ``enable_weight_cache`` or the minimum engine versions required for weight retention. Existing requests, including streams, finish before the new setting is applied; new requests are temporarily rejected while draining. The ``hot_parameters`` field in reload metadata lists these settings; ``enabled`` still indicates launch-time weight retention. Hot updates also require one worker and one replica. ``weights_reused`` is true only when an engine rebuild uses retained weights.
+
+For vLLM vision models launched with weight retention, ``limit_mm_per_prompt`` can change a positive image count to another positive count, for example ``{"image": 8}``. Unspecified modality limits are preserved in the engine, recovery and automatic-startup configuration. The engine is rebuilt to apply multimodal memory profiling and cache budgets while reusing the retained weights. Setting the image count to zero or enabling images from an initially disabled encoder is rejected; limits for other modalities cannot change through this operation.
+
 SGLang supports changing ``max_running_requests``, ``max_prefill_tokens``, ``context_length``, ``chunked_prefill_size``, ``mem_fraction_static``, ``disable_cuda_graph``, ``cuda_graph_max_bs_decode``, ``cuda_graph_max_bs_prefill`` and ``schedule_conservativeness``.
+
+For SGLang vision models launched with weight retention, ``limit_mm_data_per_request`` accepts a partial image-count patch, for example ``{"image": 8}``. The engine is rebuilt with retained weights so the new tokenizer process applies the limit. Other modality limits are preserved in the engine, recovery and automatic-startup configuration. An initially unlimited or zero image count can become a positive count because this setting only validates request counts; it does not disable the vision encoder. New image limits must be positive integers. Returning to an unlimited or zero image count requires relaunching the model. With an initial zero image count, Xinference skips SGLang's default image warmup.
 
 Parallelism, GPU placement, model path, precision, quantization and weight-layout options cannot change through reload. Pipeline/data parallelism, multi-worker deployments, LoRA, speculative decoding, weight offloading and PD deployments are not supported by this integration yet. Quantized models must pass the upstream IPC compatibility checks. For vLLM, multi-GPU caching uses its native multiprocessing executor. In the running-model detail page, choose **Reload parameters** to edit the supported values and follow progress.
 
@@ -474,3 +544,21 @@ Parallelism, GPU placement, model path, precision, quantization and weight-layou
 
     xinference reload --model-uid MODEL_UID --model-config '{"max_num_seqs": 32}'
     curl http://127.0.0.1:9997/v1/models/MODEL_UID/reload
+
+To change reasoning parsing without restarting the engine:
+
+.. code-block:: python
+
+    job = client.reload_model(uid, {"reasoning_content": True})
+
+For a vision model launched with weight retention and a positive image limit:
+
+.. code-block:: python
+
+    job = client.reload_model(uid, {"limit_mm_per_prompt": {"image": 8}})
+
+To change the image count of a SGLang vision model launched with weight retention:
+
+.. code-block:: python
+
+    job = client.reload_model(uid, {"limit_mm_data_per_request": {"image": 8}})

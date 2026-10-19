@@ -26,7 +26,7 @@ from ..advanced.auth_service import (
     PASSWORD_MIN_LENGTH,
     AdvancedAuthService,
 )
-from ..advanced.crypto import get_password_hash
+from ..advanced.crypto import get_password_hash, verify_password
 from ..advanced.database import ApiKeyNameConflictError, ApiKeyNameRequiredError
 from ..scope_aliases import _normalize_scopes
 
@@ -76,7 +76,7 @@ def get_advanced_auth(request: Request) -> AdvancedAuthService:
 
 def _get_current_user_from_token(request: Request, auth: AdvancedAuthService):
     """Extract current user info from the Authorization header."""
-    token = request.headers.get("Authorization", "").replace("Bearer ", "")
+    token = request.headers.get("Authorization", "").partition(" ")[2]
     if not token:
         return None, None, []
     payload = auth.verify_access_token(token)
@@ -86,14 +86,8 @@ def _get_current_user_from_token(request: Request, auth: AdvancedAuthService):
 
 
 def _get_current_user_live_scopes(request: Request, auth: AdvancedAuthService):
-    """Return current user info plus DB-current scopes for non-admin JWTs."""
-    current_user_id, username, token_scopes = _get_current_user_from_token(
-        request, auth
-    )
-    normalized_token_scopes = _normalize_scopes(token_scopes)
-    if "admin" in normalized_token_scopes:
-        return current_user_id, username, normalized_token_scopes
-
+    """Return the account's current permissions, including administrator grants."""
+    current_user_id, username, _ = _get_current_user_from_token(request, auth)
     user = None
     if current_user_id:
         user = auth.db.get_user_by_id(current_user_id)
@@ -107,7 +101,7 @@ def _get_current_user_live_scopes(request: Request, auth: AdvancedAuthService):
             _normalize_scopes(user.get("permissions", [])),
         )
 
-    return current_user_id, username, normalized_token_scopes
+    return None, None, []
 
 
 def _reject_permission_escalation(
@@ -126,7 +120,7 @@ def _reject_permission_escalation(
         raise HTTPException(
             status_code=400, detail="Permissions must be a list of strings"
         )
-    _, _, caller_scopes = _get_current_user_from_token(request, auth)
+    _, _, caller_scopes = _get_current_user_live_scopes(request, auth)
     caller_scopes = caller_scopes or []
     if "admin" in caller_scopes:
         return
@@ -149,7 +143,7 @@ def _reject_admin_target_takeover(
     disable the only admin and lock the deployment out. Admin callers
     bypass this check entirely.
     """
-    _, _, caller_scopes = _get_current_user_from_token(request, auth)
+    _, _, caller_scopes = _get_current_user_live_scopes(request, auth)
     caller_scopes = caller_scopes or []
     if "admin" in caller_scopes:
         return
@@ -172,9 +166,20 @@ def _reject_admin_target_takeover(
 
 async def advanced_login(request: Request) -> JSONResponse:
     auth: AdvancedAuthService = get_advanced_auth(request)
-    body = await request.json()
+    try:
+        body = await request.json()
+    except (ValueError, RecursionError):
+        body = None
+    if not isinstance(body, dict):
+        raise HTTPException(
+            status_code=400, detail="Request body must be a JSON object"
+        )
     username = body.get("username", "")
     password = body.get("password", "")
+    if not isinstance(username, str) or not isinstance(password, str):
+        raise HTTPException(
+            status_code=400, detail="username and password must be strings"
+        )
     request.state.audit_identity = {
         "user": username,
         "api_key_name": "",
@@ -212,16 +217,16 @@ async def advanced_logout(request: Request) -> JSONResponse:
 # --- Initial setup ---
 #
 # Xinference requires authentication out of the box, but a fresh
-# deployment has no accounts to log in with. These two public (no auth
-# required) endpoints let the web UI or an operator create the very
-# first admin account. setup_admin is only usable while the user table
-# is empty; the moment one account exists, it permanently refuses further
+# deployment has no accounts to log in with. These two endpoints, which
+# require no existing login, let the web UI or an operator create the very
+# first admin account using the setup token printed in the server log.
+# setup_admin is only usable while the user table is empty; the moment one
+# account exists, it permanently refuses further
 # calls, so it cannot be used to create additional admins after setup.
 #
-# The first admin is created by whoever reaches setup_admin first. On an
-# instance exposed to untrusted networks before setup completes, that could
-# be someone else; an operator with shell access to the deployment can take
-# control back with the ``xinference-reset-auth-password`` command.
+# Possession of the operator-only setup token is required even on loopback;
+# request headers and a reverse proxy's source address do not establish that
+# the caller owns the deployment.
 
 
 async def setup_status(request: Request) -> JSONResponse:
@@ -249,6 +254,9 @@ async def setup_admin(request: Request) -> JSONResponse:
         )
 
     body = await request.json()
+    setup_token = body.get("setup_token") if isinstance(body, dict) else None
+    if not isinstance(setup_token, str) or not auth.verify_setup_token(setup_token):
+        raise HTTPException(status_code=403, detail="Invalid setup token.")
     username = body.get("username")
     password = body.get("password")
     if not isinstance(username, str) or not isinstance(password, str):
@@ -270,11 +278,16 @@ async def setup_admin(request: Request) -> JSONResponse:
         username=username,
         password_hash=password_hash,
         permissions=INITIAL_ADMIN_PERMISSIONS,
+        setup_token=setup_token.strip(),
     )
     if user_id is None:
         raise HTTPException(
             status_code=403,
-            detail="Setup already completed; an account already exists.",
+            detail=(
+                "Setup already completed; an account already exists."
+                if not auth.needs_setup()
+                else "Invalid setup token."
+            ),
         )
 
     return JSONResponse(content={"id": user_id, "username": username}, status_code=201)
@@ -397,6 +410,12 @@ async def delete_user(user_id: int, request: Request) -> JSONResponse:
 
 async def change_password(user_id: int, request: Request) -> JSONResponse:
     auth: AdvancedAuthService = get_advanced_auth(request)
+    caller_id, _, caller_scopes = _get_current_user_live_scopes(request, auth)
+    manages_users = "admin" in caller_scopes or "users:manage" in caller_scopes
+    if not caller_id or (caller_id != user_id and not manages_users):
+        raise HTTPException(
+            status_code=403, detail="Cannot change another user's password"
+        )
     user = auth.db.get_user_by_id(user_id)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
@@ -406,6 +425,14 @@ async def change_password(user_id: int, request: Request) -> JSONResponse:
         )
     _reject_admin_target_takeover(request, auth, user_id)
     body = await request.json()
+    if not user["must_change_password"] and (
+        not manages_users or (caller_id == user_id and "current_password" in body)
+    ):
+        current_password = body.get("current_password")
+        if not isinstance(current_password, str) or not verify_password(
+            current_password, user["password_hash"]
+        ):
+            raise HTTPException(status_code=403, detail="Current password is incorrect")
     new_password = body.get("new_password")
     if not isinstance(new_password, str):
         raise HTTPException(status_code=400, detail="new_password must be a string")
@@ -665,7 +692,7 @@ def register_advanced_auth_routes(api: "RESTfulAPI") -> None:
         permissions so permission updates take effect consistently with
         ``AdvancedAuthService.__call__`` scoped checks.
         """
-        token = request.headers.get("Authorization", "").replace("Bearer ", "")
+        token = request.headers.get("Authorization", "").partition(" ")[2]
         payload = auth_service.verify_access_token(token) if token else None
         if not payload:
             raise HTTPException(
@@ -673,25 +700,42 @@ def register_advanced_auth_routes(api: "RESTfulAPI") -> None:
                 detail="Not enough permissions: requires keys:create or keys:manage",
             )
 
-        # Keep the existing admin wildcard behavior tied to JWT scopes, while
-        # non-admin delegated permissions are live-read from the DB user row.
-        token_scopes = _normalize_scopes(payload.get("scopes", []))
-        if "admin" in token_scopes:
-            return True
-
         db_scopes = _normalize_scopes(_user.get("permissions", []))
-        if "keys:create" in db_scopes or "keys:manage" in db_scopes:
+        if {"admin", "keys:create", "keys:manage"} & db_scopes:
             return True
         raise HTTPException(
             status_code=403,
             detail="Not enough permissions: requires keys:create or keys:manage",
         )
 
+    async def current_account(
+        request: Request, user=Security(auth_service)
+    ) -> JSONResponse:
+        # Security already resolved the current user, enabled state and grants.
+        # Reject API-key sessions using the populated key cache, without loading
+        # the account/permission resolver two additional times per UI poll.
+        token = request.headers.get("Authorization", "").partition(" ")[2]
+        if auth_service.validate_api_key(token):
+            raise HTTPException(status_code=401, detail="User session required")
+        return JSONResponse(
+            content={
+                "id": user["id"],
+                "username": user["username"],
+                "source": user["source"],
+                "permissions": user["permissions"],
+            }
+        )
+
     router.add_api_route("/token", advanced_login, methods=["POST"])
     router.add_api_route("/v1/auth/refresh", advanced_refresh, methods=["POST"])
     router.add_api_route("/v1/auth/logout", advanced_logout, methods=["POST"])
+    router.add_api_route(
+        "/v1/auth/me",
+        current_account,
+        methods=["GET"],
+    )
 
-    # Initial setup (public, no auth -- see docstring above setup_admin)
+    # Initial setup (no login; setup_admin requires the operator setup token)
     router.add_api_route("/v1/admin/setup/status", setup_status, methods=["GET"])
     router.add_api_route("/v1/admin/setup", setup_admin, methods=["POST"])
 
@@ -730,7 +774,7 @@ def register_advanced_auth_routes(api: "RESTfulAPI") -> None:
         "/v1/admin/users/{user_id}/password",
         change_password,
         methods=["PUT"],
-        dependencies=[Security(auth_service, scopes=["users:manage"])],
+        dependencies=[Security(auth_service, scopes=[])],
     )
 
     # API Key management

@@ -45,10 +45,10 @@ class MiniMaxToolParser(ToolParser):
             r"<parameter\s+name=\"([^\"]+)\">(.*?)</parameter>", re.DOTALL
         )
 
-    def _parse_param_value(self, value: str) -> Any:
+    def _parse_param_value(self, value: str, is_string: bool = False) -> Any:
         value = value.strip()
-        if not value:
-            return ""
+        if not value or is_string:
+            return value
         try:
             return json.loads(value)
         except Exception:
@@ -59,7 +59,9 @@ class MiniMaxToolParser(ToolParser):
         for name, body in self.invoke_regex.findall(tool_block):
             args: Dict[str, Any] = {}
             for key, val in self.param_regex.findall(body):
-                args[key] = self._parse_param_value(val)
+                args[key] = self._parse_param_value(
+                    val, self._is_string_parameter(name, key)
+                )
             results.append((name, args))
         return results
 
@@ -92,12 +94,19 @@ class MiniMaxToolParser(ToolParser):
     def _settled_length(self, text: str) -> int:
         """Return the length of the prefix of ``text`` that holds no unclosed
         tool call block and no trailing piece of a start tag."""
+        # Same result as walking tool_call_complete_regex.finditer(text), but
+        # str.find skips the text between tags instead of matching it lazily.
+        start_token = self.tool_call_start_token
+        end_token = self.tool_call_end_token
         position = 0
-        for match in self.tool_call_complete_regex.finditer(text):
-            position = match.end()
-        open_index = text.find(self.tool_call_start_token, position)
-        if open_index != -1:
-            return open_index
+        while True:
+            open_index = text.find(start_token, position)
+            if open_index == -1:
+                break
+            close_index = text.find(end_token, open_index + len(start_token))
+            if close_index == -1:
+                return open_index
+            position = close_index + len(end_token)
         return len(text) - self._partial_marker_length(
             text, [self.tool_call_start_token]
         )

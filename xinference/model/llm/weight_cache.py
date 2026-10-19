@@ -15,6 +15,7 @@
 """Engine-owned clients of a persistent, upstream GPU weight cache daemon."""
 
 import copy
+import dataclasses
 import json
 import logging
 import math
@@ -112,11 +113,19 @@ def _cached_memory_fraction(
     return max(fractions)
 
 
+HOT_RELOAD_FIELDS = {"reasoning_content": "bool"}
+IMAGE_LIMIT_FIELDS = {
+    "vllm": "limit_mm_per_prompt",
+    "sglang": "limit_mm_data_per_request",
+}
+
 # Only execution parameters may change while the daemon owns the weights.
 # In particular, do not accept arbitrary engine arguments: some change packed
 # weight layouts without changing a model name (attention/MoE backends, RoPE).
 RELOAD_FIELDS = {
     "vllm": {
+        **HOT_RELOAD_FIELDS,
+        "limit_mm_per_prompt": "image_limits",
         "max_num_seqs": "positive_int",
         "max_num_batched_tokens": "positive_int",
         "max_model_len": "positive_int",
@@ -124,6 +133,8 @@ RELOAD_FIELDS = {
         "enforce_eager": "bool",
     },
     "sglang": {
+        **HOT_RELOAD_FIELDS,
+        "limit_mm_data_per_request": "image_limits",
         "max_running_requests": "positive_int",
         "max_prefill_tokens": "positive_int",
         "context_length": "positive_int",
@@ -165,6 +176,14 @@ def validate_reload_patch(engine: str, patch: Dict[str, Any]) -> None:
             )
         if kind == "bool":
             valid = isinstance(value, bool)
+        elif kind == "image_limits":
+            valid = (
+                isinstance(value, dict)
+                and "image" in value
+                and not set(value) - {"image", "video", "audio"}
+                and all(type(v) is int and v >= 0 for v in value.values())
+                and value["image"] > 0
+            )
         elif kind in ("positive_int", "chunk_size"):
             valid = type(value) is int and (
                 value > 0 or (kind == "chunk_size" and value == -1)
@@ -251,7 +270,9 @@ class WeightCacheDaemon:
         # JSON is a YAML subset, preserving nested engine configs and booleans.
         config_path = self.directory / "config.yaml"
         try:
-            config_path.write_text(json.dumps(config), encoding="utf-8")
+            config_path.write_text(
+                json.dumps(config, default=dataclasses.asdict), encoding="utf-8"
+            )
             self._log = (self.directory / "daemon.log").open("w+")
             baseline = None
             if self.engine == "vllm" and not self.config.get("kv_cache_memory_bytes"):
@@ -375,13 +396,18 @@ class WeightCachedModel:
     model_spec: Any
     _loading_error: Any
     _loading_thread: Any
+    reasoning_parser: Any
 
     if TYPE_CHECKING:
 
         def _sanitize_model_config(self, config: Any) -> Any: ...
+
         def _stop_engine(self) -> None: ...
+
         def load(self) -> None: ...
+
         def wait_for_load(self) -> None: ...
+
         def _get_xinference_executor_backend(self) -> str: ...
 
     def _init_weight_cache(self, config: Any) -> None:
@@ -459,19 +485,60 @@ class WeightCachedModel:
         if initial:
             self._reload_config = {
                 **self._reload_config,
-                **{k: v for k, v in config.items() if k in RELOAD_FIELDS[engine]},
+                **{
+                    k: copy.deepcopy(v)
+                    for k, v in config.items()
+                    if k in RELOAD_FIELDS[engine]
+                },
             }
 
+    @staticmethod
+    def _is_hot_patch(patch: Dict[str, Any]) -> bool:
+        return bool(patch) and set(patch) <= HOT_RELOAD_FIELDS.keys()
+
+    def _reload_parameters(self) -> Dict[str, str]:
+        parameters = dict(RELOAD_FIELDS[self._weight_cache_engine])
+        abilities = getattr(getattr(self, "model_family", None), "model_ability", [])
+        image_field = IMAGE_LIMIT_FIELDS[self._weight_cache_engine]
+        limits = self._reload_config.get(image_field)
+        image_limit = limits.get("image") if isinstance(limits, dict) else None
+        minimum = 1 if self._weight_cache_engine == "vllm" else 0
+        valid_limit = type(image_limit) is int and image_limit >= minimum
+        if self._weight_cache_engine == "sglang" and (
+            limits is None or (isinstance(limits, dict) and "image" not in limits)
+        ):
+            # SGLang defaults to no request-count limit; zero does not unload
+            # its encoder either. Both can become a positive request limit.
+            valid_limit = True
+        if (
+            not self._enable_weight_cache
+            or not {"vision", "omni"}.intersection(abilities)
+            or not valid_limit
+        ):
+            parameters.pop(image_field, None)
+        if not getattr(
+            getattr(self, "reasoning_parser", None), "reasoning_end_tag", None
+        ):
+            parameters.pop("reasoning_content", None)
+        return parameters
+
     def get_reload_config(self) -> Dict[str, Any]:
+        parameters = self._reload_parameters()
+        config = {
+            k: copy.deepcopy(v)
+            for k, v in self._reload_config.items()
+            if k in parameters and v is not None
+        }
+        if "reasoning_content" in parameters:
+            config.setdefault(
+                "reasoning_content", self.reasoning_parser.reasoning_content
+            )
         return {
             "enabled": self._enable_weight_cache,
             "engine": self._weight_cache_engine,
-            "model_config": {
-                k: v
-                for k, v in self._reload_config.items()
-                if k in RELOAD_FIELDS[self._weight_cache_engine] and v is not None
-            },
-            "parameters": RELOAD_FIELDS[self._weight_cache_engine],
+            "model_config": config,
+            "parameters": parameters,
+            "hot_parameters": [key for key in HOT_RELOAD_FIELDS if key in parameters],
         }
 
     def _weight_cache_engine_config(self, config: Dict[str, Any]) -> Dict[str, Any]:
@@ -480,13 +547,43 @@ class WeightCachedModel:
         return self._weight_cache.engine_config(config)
 
     def validate_reload(self, patch: Dict[str, Any]) -> Dict[str, Any]:
+        validate_reload_patch(self._weight_cache_engine, patch)
+        config = {**copy.deepcopy(self._reload_config), **copy.deepcopy(patch)}
+        parameters = self._reload_parameters()
+        if "reasoning_content" in patch and "reasoning_content" not in parameters:
+            raise ValueError("This model does not support reasoning-content parsing")
+        if self._is_hot_patch(patch):
+            return config
         if self._weight_cache is None:
             raise ValueError(
                 "Launch this model with enable_weight_cache=true before reloading"
             )
         self._weight_cache.client_config()
-        validate_reload_patch(self._weight_cache_engine, patch)
-        config = {**copy.deepcopy(self._reload_config), **patch}
+        image_field = IMAGE_LIMIT_FIELDS[self._weight_cache_engine]
+        if image_field in patch:
+            abilities = getattr(
+                getattr(self, "model_family", None), "model_ability", []
+            )
+            if not {"vision", "omni"}.intersection(abilities):
+                raise ValueError("Image-limit reload requires a vision model")
+            previous = self._sanitize_model_config(copy.deepcopy(self._reload_config))
+            limits = previous.get(image_field) or {}
+            image_limit = limits.get("image")
+            if self._weight_cache_engine == "vllm" and (
+                type(image_limit) is not int or image_limit <= 0
+            ):
+                raise ValueError(
+                    "Image-limit reload requires an existing positive image limit; "
+                    "switching between disabled and enabled encoders is not supported"
+                )
+            requested = patch[image_field]
+            if any(k != "image" and v != limits.get(k) for k, v in requested.items()):
+                raise ValueError("Only the image count can change through reload")
+            config[image_field] = {**limits, **requested}
+            validate_reload_patch(
+                self._weight_cache_engine,
+                {image_field: config[image_field]},
+            )
         candidate = self._sanitize_model_config(copy.deepcopy(config))
         candidate.pop("reasoning_content", None)
         candidate.pop("enable_thinking", None)
@@ -505,6 +602,14 @@ class WeightCachedModel:
 
     def reload(self, patch: Dict[str, Any], progress: Callable[[str], None]) -> None:
         config = self.validate_reload(patch)
+        if self._is_hot_patch(patch):
+            # Replace the parser rather than mutating an object held by a response.
+            parser = copy.copy(self.reasoning_parser)
+            parser.reasoning_content = config["reasoning_content"]
+            self.reasoning_parser = parser
+            self._reload_config = config
+            progress("ready")
+            return
         previous = copy.deepcopy(self._reload_config)
 
         def load(config: Dict[str, Any]) -> None:

@@ -481,6 +481,9 @@ class ModelActor(xo.StatelessActor, CancelMixin):
 
         return isinstance(self._model, VLLMModel)
 
+    def is_transformers_batching_enabled(self) -> bool:
+        return bool(getattr(self._model, "_batch_scheduler", None))
+
     def is_sglang_backend(self) -> bool:
         from ..model.llm.sglang.core import SGLANGModel
 
@@ -546,17 +549,18 @@ class ModelActor(xo.StatelessActor, CancelMixin):
     def get_reload_config(self) -> Dict[str, Any]:
         return self._get_weight_cached_model().get_reload_config()
 
-    async def validate_reload(self, model_config: Dict[str, Any]) -> None:
+    async def validate_reload(self, model_config: Dict[str, Any]) -> Dict[str, Any]:
         self._require_ready()
-        await asyncio.to_thread(
+        config = await asyncio.to_thread(
             self._get_weight_cached_model().validate_reload, model_config
         )
         self._reload_status: Dict[str, Any] = {}
+        return {key: config[key] for key in model_config}
 
     def get_reload_status(self) -> Dict[str, Any]:
         return dict(getattr(self, "_reload_status", {}))
 
-    async def reload(self, model_config: Dict[str, Any], drain_timeout: float) -> None:
+    async def reload(self, model_config: Dict[str, Any], drain_timeout: float) -> bool:
         from ..model.llm.weight_cache import ModelReloadError
 
         await self.validate_reload(model_config)
@@ -589,6 +593,7 @@ class ModelActor(xo.StatelessActor, CancelMixin):
         else:
             self._model_state = "ready"
             self._reload_status.update(stage="ready")
+            return not model._is_hot_patch(model_config)
 
     def need_create_pools(self):
         return getattr(self._model, "need_create_pools", False)
@@ -930,6 +935,7 @@ class ModelActor(xo.StatelessActor, CancelMixin):
     @log_async(logger=logger)
     async def generate(self, prompt: str, *args, **kwargs):
         self._require_ready()
+        start_time = time.time()
         # Directly delegate to model, let model decide how to handle (batching or not)
         kwargs.pop("raw_params", None)
         if hasattr(self._model, "generate"):
@@ -947,21 +953,25 @@ class ModelActor(xo.StatelessActor, CancelMixin):
                     args = (generate_config, *args[1:])
                 else:
                     kwargs["generate_config"] = generate_config
-            return await self._call_wrapper_json(
+            response = await self._call_wrapper_json(
                 self._model.generate, prompt, *args, **kwargs
             )
+            await self._record_non_stream_completion_metrics(response, start_time)
+            return response
         if hasattr(self._model, "async_generate"):
             if "request_id" not in kwargs:
                 kwargs["request_id"] = str(uuid.uuid1())
             else:
                 # model only accept string
                 kwargs["request_id"] = str(kwargs["request_id"])
-            return await self._call_wrapper_json(
+            response = await self._call_wrapper_json(
                 self._model.async_generate,
                 prompt,
                 *args,
                 **kwargs,
             )
+            await self._record_non_stream_completion_metrics(response, start_time)
+            return response
         raise AttributeError(f"Model {self._model.model_spec} is not for generate.")
 
     @request_limit
@@ -975,12 +985,18 @@ class ModelActor(xo.StatelessActor, CancelMixin):
             # Directly delegate to model, let model decide how to handle (batching or not)
             kwargs.pop("raw_params", None)
             if hasattr(self._model, "chat"):
-                # Only remove request_id if model doesn't have batch scheduler
-                if not (
-                    hasattr(self._model, "_batch_scheduler")
-                    and self._model._batch_scheduler
+                request_id = kwargs.pop("request_id", None)
+                if request_id is not None and getattr(
+                    self._model, "_batch_scheduler", None
                 ):
-                    kwargs.pop("request_id", None)
+                    # Match generate(): batching reads IDs from a copied config.
+                    generate_config = args[0] if args else kwargs.get("generate_config")
+                    generate_config = dict(generate_config or {})
+                    generate_config["request_id"] = str(request_id)
+                    if args:
+                        args = (generate_config, *args[1:])
+                    else:
+                        kwargs["generate_config"] = generate_config
                 response = await self._call_wrapper_json(
                     self._model.chat, messages, *args, **kwargs
                 )
@@ -997,32 +1013,37 @@ class ModelActor(xo.StatelessActor, CancelMixin):
                 return response
             raise AttributeError(f"Model {self._model.model_spec} is not for chat.")
         finally:
-            # For the non stream result.
-            record = None
-            if isinstance(response, Generator) or isinstance(response, AsyncGenerator):
-                record = response
-            elif isinstance(response, bytes):
-                record = json.loads(response)
-            if record and isinstance(record, dict):
-                usage = record.get("usage")
-                # Some backends may not have a valid usage, we just skip them.
-                if isinstance(usage, dict):
-                    completion_tokens = usage.get("completion_tokens")
-                    prompt_tokens = usage.get("prompt_tokens")
-                    if completion_tokens is not None and prompt_tokens is not None:
-                        await self._record_completion_metrics(
-                            time.time() - start_time,
-                            completion_tokens,
-                            prompt_tokens,
-                        )
-                await self.record_metrics(
-                    "time_to_first_token_seconds",
-                    "observe",
-                    {
-                        "labels": {**self._metrics_labels, "stream": "false"},
-                        "value": time.time() - start_time,
-                    },
-                )
+            await self._record_non_stream_completion_metrics(response, start_time)
+
+    async def _record_non_stream_completion_metrics(
+        self, response: Any, start_time: float
+    ) -> None:
+        # For the non stream result.
+        record = None
+        if isinstance(response, Generator) or isinstance(response, AsyncGenerator):
+            record = response
+        elif isinstance(response, bytes):
+            record = json.loads(response)
+        if record and isinstance(record, dict):
+            usage = record.get("usage")
+            # Some backends may not have a valid usage, we just skip them.
+            if isinstance(usage, dict):
+                completion_tokens = usage.get("completion_tokens")
+                prompt_tokens = usage.get("prompt_tokens")
+                if completion_tokens is not None and prompt_tokens is not None:
+                    await self._record_completion_metrics(
+                        time.time() - start_time,
+                        completion_tokens,
+                        prompt_tokens,
+                    )
+            await self.record_metrics(
+                "time_to_first_token_seconds",
+                "observe",
+                {
+                    "labels": {**self._metrics_labels, "stream": "false"},
+                    "value": time.time() - start_time,
+                },
+            )
 
     @log_async(logger=logger)
     async def abort_request(
@@ -1095,6 +1116,55 @@ class ModelActor(xo.StatelessActor, CancelMixin):
             )
 
         raise AttributeError(f"Model {self._model.model_spec} can convert token id.")
+
+    @request_limit
+    @log_async(logger=logger)
+    async def count_tokens(
+        self, messages: List[Dict], generate_config: Optional[Dict] = None
+    ):
+        self._require_ready()
+        return await self._call_wrapper_json(
+            getattr(self._model, "async_count_tokens", self._model.count_tokens),
+            messages,
+            generate_config,
+        )
+
+    @request_limit
+    @log_async(logger=logger)
+    async def prepare_anthropic_request(
+        self, messages: List[Dict], generate_config: Dict
+    ):
+        self._require_ready()
+        return await self._call_wrapper_json(
+            getattr(
+                self._model,
+                "async_prepare_anthropic_request",
+                self._model.prepare_anthropic_request,
+            ),
+            messages,
+            generate_config,
+        )
+
+    @log_async(logger=logger)
+    async def get_anthropic_capabilities(self):
+        self._require_ready()
+        if not hasattr(self._model, "get_anthropic_capabilities"):
+            return None
+
+        def _describe():
+            from dataclasses import asdict, is_dataclass
+
+            capabilities = self._model.get_anthropic_capabilities()
+            description = (
+                asdict(capabilities) if is_dataclass(capabilities) else capabilities
+            )
+            if isinstance(description, dict):
+                context_edits = description.get("supported_context_edits")
+                if isinstance(context_edits, (set, frozenset)):
+                    description["supported_context_edits"] = sorted(context_edits)
+            return description
+
+        return await self._call_wrapper_json(_describe)
 
     @request_limit
     @log_async(logger=logger)

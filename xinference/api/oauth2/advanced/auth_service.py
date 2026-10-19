@@ -137,6 +137,7 @@ class AdvancedAuthService:
         self._jwt_secret_key = jwt_secret_key
         self._encryption_key = derive_encryption_key(encryption_key)
         self._cache = ApiKeyCache(self._db)
+        self._db.get_or_create_setup_token()
 
         try:
             from .rate_limiter import RateLimiter
@@ -156,6 +157,22 @@ class AdvancedAuthService:
     def needs_setup(self) -> bool:
         """True until the first admin account is created via /v1/admin/setup."""
         return self._db.user_count() == 0
+
+    @property
+    def setup_token(self) -> Optional[str]:
+        """Bootstrap secret for the operator's startup log, never an API response."""
+        return self._db.get_or_create_setup_token()
+
+    def verify_setup_token(self, token: Any) -> bool:
+        if not isinstance(token, str):
+            return False
+        token = token.strip()
+        expected = self.setup_token
+        return (
+            expected is not None
+            and token.isascii()
+            and secrets.compare_digest(token, expected)
+        )
 
     # --- JWT ---
 
@@ -387,6 +404,8 @@ class AdvancedAuthService:
         if get_request_route_path(request) in {
             "/v1/messages",
             "/anthropic/v1/messages",
+            "/v1/messages/count_tokens",
+            "/anthropic/v1/messages/count_tokens",
         }:
             # Anthropic clients send the same Xinference credential in
             # ``x-api-key`` rather than an Authorization header.
@@ -622,7 +641,6 @@ class AdvancedAuthService:
             raise credentials_exception
 
         username: Optional[str] = payload.get("sub")
-        token_scopes = payload.get("scopes", [])
         user_id = payload.get("user_id")
 
         if user_id:
@@ -655,7 +673,8 @@ class AdvancedAuthService:
                 headers={"WWW-Authenticate": authenticate_value},
             )
 
-        if "admin" in token_scopes:
+        db_scopes = _normalize_scopes(user.get("permissions", []))
+        if "admin" in db_scopes:
             _set_audit_identity(user=username or "", auth_type="jwt")
             return user
 
@@ -664,7 +683,6 @@ class AdvancedAuthService:
         # every request to verify existence/enabled, so user["permissions"] is
         # already in hand at zero extra DB cost. This makes admin permission
         # changes take effect on the next request rather than the next login.
-        db_scopes = _normalize_scopes(user.get("permissions", []))
         for scope in security_scopes.scopes:
             if scope not in db_scopes:
                 _audit("insufficient_scope", user=username or "", auth_type="jwt")
