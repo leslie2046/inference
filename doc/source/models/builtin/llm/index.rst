@@ -176,6 +176,11 @@ The following is a list of built-in LLM in Xinference:
      - 163840
      - We present a preview version of DeepSeek-V4 series, including two strong Mixture-of-Experts (MoE) language models — DeepSeek-V4-Pro with 1.6T parameters (49B activated) and DeepSeek-V4-Flash with 284B parameters (13B activated) — both supporting a context length of one million tokens.
 
+   * - :ref:`deepseek-v4.1-flash <models_llm_deepseek-v4.1-flash>`
+     - chat, vision, reasoning, hybrid, tools
+     - 1048576
+     - We introduce DeepSeek-V4.1-Flash, a multimodal Mixture-of-Experts (MoE) model with 552B backbone parameters and support for contexts of up to one million tokens. The model natively processes images and text, and generates text autoregressively.
+
    * - :ref:`deepseek-vl2 <models_llm_deepseek-vl2>`
      - chat, vision
      - 4096
@@ -260,6 +265,11 @@ The following is a list of built-in LLM in Xinference:
      - chat, tools, reasoning, hybrid
      - 1048576
      - We're introducing GLM-5.2, our latest flagship model for long-horizon tasks
+
+   * - :ref:`glm-5.3 <models_llm_glm-5.3>`
+     - chat, tools, reasoning
+     - 1048576
+     - GLM-5.3 is a reasoning model for coding and long-horizon agentic tasks.
 
    * - :ref:`glm-edge-chat <models_llm_glm-edge-chat>`
      - chat
@@ -910,6 +920,8 @@ The following is a list of built-in LLM in Xinference:
   
    deepseek-v4-pro
   
+   deepseek-v4.1-flash
+
    deepseek-vl2
   
    dianjin-r1
@@ -944,6 +956,8 @@ The following is a list of built-in LLM in Xinference:
   
    glm-5.2
   
+   glm-5.3
+
    glm-edge-chat
   
    glm4-0414

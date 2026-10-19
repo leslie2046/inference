@@ -312,6 +312,10 @@ class ChatModelMixin:
         # template style are covered automatically.
         return chat_template is not None and (
             "tool_call.arguments|items" in chat_template
+            or (
+                "_args = tc.arguments" in chat_template
+                and "_args.items()" in chat_template
+            )
             or "tool_call.function.arguments is not mapping" in chat_template
             or (
                 "args_dict = tool_call.arguments" in chat_template
@@ -412,7 +416,11 @@ class ChatModelMixin:
                 messages
             )
         if tokenizer is not None:
-            if self.model_family.model_name.lower().startswith("deepseek-v4"):
+            if self.model_family.model_name.lower().startswith(
+                "deepseek-v4"
+            ) and "DeepseekV41ForCausalLM" not in (
+                getattr(self.model_family, "architectures", None) or []
+            ):
                 from ..utils import allow_trust_remote_code
 
                 if not allow_trust_remote_code(self.model_family):
@@ -494,6 +502,10 @@ class ChatModelMixin:
                         if isinstance(thinking, bool)
                         else reasoning_parser.enable_thinking
                     )
+                if reasoning_parser and not reasoning_parser.allow_disable_thinking:
+                    kwargs["enable_thinking"] = True
+                    if "thinking" in kwargs:
+                        kwargs["thinking"] = True
                 return kwargs
             else:
                 raise TypeError(
@@ -501,7 +513,10 @@ class ChatModelMixin:
                 )
         elif reasoning_parser:
             # pass enable_thinking to chat template
-            return {"enable_thinking": reasoning_parser.enable_thinking}
+            return {
+                "enable_thinking": reasoning_parser.enable_thinking
+                or not reasoning_parser.allow_disable_thinking
+            }
         return None
 
     @staticmethod
@@ -1155,9 +1170,10 @@ class ChatModelMixin:
             reasoning_content, processed_content = (
                 self.reasoning_parser.extract_reasoning_content(text)
             )
-            # Use the processed content (without thinking tags) for tool parsing
-            if processed_content:
-                text = processed_content
+            # Use the processed content (without thinking tags) for tool parsing.
+            # It is empty when the output only contains reasoning, e.g. when
+            # generation stops inside the thinking block.
+            text = processed_content or ""
 
         # Then, extract tool calls from the processed text (without thinking tags)
         tool_calls = []
@@ -1192,7 +1208,11 @@ class ChatModelMixin:
             # For non-tool calls, use the processed content from reasoning parser
             content = text
 
-        finish_reason = "tool_calls" if tool_calls else "stop"
+        finish_reason = (
+            "tool_calls"
+            if tool_calls
+            else c["choices"][0].get("finish_reason") or "stop"
+        )
 
         m = {
             "role": "assistant",

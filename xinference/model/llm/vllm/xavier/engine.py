@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import logging
+import os
 from typing import Any, Dict, Optional
 
 from packaging import version
@@ -29,23 +30,9 @@ from .transport import (
 
 logger = logging.getLogger(__name__)
 
-XAVIER_EAGER_VLLM_VERSION = version.parse("0.21.0")
-
 
 class XavierEngine:
     _xavier_config: Optional[Dict] = None
-
-    @staticmethod
-    def _json_safe(value: Any) -> Any:
-        if isinstance(value, bytes):
-            return value.decode(errors="replace")
-        if isinstance(value, dict):
-            return {str(k): XavierEngine._json_safe(v) for k, v in value.items()}
-        if isinstance(value, (list, tuple)):
-            return [XavierEngine._json_safe(v) for v in value]
-        if isinstance(value, (str, int, float, bool)) or value is None:
-            return value
-        return str(value)
 
     @classmethod
     def _patch_v1_engine_args(
@@ -68,13 +55,6 @@ class XavierEngine:
         xavier_config = dict(xavier_config)
         set_xavier_transport_backend(xavier_config, XAVIER_TRANSPORT_XAVIER)
 
-        additional_config = dict(getattr(engine_args, "additional_config", {}) or {})
-        # vLLM V1 includes additional_config in its compilation cache hash and
-        # serializes it as JSON. Keep the connector's full config below, but
-        # only expose a JSON-safe copy here.
-        additional_config["xavier_config"] = cls._json_safe(xavier_config)
-        engine_args.additional_config = additional_config
-
         role = xavier_config.get("role")
         if role == "prefill":
             kv_role = "kv_producer"
@@ -87,32 +67,63 @@ class XavierEngine:
             kv_rank = xavier_config.get("rank", 0)
 
         extra_config = dict(xavier_config.get("kv_connector_extra_config") or {})
+        # Actor addresses, IDs and ranks affect transport, not compiled model
+        # operations. Keep them in the connector config: additional_config is
+        # included in vLLM's graph hash and would recompile on every launch.
         extra_config["xavier_config"] = xavier_config
 
-        if (
-            version.parse(VLLM_VERSION) >= XAVIER_EAGER_VLLM_VERSION
-            and xavier_config.get("enforce_eager", True)
-            and not getattr(engine_args, "enforce_eager", False)
+        recurrent = engine_args.create_model_config().is_hybrid
+        if xavier_config.get("enforce_eager", recurrent) and not getattr(
+            engine_args, "enforce_eager", False
         ):
-            # vLLM V1 may create XavierConnector twice during CUDA graph
-            # setup. In CUDA-heavy processes this can trip glibc static TLS
-            # allocation, so keep Xavier on the eager execution path.
+            # Attention snapshots are exported after forward and support CUDA
+            # graphs. Keep the existing eager default for recurrent handoff.
             engine_args.enforce_eager = True
             logger.info(
                 "Set enforce_eager=True for Xavier V1 on vLLM %s.",
                 VLLM_VERSION,
             )
 
+        # vLLM's is_hybrid means attention plus recurrent state, not a mixture
+        # of sliding-window and full attention. Only recurrent models need this
+        # override: 0.21 disables HMA for every KV connector by default; 0.22+
+        # checks SupportsHMA itself. Preserve an explicit user setting.
+        if (
+            recurrent
+            and version.parse(VLLM_VERSION) < version.parse("0.22.0")
+            and getattr(engine_args, "disable_hybrid_kv_cache_manager", None) is None
+        ):
+            engine_args.disable_hybrid_kv_cache_manager = False
+        if getattr(engine_args, "enable_prefix_caching", None) is None:
+            engine_args.enable_prefix_caching = not recurrent
+        if recurrent:
+            if getattr(engine_args, "async_scheduling", None) is None:
+                engine_args.async_scheduling = False
+            if engine_args.enable_prefix_caching or engine_args.async_scheduling:
+                raise ValueError(
+                    "Xavier recurrent handoff requires enable_prefix_caching=False "
+                    "and async_scheduling=False"
+                )
+
         engine_args.kv_transfer_config = KVTransferConfig(
-            kv_connector=XAVIER_CONNECTOR,
-            kv_connector_module_path=XAVIER_CONNECTOR_MODULE,
+            kv_connector=(
+                "CrossEngineConnector"
+                if xavier_config.get("heterogeneous")
+                else XAVIER_CONNECTOR
+            ),
+            kv_connector_module_path=(
+                "xinference.model.llm.vllm.xavier.cross_engine"
+                if xavier_config.get("heterogeneous")
+                else XAVIER_CONNECTOR_MODULE
+            ),
             engine_id=xavier_config.get("engine_id"),
             kv_role=kv_role,
             kv_rank=xavier_config.get("kv_rank", kv_rank),
             kv_parallel_size=xavier_config.get("kv_parallel_size", 2),
             kv_connector_extra_config=extra_config,
             kv_load_failure_policy=xavier_config.get(
-                "kv_load_failure_policy", "recompute"
+                "kv_load_failure_policy",
+                "fail" if xavier_config.get("heterogeneous") else "recompute",
             ),
         )
 
@@ -126,6 +137,12 @@ class XavierEngine:
         stat_loggers: Optional[Any] = None,
         xavier_config: Optional[Dict] = None,
     ) -> "AsyncLLMEngine":
+        if (
+            xavier_config
+            and xavier_config.get("gpu_cache_bytes") is not None
+            and version.parse(VLLM_VERSION) < version.parse("0.21.0")
+        ):
+            raise RuntimeError("Xavier GPU transfer requires vLLM >= 0.21.0")
         if version.parse(VLLM_VERSION) < version.parse("0.11.0"):
             from .legacy_engine import XavierEngine as LegacyXavierEngine
 
@@ -141,6 +158,9 @@ class XavierEngine:
             raise RuntimeError("Xavier V1 requires vLLM >= 0.21.0")
         cls._xavier_config = xavier_config
         cls._patch_v1_engine_args(engine_args, xavier_config)
+        # EngineCore calls back into the actor runtime. Forking the loaded model
+        # process can inherit actor clients whose event-loop threads are gone.
+        os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
         logger.debug("Start Xavier V1 adapter for vLLM with config: %s", xavier_config)
         return AsyncLLMEngine.from_engine_args(
             engine_args,

@@ -39,6 +39,7 @@ import type { CatalogModel, LaunchFieldConfig, RequestModelType, WorkerOption } 
 import {
   MODEL_ENGINE_TYPES,
   buildEngineIndex,
+  buildLaunchHistoryValues,
   createCacheKey,
   isCachedSpec,
   normalizeModelSize,
@@ -53,6 +54,8 @@ import {
   isEmptyLaunchValue,
   isVisibleRequiredLaunchField,
   extractWorkerItems,
+  reconcileGpuIndexesForDevice,
+  reconcileWorkerSelectionForDevice,
   requiresGpuWorkers,
   GPU_IDX_PATTERN,
 } from '../utils';
@@ -100,6 +103,21 @@ interface SystemSettingsResponse {
 }
 
 const DOWNLOAD_TERMINAL_STAGES = new Set(['completed', 'failed', 'cancelled']);
+
+export function getNGpuOptions(
+  modelType: RequestModelType,
+  gpuAvailable: number,
+  supportsRecommendation: boolean
+): Array<string | number> {
+  if ([ModelType.LLM, ModelType.Image].includes(modelType)) {
+    return gpuAvailable > 0 ? ['auto', 'CPU', ...range(1, gpuAvailable)] : ['auto', 'CPU'];
+  }
+  if (supportsRecommendation) {
+    // A zero GPU count does not rule out Metal/MLX on Apple Silicon.
+    return gpuAvailable > 0 ? ['auto', 'GPU', 'CPU'] : ['auto', 'CPU'];
+  }
+  return gpuAvailable > 0 ? ['GPU', 'CPU'] : ['CPU'];
+}
 
 function getLaunchStageKey(stage?: string, status?: string): string {
   if (stage === 'downloading') return 'launchModel.stageDownloading';
@@ -462,25 +480,26 @@ export default function LaunchDialog({
   );
 
   const nGpuFieldProps = useMemo(() => {
-    let options = [];
-    if ([ModelType.LLM, ModelType.Image].includes(modelType)) {
-      options = gpuAvailable > 0 ? ['auto', 'CPU', ...range(1, gpuAvailable)] : ['auto', 'CPU'];
-    } else if (supportsRecommendation) {
-      // A zero GPU count does not rule out Metal/MLX on Apple Silicon.
-      options = ['auto', 'CPU'];
-    } else {
-      options = gpuAvailable === 0 ? ['CPU'] : ['GPU', 'CPU'];
-    }
+    const options = getNGpuOptions(modelType, gpuAvailable, supportsRecommendation);
     return {
       options: options.map((item) => ({ label: String(item), value: item })),
-      onChange: () => {
+      onChange: (nextNGpu: string | number | undefined) => {
         form.setFieldsValue({
-          gpu_idx: undefined,
-          worker_ip: undefined,
+          gpu_idx: reconcileGpuIndexesForDevice(
+            form.getFieldValue('gpu_idx'),
+            nGpuValue,
+            nextNGpu,
+            modelType
+          ),
+          worker_ip: reconcileWorkerSelectionForDevice(
+            form.getFieldValue('worker_ip'),
+            nextNGpu,
+            workerOptions
+          ),
         });
       },
     };
-  }, [gpuAvailable, modelType, supportsRecommendation, form]);
+  }, [gpuAvailable, modelType, supportsRecommendation, form, nGpuValue, workerOptions]);
 
   const downloadHubOptions = useMemo(() => {
     const allSpecHubs = Array.from(
@@ -1906,14 +1925,14 @@ export default function LaunchDialog({
       return;
     }
 
-    const newValues = transformFormToFetch(values);
+    const launchRequestValues = transformFormToFetch(values);
     isCanceledLaunchRef.current = false;
     setLoading(true);
     setProgressDetails(null);
     setReplicaStatuses([]);
 
     request
-      .post<{ model_uid?: string }>('/v1/models', newValues, { noTimeout: true })
+      .post<{ model_uid?: string }>('/v1/models', launchRequestValues, { noTimeout: true })
       .then(async (launchResponse) => {
         // Prevents a false deployment success notification when /v1/models returns model_uid after download cancellation, triggering the success logic below.
         if (isCanceledLaunchRef.current) {
@@ -1924,10 +1943,14 @@ export default function LaunchDialog({
         setProgressDetails({ stage: 'completed' });
 
         const launchedValues = {
-          ...newValues,
-          model_uid: launchResponse?.model_uid || newValues.model_uid || newValues.model_name,
+          ...launchRequestValues,
+          model_uid:
+            launchResponse?.model_uid ||
+            launchRequestValues.model_uid ||
+            launchRequestValues.model_name,
         };
-        void saveLaunchConfigHistory(launchedValues, clusterAuth?.auth)
+        const historyValues = buildLaunchHistoryValues(values, launchedValues);
+        void saveLaunchConfigHistory(historyValues.data, clusterAuth?.auth, historyValues.uiData)
           .then((historySaved) => {
             if (!historySaved) {
               toast.warning(t('launchModel.configHistorySyncFailed'));

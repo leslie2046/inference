@@ -14,6 +14,10 @@
 
 from typing import Any, Dict, Optional
 
+from ...xavier.transport import get_transport_host as get_transport_host
+from ...xavier.transport import gpu_pool_options as gpu_pool_options
+from ...xavier.transport import validate_gpu_cache_budget as validate_gpu_cache_budget
+
 XAVIER_TRANSPORT_BACKEND_KEY = "vllm_transfer_backend_type"
 XAVIER_TRANSPORT_BACKEND_ALIAS_KEY = "transfer_backend_type"
 
@@ -24,9 +28,14 @@ XAVIER_CONNECTOR_MODULE = "xinference.model.llm.vllm.xavier.v1_connector"
 
 
 def normalize_xavier_transport_backend(backend: Optional[str]) -> str:
-    if backend in (None, ""):
+    if backend is None or backend == "":
         return XAVIER_TRANSPORT_XAVIER
-    return XAVIER_TRANSPORT_XAVIER
+    backend = str(backend).strip().lower()
+    if backend not in ("xavier", "nixl"):
+        raise ValueError(
+            f"Unknown vLLM transfer backend: {backend!r}; use xavier or nixl"
+        )
+    return backend
 
 
 def get_xavier_transport_backend(xavier_config: Optional[Dict[str, Any]]) -> str:
@@ -47,3 +56,12 @@ def set_xavier_transport_backend(
     xavier_config[XAVIER_TRANSPORT_BACKEND_KEY] = normalized
     xavier_config[XAVIER_TRANSPORT_BACKEND_ALIAS_KEY] = normalized
     return xavier_config
+
+
+def uses_direct_handoff(config: Optional[Dict[str, Any]]) -> bool:
+    """GPU P/D uses request-scoped handoff; CPU and hybrid caches stay unchanged."""
+    return bool(
+        config
+        and config.get("gpu_cache_bytes") is not None
+        and config.get("role") in {"prefill", "decode"}
+    )

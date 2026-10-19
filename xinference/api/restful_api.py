@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import asyncio
+import base64
 import gc
 import inspect
 import ipaddress
@@ -21,6 +22,7 @@ import logging
 import multiprocessing
 import os
 import pprint
+import struct
 import time
 import uuid
 import warnings
@@ -468,6 +470,21 @@ def _audio_response_media_type(response_format: Optional[str]) -> str:
     )
 
 
+def _encode_embeddings_base64(embedding: Union[bytes, str]) -> str:
+    """Encode dense vectors as base64 little-endian float32, as OpenAI does.
+
+    Sparse embeddings (token -> weight dicts) have no base64 form and are
+    returned unchanged.
+    """
+    result = json.loads(embedding)
+    for item in result.get("data") or []:
+        vector = item.get("embedding")
+        if isinstance(vector, list):
+            packed = struct.pack(f"<{len(vector)}f", *vector)
+            item["embedding"] = base64.b64encode(packed).decode("ascii")
+    return json.dumps(result)
+
+
 def _validate_replica(value: Any) -> int:
     """Validate and convert the ``replica`` field from a JSON payload.
 
@@ -565,12 +582,14 @@ class RESTfulAPI(CancelMixin):
     @asynccontextmanager
     async def _lifespan(self, _app: FastAPI) -> AsyncIterator[None]:
         # Keep the large startup heap out of full collections while continuing
-        # to collect cycles created by requests. Respect an existing freeze
-        # owned by the host application.
+        # to collect cycles created by requests. Extend any existing freeze
+        # with the API startup graph; unfreeze only when this lifespan owns it.
         owns_gc_freeze = gc.get_freeze_count() == 0
-        if owns_gc_freeze:
-            gc.collect()
-            gc.freeze()
+        # A runtime may already have frozen a small startup graph. Include the
+        # libraries initialized for this API even then; only undo a freeze that
+        # this lifespan owns, keeping the pre-existing owner's policy intact.
+        gc.collect()
+        gc.freeze()
         try:
             if not is_metrics_disabled():
                 self._cluster_metrics_task = asyncio.create_task(
@@ -854,7 +873,11 @@ class RESTfulAPI(CancelMixin):
         request.state.audit_recorded = True
 
     async def _audit_middleware(self, request: Request, call_next):
-        from .oauth2.advanced.audit import classify_endpoint, should_skip_audit
+        from .oauth2.advanced.audit import (
+            classify_endpoint,
+            should_skip_audit,
+            should_skip_completed_audit,
+        )
 
         started = time.perf_counter()
         request_id = get_model_request_id(request)
@@ -883,8 +906,11 @@ class RESTfulAPI(CancelMixin):
         ):
             return response
 
-        latency_s = time.perf_counter() - started
         status_code = response.status_code
+        if should_skip_completed_audit(request.method, request.url.path, status_code):
+            return response
+
+        latency_s = time.perf_counter() - started
         request.state.audit_status_code = status_code
         model_uid = getattr(request.state, "_audit_model_uid", "")
         audit_status = getattr(request.state, "audit_status", "")
@@ -1135,6 +1161,18 @@ class RESTfulAPI(CancelMixin):
         )
 
     def serve(self, logging_conf: Optional[dict] = None):
+        # Optional fastapi-guard security middleware (no-op when disabled).
+        # Attached FIRST so it nests INSIDE both CORS and the audited IP
+        # middleware (Starlette runs the last-added middleware outermost):
+        # the effective chain is audit/IP -> CORS -> guard -> app, so guard's
+        # own rejections (403/429) leave with CORS headers (cross-origin
+        # browser clients can read them) and still pass through the audit
+        # wrapper keeping X-Request-ID, while the XINFERENCE_ALLOWED_IPS
+        # allowlist stays first in line on the way in.
+        from .guard_integration import attach_guard, uvicorn_forwarded_allow_ips
+
+        attach_guard(self._app)
+
         self._app.add_middleware(
             CORSMiddleware,
             allow_origins=["*"],
@@ -1208,6 +1246,19 @@ class RESTfulAPI(CancelMixin):
 
                 validate_oidc_config()
                 register_oidc_routes(self)
+
+        from ..extensions import APIExtensionContext, configure_api, get_extensions
+
+        if get_extensions():
+            configure_api(
+                APIExtensionContext(
+                    app=self._app,
+                    router=self._router,
+                    auth_service=self._auth_service,
+                    auth_enabled=self.is_authenticated(),
+                    get_supervisor_ref=self._get_supervisor_ref,
+                )
+            )
 
         if is_metrics_disabled():
             logger.info(
@@ -1292,7 +1343,12 @@ class RESTfulAPI(CancelMixin):
             port=self._port,
             log_config=logging_conf,
             proxy_headers=True,
-            forwarded_allow_ips="*",
+            # With the guard enabled, only explicitly trusted proxies may
+            # rewrite the client address from X-Forwarded-For; trusting any
+            # peer here would let a direct client forge its identity before
+            # guard (or the allowlist above) ever sees the request.
+            # No-op ("*") when the guard is disabled.
+            forwarded_allow_ips=uvicorn_forwarded_allow_ips(),
             # Slow HTTP DoS (Slowloris) protection, see xinference/core/http_protocol.py
             http=create_hardened_http_protocol(XINFERENCE_HTTP_REQUEST_TIMEOUT),
             timeout_keep_alive=XINFERENCE_HTTP_TIMEOUT_KEEP_ALIVE,
@@ -1640,74 +1696,64 @@ class RESTfulAPI(CancelMixin):
             logger.error(str(e), exc_info=True)
             raise HTTPException(status_code=500, detail=str(e))
 
-    async def add_model_replica_dispatch(
-        self, request: Request, model_uid: str
-    ) -> JSONResponse:
-        """Dispatch legacy bulk and placement-aware single-replica requests."""
-        payload = await request.json()
-        if "replica" in payload:
-            return await self.add_model_replicas(request, model_uid)
-        return await self.add_model_replica(model_uid, payload)
-
-    async def add_model_replicas(
-        self, request: Request, model_uid: str
-    ) -> JSONResponse:
-        """Dynamically add replicas to a running model."""
-        payload = await request.json()
-        replica = _validate_replica(payload.get("replica", 1))
-        worker_ip = payload.get("worker_ip")
-        gpu_idx = payload.get("gpu_idx")
-        if isinstance(worker_ip, list):
-            worker_ip = ",".join(
-                str(item).strip() for item in worker_ip if str(item).strip()
-            )
-        if worker_ip is not None and not isinstance(worker_ip, str):
-            raise HTTPException(
-                status_code=400,
-                detail="Invalid input. `worker_ip` must be a string or a list of strings.",
-            )
-        if isinstance(gpu_idx, int) and not isinstance(gpu_idx, bool):
-            gpu_idx = [gpu_idx]
-        if gpu_idx is not None and (
-            not isinstance(gpu_idx, list)
-            or any(
-                isinstance(index, bool) or not isinstance(index, int) or index < 0
-                for index in gpu_idx
-            )
-        ):
-            raise HTTPException(
-                status_code=400,
-                detail="Invalid input. `gpu_idx` must contain non-negative integers.",
-            )
-        if gpu_idx and len(gpu_idx) % replica:
-            raise HTTPException(
-                status_code=400,
-                detail="Invalid input. Allocated gpu must be a multiple of replica.",
-            )
-
-        resource_options: Dict[str, Any] = {}
-        if "n_gpu" in payload:
-            resource_options["n_gpu"] = payload["n_gpu"]
-        if worker_ip:
-            resource_options["worker_ip"] = worker_ip
-        if gpu_idx:
-            resource_options["gpu_idx"] = gpu_idx
+    async def get_model_reload_config(self, model_uid: str) -> JSONResponse:
         try:
-            total, replica_ids = await (
-                await self._get_supervisor_ref()
-            ).add_model_replicas(model_uid, replica, **resource_options)
-            return JSONResponse(content={"replica": total, "replica_ids": replica_ids})
-        except ValueError as ve:
-            logger.error(str(ve), exc_info=True)
-            raise HTTPException(status_code=400, detail=str(ve))
-        except ModelNotReadyError as e:
-            raise HTTPException(status_code=409, detail=str(e))
-        except RuntimeError as re:
-            logger.error(str(re), exc_info=True)
-            raise HTTPException(status_code=503, detail=str(re))
-        except Exception as e:
-            logger.error(str(e), exc_info=True)
-            raise HTTPException(status_code=500, detail=str(e))
+            result = await (await self._get_supervisor_ref()).get_model_reload_config(
+                model_uid
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return JSONResponse(content=result)
+
+    async def get_model_reload_status(self, model_uid: str) -> JSONResponse:
+        try:
+            result = await (await self._get_supervisor_ref()).get_model_reload_status(
+                model_uid
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return JSONResponse(content=result)
+
+    async def reload_model(self, model_uid: str, request: Request) -> JSONResponse:
+        import math
+
+        from ..model.llm.weight_cache import validate_reload_patch
+
+        try:
+            payload = await request.json()
+            if not isinstance(payload, dict) or set(payload) - {
+                "model_config",
+                "drain_timeout",
+            }:
+                raise ValueError("Expected model_config and optional drain_timeout")
+            config = payload.get("model_config")
+            metadata = await (await self._get_supervisor_ref()).get_model_reload_config(
+                model_uid
+            )
+            # Validate the request's shape and types before crossing the actor boundary.
+            if not isinstance(config, dict) or not config:
+                raise ValueError("model_config must be a non-empty object")
+            if set(config) - set(metadata["parameters"]):
+                raise ValueError("Unsupported reload parameters")
+            engine = metadata["engine"]
+            validate_reload_patch(engine, config)
+            timeout = payload.get("drain_timeout", 300)
+            if (
+                type(timeout) not in (int, float)
+                or not math.isfinite(timeout)
+                or not 0 < timeout <= 3600
+            ):
+                raise ValueError("drain_timeout must be between 0 and 3600 seconds")
+            result = await (await self._get_supervisor_ref()).reload_model(
+                model_uid, config, timeout
+            )
+        except ModelNotReadyError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return JSONResponse(content=result, status_code=202)
 
     async def get_launch_model_progress(self, model_uid: str) -> JSONResponse:
         try:
@@ -2857,6 +2903,8 @@ class RESTfulAPI(CancelMixin):
         try:
             kwargs["model_uid"] = model_uid
             embedding = await model.create_embedding(body.input, **kwargs)
+            if payload.get("encoding_format") == "base64":
+                embedding = _encode_embeddings_base64(embedding)
             return Response(embedding, media_type="application/json")
         except Exception as e:
             e = await self._get_model_last_error(model.uid, e)
@@ -3680,6 +3728,7 @@ class RESTfulAPI(CancelMixin):
             )
             preserve_alpha = description.get("model_name", "").lower() in {
                 "qwen-image-2.1",
+                "qwen-image-2.1-turbo",
                 "ming-image-0.1-design",
                 "ming-image-0.1-design-layer",
             }

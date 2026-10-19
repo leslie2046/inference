@@ -13,6 +13,9 @@
 # limitations under the License.
 import asyncio
 import logging
+import math
+import sys
+from contextlib import nullcontext
 from functools import lru_cache
 from queue import Queue
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, no_type_check
@@ -21,8 +24,11 @@ import numpy as np
 import torch
 import xoscar as xo
 
-from .collective import CollectiveRank
-from .snapshot import KVSnapshotStore
+from ...sglang.gc_lifecycle import InitializationGCFreeze
+from ...xavier.backends.torch.snapshot import KVSnapshotStore
+from ...xavier.collective import CollectiveRank
+from ...xavier.constants import DEFAULT_TRANSFER_ACTOR_UID
+from ...xavier.profiling import profile_stage
 
 try:
     from vllm.utils import TORCH_DTYPE_TO_NUMPY_DTYPE, Device
@@ -47,13 +53,10 @@ else:
 
 logger = logging.getLogger(__name__)
 
-# gloo (xoscar collective) cannot transfer bfloat16 tensors, so bf16 KV must be
-# moved as another dtype. Use float32 rather than float16: float16's 5-bit
-# exponent overflows to +/-inf for KV values above 65504 (which occur in
-# Qwen3.5's linear_attn state cache and attention outliers), silently
-# corrupting the transferred cache and producing garbage generation. bf16 has
-# the same 8-bit exponent as float32, so bf16 -> float32 -> bf16 is lossless.
-XAVIER_BF16_TRANSPORT_DTYPE = torch.float32
+# Gloo cannot transfer bfloat16 directly. Use float16 only as a 16-bit carrier:
+# view() preserves every bit, including BF16 values outside the FP16 range.
+# Never numerically convert these payloads or perform arithmetic on the carrier.
+XAVIER_BF16_TRANSPORT_DTYPE = torch.float16
 
 
 class BufferTransferMixin:
@@ -119,10 +122,39 @@ class BufferTransferMixin:
         return TypeMappingGloo[TORCH_DTYPE_TO_NUMPY_DTYPE[input_dtype]]
 
 
-class TransferActor(xo.StatelessActor, BufferTransferMixin, CollectiveRank):
+from ...xavier.backends.torch.gpu_transfer import GPUTransferMixin, finish_before_cancel
+
+
+async def _copy_snapshot_to_cpu(
+    value: torch.Tensor,
+    stream: Optional[torch.cuda.Stream],
+    ready_event: Optional[torch.cuda.Event],
+) -> torch.Tensor:
+    def copy():
+        # Allocation and pageable D2H can block the caller. Keep both off the
+        # actor loop shared by streaming requests; no extra CPU memcpy is needed.
+        with torch.cuda.stream(stream) if stream is not None else nullcontext():
+            if ready_event is not None:
+                assert stream is not None
+                stream.wait_event(ready_event)
+            try:
+                return value.to(device="cpu", non_blocking=False, copy=True)
+            except BaseException:
+                if stream is not None:
+                    stream.synchronize()
+                raise
+
+    task = asyncio.create_task(asyncio.to_thread(copy))
+    # A cancelled export must retain its GPU source until the copy thread exits.
+    return await finish_before_cancel(task)
+
+
+class TransferActor(
+    xo.StatelessActor, BufferTransferMixin, CollectiveRank, GPUTransferMixin
+):
     @classmethod
     def default_uid(cls):
-        return f"vllm-transfer-actor"
+        return DEFAULT_TRANSFER_ACTOR_UID
 
     def __init__(
         self,
@@ -132,6 +164,7 @@ class TransferActor(xo.StatelessActor, BufferTransferMixin, CollectiveRank):
         store_address: str,
         store_port: int,
         world_addresses: List[str],
+        freeze_initialization_gc: bool = False,
     ):
         super().__init__()
         CollectiveRank.__init__(
@@ -146,11 +179,25 @@ class TransferActor(xo.StatelessActor, BufferTransferMixin, CollectiveRank):
         self._cache_engine: Optional[List[CacheEngine]] = None
         self._scheduler: Optional[List[Scheduler]] = None
         self._snapshot_store: Optional[KVSnapshotStore] = None
+        self._kv_schema_v1: Optional[Tuple[int, dict, str]] = None
+        self._schema_mismatch_warnings: Set[Tuple[str, str]] = set()
         self._layer_send_tasks_v1: Set[asyncio.Task[Any]] = set()
+        self._snapshot_export_jobs_v1: Dict[str, asyncio.Task] = {}
+        self._snapshot_export_lock_v1 = asyncio.Lock()
+        self._snapshot_export_sources_v1: Dict[
+            str, List[Tuple[torch.Tensor, torch.cuda.Event]]
+        ] = {}
+        self._snapshot_gc_freeze = (
+            InitializationGCFreeze() if freeze_initialization_gc else None
+        )
         self._swap_stream = torch.cuda.Stream()
 
     async def __post_create__(self):
         self.init_rank()
+        if self._snapshot_gc_freeze is not None:
+            # Actor creation follows model loading and precedes serving. Freeze
+            # once here; snapshots and request cycles allocated later still GC.
+            self._snapshot_gc_freeze.start()
 
     def setup(
         self,
@@ -169,15 +216,40 @@ class TransferActor(xo.StatelessActor, BufferTransferMixin, CollectiveRank):
         )
 
     async def __pre_destroy__(self):
-        for task in self._layer_send_tasks_v1:
-            task.cancel()
-        self._context.closeConnections()
+        try:
+            if getattr(self, "_local_read_tasks_v1", None):
+                await asyncio.gather(*self._local_read_tasks_v1, return_exceptions=True)
+            read_buffer = getattr(self, "_local_read_buffer_v1", None)
+            if read_buffer is not None:
+                read_buffer.close()
+                self._local_read_buffer_v1 = None
+            if getattr(self, "_snapshot_export_jobs_v1", None):
+                await asyncio.gather(
+                    *self._snapshot_export_jobs_v1.values(), return_exceptions=True
+                )
+                self._snapshot_export_jobs_v1.clear()
+            if getattr(self, "_snapshot_export_sources_v1", None):
+                self._snapshot_export_sources_v1.clear()
+            try:
+                await self.close_gpu_caches_v1()
+            except Exception:
+                logger.warning(
+                    "Failed to close Xavier GPU caches; continuing transfer cleanup",
+                    exc_info=True,
+                )
+            for task in self._layer_send_tasks_v1:
+                task.cancel()
+            self._context.closeConnections()
+        finally:
+            guard = getattr(self, "_snapshot_gc_freeze", None)
+            if guard is not None:
+                guard.close()
 
     def _get_cache_engine(self, virtual_engine: int) -> CacheEngine:
         return self._cache_engine[virtual_engine]  # type: ignore
 
     def configure_snapshots_v1(self, capacity: int):
-        from .snapshot import KVSnapshotStore
+        from ...xavier.backends.torch.snapshot import KVSnapshotStore
 
         if capacity <= 0:
             raise ValueError("Xavier snapshot capacity must be positive")
@@ -185,10 +257,14 @@ class TransferActor(xo.StatelessActor, BufferTransferMixin, CollectiveRank):
             self._snapshot_store = KVSnapshotStore(capacity)
 
     def stage_layer_blocks_v1(self, request_id, layer_name, block_ids, blocks):
+        logical_dtype = blocks.dtype
         if blocks.dtype == torch.bfloat16:
-            blocks = blocks.to(dtype=XAVIER_BF16_TRANSPORT_DTYPE)
+            blocks = blocks.view(XAVIER_BF16_TRANSPORT_DTYPE)
         self._snapshot_store.stage(
-            layer_name, block_ids, blocks.detach().cpu().contiguous()
+            layer_name,
+            block_ids,
+            blocks.detach().cpu().contiguous(),
+            logical_dtype=logical_dtype,
         )
         logger.debug(
             "Stage Xavier V1 blocks: request=%s, rank=%s, layer=%s, blocks=%s",
@@ -198,13 +274,207 @@ class TransferActor(xo.StatelessActor, BufferTransferMixin, CollectiveRank):
             block_ids,
         )
 
+    def ready_blocks_for_export_v1(self, keys: List[int]) -> List[int]:
+        if self._snapshot_store is None:
+            return []
+        ready = []
+        for key in dict.fromkeys(keys):
+            if key in self._snapshot_store.ready:
+                ready.append(key)
+                # A reused snapshot is still hot even without another write.
+                self._snapshot_store.blocks.move_to_end(key)
+        return ready
+
+    def stage_layer_batches_v1(
+        self,
+        entries: List[Tuple[str, List[int], torch.Tensor]],
+        metadata: List[Tuple[Tuple[int, ...], torch.dtype]],
+    ) -> None:
+        if len(entries) != len(metadata):
+            raise ValueError("Xavier export metadata does not match payload")
+        entries = [
+            (name, keys, blocks.view(dtype).view(shape))
+            for (name, keys, blocks), (shape, dtype) in zip(entries, metadata)
+        ]
+        store = self._snapshot_store
+        assert store is not None
+        batch_keys = set(key for _, ids, _ in entries for key in ids)
+        pinned = set().union(*store.leases.values())
+        if len(batch_keys | pinned) <= store.capacity:
+            # All batch keys can stay resident across layers, even if staging
+            # first needs to evict older unleased content.
+            for name, ids, blocks in entries:
+                TransferActor.stage_layer_blocks_v1(self, "batch", name, ids, blocks)
+            return
+        # Stage a complete block before moving to the next one. Layer-major
+        # staging could evict every partial block when the batch exceeds the
+        # available capacity (including capacity held by transfer leases).
+        positions = [
+            (name, dict(zip(keys, range(len(keys)))), blocks)
+            for name, keys, blocks in entries
+        ]
+        ordered_keys = dict.fromkeys(
+            key for _, indices, _ in positions for key in indices
+        )
+        for key in ordered_keys:
+            for name, indices, blocks in positions:
+                if key in indices:
+                    i = indices[key]
+                    TransferActor.stage_layer_blocks_v1(
+                        self, "batch", name, [key], blocks[i : i + 1]
+                    )
+
     def publish_blocks_v1(self, keys, layers):
         available = self._snapshot_store.publish(keys, set(layers))
         evicted = list(self._snapshot_store.evicted)
         self._snapshot_store.evicted.clear()
         return available, evicted
 
-    def reserve_blocks_v1(self, lease, keys):
+    async def refresh_snapshot_blocks_v1(
+        self, keys, layers, tracker_address, tracker_uid
+    ):
+        # Refresh and background export must finish tracker publication before
+        # either path can evict the other's snapshots.
+        async with self._snapshot_export_lock_v1:
+            tracker = await xo.actor_ref(address=tracker_address, uid=tracker_uid)
+            available, evicted = self.publish_blocks_v1(keys, layers)
+            removed = set(evicted) | (set(keys) - set(available))
+            if removed:
+                await tracker.unregister_blocks(0, self._rank, list(removed))
+            await tracker.register_snapshot_blocks(0, available, self._rank)
+            return available, evicted
+
+    def configure_kv_schema_v1(self, block_size: int, layers: dict, cache_dtype: str):
+        schema = (block_size, dict(layers), cache_dtype)
+        previous = self._kv_schema_v1
+        if previous is not None and previous != schema:
+            raise ValueError("Xavier registered KV schema changed")
+        self._kv_schema_v1 = schema
+
+    def register_snapshot_export_source_v1(self, source, metadata):
+        from torch.multiprocessing.reductions import rebuild_cuda_tensor
+
+        mapped = []
+        for descriptor, handle in metadata:
+            value = rebuild_cuda_tensor(*descriptor)
+            ready = torch.cuda.Event.from_ipc_handle(value.device, handle)
+            mapped.append((value, ready))
+        sources = getattr(self, "_snapshot_export_sources_v1", None)
+        if sources is None:
+            sources = self._snapshot_export_sources_v1 = {}
+        sources[source] = mapped
+
+    async def close_snapshot_export_source_v1(self, source):
+        if getattr(self, "_snapshot_export_jobs_v1", None):
+            await asyncio.gather(
+                *self._snapshot_export_jobs_v1.values(), return_exceptions=True
+            )
+        sources = getattr(self, "_snapshot_export_sources_v1", None)
+        if sources is not None:
+            sources.pop(source, None)
+
+    def enqueue_snapshot_export_v1(self, ticket, batches, tracker_address, tracker_uid):
+        """Own immutable GPU gathers before acknowledging the producer."""
+        from torch.multiprocessing.reductions import rebuild_cuda_tensor
+
+        sources = getattr(self, "_snapshot_export_sources_v1", {})
+        if any(
+            isinstance(descriptor, dict) and descriptor["gpu_export"] not in sources
+            for _, descriptor, _ in batches
+        ):
+            return False  # Actor recovery requires fresh IPC refcounts.
+        mapped = []
+        for keys, descriptor, layers in batches:
+            ready = None
+            if isinstance(descriptor, dict):
+                buffer, ready = sources[descriptor["gpu_export"]][descriptor["slot"]]
+                shape = descriptor["shape"]
+                value = buffer[: math.prod(shape)].view(shape)
+            else:
+                value = rebuild_cuda_tensor(*descriptor)
+                # Legacy CUDA IPC reconstruction waits on the actor's current
+                # stream. Carry that dependency to the background copy stream.
+                ready = torch.cuda.Event()
+                ready.record(torch.cuda.current_stream(value.device))
+            mapped.append((keys, value, layers, ready))
+        batches = mapped
+
+        async def export():
+            available, evicted = set(), set()
+            async with self._snapshot_export_lock_v1:
+                tracker = await xo.actor_ref(address=tracker_address, uid=tracker_uid)
+                for keys, value, layers, ready_event in batches:
+                    host = await _copy_snapshot_to_cpu(
+                        value, self._swap_stream, ready_event
+                    )
+                    self._snapshot_store.stage_packed_blocks(
+                        keys, host, layers, retain_storage=True
+                    )
+                    ready, removed = self.publish_blocks_v1(
+                        keys, {layer[0] for layer in layers}
+                    )
+                    if removed:
+                        await tracker.unregister_blocks(0, self._rank, removed)
+                    await tracker.register_snapshot_blocks(0, ready, self._rank)
+                    available.difference_update(removed)
+                    available.update(ready)
+                    evicted.update(removed)
+                    evicted.difference_update(ready)
+            return list(available), list(evicted)
+
+        self._snapshot_export_jobs_v1[ticket] = asyncio.create_task(export())
+
+    async def poll_snapshot_exports_v1(self, tickets, *, wait=False):
+        tasks = {
+            ticket: self._snapshot_export_jobs_v1.get(ticket) for ticket in tickets
+        }
+        if wait:
+            await asyncio.gather(
+                *(task for task in tasks.values() if task is not None),
+                return_exceptions=True,
+            )
+        results = {}
+        for ticket, task in tasks.items():
+            if task is None:
+                results[ticket] = (None, "Unknown snapshot export ticket")
+            elif task.done():
+                self._snapshot_export_jobs_v1.pop(ticket)
+                try:
+                    results[ticket] = task.result()
+                except BaseException as error:
+                    results[ticket] = (None, repr(error))
+        return results
+
+    def reserve_blocks_v1(self, lease, keys, expected_schema):
+        schema = self._kv_schema_v1
+        if not schema or not schema[1]:
+            logger.debug(
+                "Xavier KV schema is not registered; treating reservation as a miss"
+            )
+            return False
+        if schema != expected_schema:
+            peer = lease.partition(":")[0]
+            fields = []
+            if schema[0] != expected_schema[0]:
+                fields.append("block_size")
+            if schema[2] != expected_schema[2]:
+                fields.append("cache_dtype")
+            if schema[1].keys() != expected_schema[1].keys():
+                fields.append("layer set")
+            for layer in schema[1].keys() & expected_schema[1].keys():
+                for index, field in enumerate(("shape", "dtype")):
+                    if schema[1][layer][index] != expected_schema[1][layer][index]:
+                        fields.append(field)
+            for field in set(fields):
+                warning = (peer, field)
+                if warning not in self._schema_mismatch_warnings:
+                    self._schema_mismatch_warnings.add(warning)
+                    logger.warning(
+                        "Xavier KV schema mismatch with peer %s: %s; recomputing locally",
+                        peer,
+                        field,
+                    )
+            return False
         return self._snapshot_store is not None and self._snapshot_store.reserve(
             lease, keys
         )
@@ -218,6 +488,12 @@ class TransferActor(xo.StatelessActor, BufferTransferMixin, CollectiveRank):
             self._snapshot_store.release_consumer(rank)
 
     async def reserve_remote_blocks_v1(self, lease, transfers):
+        schema = self._kv_schema_v1
+        if not schema or not schema[1]:
+            logger.debug(
+                "Xavier consumer KV schema is not registered; recomputing locally"
+            )
+            return False
         refs = []
         success = False
         try:
@@ -227,7 +503,7 @@ class TransferActor(xo.StatelessActor, BufferTransferMixin, CollectiveRank):
                     uid=f"{TransferActor.default_uid()}-{rank}",
                 )
                 refs.append(ref)
-                if not await ref.reserve_blocks_v1(lease, list(mapping)):
+                if not await ref.reserve_blocks_v1(lease, list(mapping), schema):
                     return False
             success = True
             return True
@@ -251,17 +527,29 @@ class TransferActor(xo.StatelessActor, BufferTransferMixin, CollectiveRank):
             )
             await ref.release_blocks_v1(lease)
 
-        await asyncio.gather(
+        results = await asyncio.gather(
             *(release(rank) for rank in transfers), return_exceptions=True
         )
+        for rank, result in zip(transfers, results):
+            if isinstance(result, BaseException):
+                logger.warning(
+                    "Failed to release Xavier snapshot lease %s on rank %s",
+                    lease,
+                    rank,
+                    exc_info=(type(result), result, result.__traceback__),
+                )
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
 
     def _get_staged_layer_blocks_v1(self, layer_name, remote_block_ids):
         return self._snapshot_store.read(layer_name, remote_block_ids)
 
-    def has_layer_blocks_v1(self, layer_name, remote_block_ids):
+    def has_layer_blocks_v1(self, layer_name, remote_block_ids, expected_dtype):
         return self._snapshot_store is not None and all(
             key in self._snapshot_store.ready
             and layer_name in self._snapshot_store.blocks[key]
+            and self._snapshot_store.logical_dtypes[key][layer_name] == expected_dtype
             for key in remote_block_ids
         )
 
@@ -362,7 +650,12 @@ class TransferActor(xo.StatelessActor, BufferTransferMixin, CollectiveRank):
             recv_shape,
             recvbuf.dtype,
         )
-        xp.recv(self._context, recvptr, data_size, datatype, from_rank)
+        with profile_stage(
+            "gloo_receive",
+            rank=self._rank,
+            nbytes=recvbuf.numel() * recvbuf.element_size(),
+        ):
+            xp.recv(self._context, recvptr, data_size, datatype, from_rank)
         logger.debug(
             "Recv Xavier V1 blocks done: rank=%s, from_rank=%s, shape=%s, " "dtype=%s",
             self._rank,
@@ -381,22 +674,140 @@ class TransferActor(xo.StatelessActor, BufferTransferMixin, CollectiveRank):
         recv_dtype: torch.dtype,
     ) -> torch.Tensor:
         remote_block_ids = list(src_to_dst.keys())
-        from_address = self._world_addresses[from_rank]
-        sender_ref = await xo.actor_ref(
-            address=from_address, uid=f"{TransferActor.default_uid()}-{from_rank}"
-        )
-        if not await sender_ref.has_layer_blocks_v1(layer_name, remote_block_ids):
-            raise KeyError(
-                "No staged Xavier V1 blocks on rank "
-                f"{from_rank}: layer={layer_name!r}, blocks={remote_block_ids}"
+        with profile_stage(
+            "actor_control", layer=layer_name, blocks=len(src_to_dst), rank=self._rank
+        ):
+            from_address = self._world_addresses[from_rank]
+            sender_ref = await xo.actor_ref(
+                address=from_address, uid=f"{TransferActor.default_uid()}-{from_rank}"
             )
-        await sender_ref.start_send_layer_blocks_v1(
-            self._rank, layer_name, remote_block_ids
-        )
-        recvbuf = await asyncio.to_thread(
-            self.do_recv_layer_blocks_v1, from_rank, recv_shape, recv_dtype
-        )
+            if not await sender_ref.has_layer_blocks_v1(
+                layer_name, remote_block_ids, recv_dtype
+            ):
+                raise KeyError(
+                    "No staged Xavier V1 blocks on rank "
+                    f"{from_rank}: layer={layer_name!r}, blocks={remote_block_ids}"
+                )
+            await sender_ref.start_send_layer_blocks_v1(
+                self._rank, layer_name, remote_block_ids
+            )
+        with profile_stage("actor_receive", layer=layer_name, rank=self._rank):
+            recvbuf = await asyncio.to_thread(
+                self.do_recv_layer_blocks_v1, from_rank, recv_shape, recv_dtype
+            )
         return recvbuf
+
+    async def start_send_request_blocks_v1(self, to_rank, reads):
+        from xoscar.collective import xoscar_pygloo as xp
+
+        from ...xavier.backends.torch.request_transfer import pack_reads
+
+        # Validate and retain the complete payload before acknowledging the send.
+        payload = pack_reads(self._snapshot_store, reads)
+
+        def send():
+            # The thread owns payload even if its asyncio wrapper is cancelled.
+            xp.send(
+                self._context,
+                payload.numpy().ctypes.data,
+                payload.numel(),
+                self.get_gloo_dtype(torch.uint8),
+                to_rank,
+            )
+
+        task = asyncio.create_task(asyncio.to_thread(send))
+        self._layer_send_tasks_v1.add(task)
+
+        def completed(future):
+            self._layer_send_tasks_v1.discard(future)
+            if not future.cancelled() and future.exception() is not None:
+                logger.error(
+                    "Xavier cross-layer send failed", exc_info=future.exception()
+                )
+
+        task.add_done_callback(completed)
+
+    def get_local_read_metadata_v1(self):
+        if sys.platform != "linux":
+            return None
+        from ...xavier.backends.torch.local_read import SharedReadBuffer
+
+        owner = getattr(self, "_local_read_buffer_v1", None)
+        try:
+            if owner is None:
+                owner = self._local_read_buffer_v1 = SharedReadBuffer()
+                self._local_read_tasks_v1 = set()
+            return owner.metadata()
+        except OSError:
+            if owner is not None:
+                owner.close()
+                self._local_read_buffer_v1 = None
+            return None
+
+    async def read_request_blocks_local_v1(self, from_rank, reads, token):
+        from ...xavier.backends.torch.gpu_transfer import finish_before_cancel
+
+        owner = getattr(self, "_local_read_buffer_v1", None)
+        if owner is None or owner.token != token:
+            return None
+        acquired = owner.acquire(sum(read.nbytes for read in reads))
+        if acquired is None:
+            return None  # Busy or oversized messages use the ordinary RPC path.
+        lease, payload = acquired
+        task = asyncio.create_task(
+            self.read_request_blocks_v1(from_rank, reads, _buffer=payload)
+        )
+        self._local_read_tasks_v1.add(task)
+        try:
+            # Cancellation cannot release/unmap a buffer while Gloo still writes.
+            await finish_before_cancel(task)
+        except BaseException:
+            owner.release(lease)
+            raise
+        finally:
+            self._local_read_tasks_v1.discard(task)
+        return lease
+
+    def release_local_read_v1(self, lease):
+        owner = getattr(self, "_local_read_buffer_v1", None)
+        if owner is not None:
+            owner.release(lease)
+
+    async def read_request_blocks_v1(self, from_rank, reads, *, _buffer=None):
+        from xoscar.collective import xoscar_pygloo as xp
+
+        fields = dict(
+            rank=self._rank,
+            nbytes=sum(read.nbytes for read in reads),
+            blocks=sum(len(read.keys) for read in reads),
+        )
+        payload = (
+            torch.empty(fields["nbytes"], dtype=torch.uint8)
+            if _buffer is None
+            else _buffer
+        )
+        with profile_stage("actor_control", **fields):
+            sender = await xo.actor_ref(
+                address=self._world_addresses[from_rank],
+                uid=f"{TransferActor.default_uid()}-{from_rank}",
+            )
+            await sender.start_send_request_blocks_v1(self._rank, reads)
+
+        def recv(buffer):
+            # Cancellation stops the await, not the native thread. Keep ownership
+            # in the executor until Gloo has finished writing to the pointer.
+            with profile_stage("gloo_receive", **fields):
+                xp.recv(
+                    self._context,
+                    buffer.numpy().ctypes.data,
+                    buffer.numel(),
+                    self.get_gloo_dtype(torch.uint8),
+                    from_rank,
+                )
+
+        with profile_stage("actor_receive", **fields):
+            await asyncio.to_thread(recv, payload)
+        return payload
 
     @staticmethod
     def _get_swap_block_ids(src_to_dst: Dict[int, int], is_sender: bool) -> List[int]:
@@ -579,7 +990,7 @@ class Rank0TransferActor(xo.StatelessActor, CollectiveRank):
 
     @classmethod
     def default_uid(cls):
-        return f"vllm-transfer-actor"
+        return DEFAULT_TRANSFER_ACTOR_UID
 
     def __init__(
         self,

@@ -29,6 +29,7 @@ def connector_module(monkeypatch):
         SimpleNamespace(
             KVConnectorBase_V1=Base,
             KVConnectorMetadata=Metadata,
+            KVConnectorHandshakeMetadata=Metadata,
             KVConnectorRole=object,
             SupportsHMA=HMA,
         ),
@@ -51,7 +52,7 @@ def connector_module(monkeypatch):
 @pytest.fixture
 def connector_config():
     return SimpleNamespace(
-        cache_config=SimpleNamespace(block_size=16),
+        cache_config=SimpleNamespace(block_size=16, cache_dtype="auto"),
         parallel_config=SimpleNamespace(
             tensor_parallel_size=1, pipeline_parallel_size=1
         ),
@@ -79,3 +80,15 @@ def connector(connector_module, connector_config):
     instance = connector_module.XavierConnector(connector_config, None, caches)
     yield instance
     instance.shutdown()
+
+
+@pytest.fixture
+def assert_gpu_lru_consistent():
+    def check(store):
+        assert set(store.blocks) == set(store.tiers)
+        gpu_keys = [key for key in store.blocks if store.tiers[key] == "gpu"]
+        assert list(store._gpu_lru) == gpu_keys
+        assert store.counts["gpu"] == len(gpu_keys)
+        assert store.counts["cpu"] == len(store.blocks) - len(gpu_keys)
+
+    return check

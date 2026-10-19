@@ -18,8 +18,10 @@ import json
 import logging
 import os
 import shutil
+import subprocess
 import sys
 import threading
+import venv
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, List, Optional, Tuple, Union
@@ -37,6 +39,89 @@ from ..status_guard import InstanceInfo, LaunchStatus, ReplicaStatus
 from ..supervisor import ReplicaInfo, SupervisorActor
 from ..utils import merge_virtual_env_packages
 from ..worker import ModelStatus, WorkerActor, _inject_jina_v3_allocator_env
+
+
+@pytest.mark.parametrize("editable_style", ["path", "finder"])
+def test_model_virtualenv_loads_parent_editable_install(
+    tmp_path, monkeypatch, editable_style
+):
+    import sysconfig
+
+    import xoscar.virtualenv
+
+    env_path = tmp_path / "model-env"
+    venv.EnvBuilder(with_pip=False).create(env_path)
+    python = env_path / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    child_site = Path(
+        subprocess.check_output(
+            [
+                str(python),
+                "-I",
+                "-c",
+                "import sysconfig; print(sysconfig.get_path('purelib'))",
+            ],
+            text=True,
+        ).strip()
+    )
+    parent_site = tmp_path / "parent's site packages"
+    parent_site.mkdir()
+    source = tmp_path / "editable source"
+    source.mkdir()
+    (source / "editable_model.py").write_text("value = 'editable'\n")
+    (parent_site / "parent_package.py").write_text("value = 'parent'\n")
+    (parent_site / "shadowed_package.py").write_text("value = 'parent'\n")
+    (child_site / "shadowed_package.py").write_text("value = 'child'\n")
+    if editable_style == "path":
+        (parent_site / "editable.pth").write_text(str(source) + "\n")
+    else:
+        # PEP 660 setuptools installs register a meta-path finder from a .pth.
+        (parent_site / "editable_finder.py").write_text(
+            "import importlib.util, sys\n"
+            "class Finder:\n"
+            "    @classmethod\n"
+            "    def find_spec(cls, fullname, path=None, target=None):\n"
+            "        if fullname == 'editable_model':\n"
+            "            return importlib.util.spec_from_file_location(\n"
+            f"                fullname, {str(source / 'editable_model.py')!r})\n"
+            "def install():\n"
+            "    if Finder not in sys.meta_path:\n"
+            "        sys.meta_path.append(Finder)\n"
+        )
+        (parent_site / "editable.pth").write_text(
+            "import editable_finder; editable_finder.install()\n"
+        )
+
+    # Also exercise migration of a model environment created by older workers.
+    pth_file = child_site / "_xinference_parent.pth"
+    pth_file.write_text(str(parent_site) + "\n")
+    manager = SimpleNamespace(
+        create_env=lambda **kwargs: None,
+        get_lib_path=lambda: str(child_site),
+    )
+    monkeypatch.setattr(
+        xoscar.virtualenv, "get_virtual_env_manager", lambda *args: manager
+    )
+    monkeypatch.setattr(sysconfig, "get_paths", lambda: {"purelib": str(parent_site)})
+    for _ in range(2):
+        assert (
+            WorkerActor._create_virtual_env_manager(True, "uv", str(env_path))
+            is manager
+        )
+
+    # A fresh interpreter, without PYTHONPATH, must import the editable package
+    # while retaining precedence for packages installed in the child venv.
+    output = subprocess.check_output(
+        [
+            str(python),
+            "-I",
+            "-c",
+            "import json, sys, editable_model, parent_package, shadowed_package; "
+            "print(json.dumps([editable_model.value, parent_package.value, "
+            f"shadowed_package.value, sys.path.count({str(parent_site)!r})]))",
+        ],
+        text=True,
+    )
+    assert json.loads(output) == ["editable", "parent", "child", 1]
 
 
 @pytest.mark.asyncio
@@ -278,7 +363,7 @@ class MockWorkerActorRealTerminate(MockWorkerActor):
 @pytest_asyncio.fixture
 async def setup_pool():
     pool = await create_actor_pool(
-        "test://127.0.0.1:" + str(xo.utils.get_next_port()),
+        "test://127.0.0.1:0",
         n_process=0,
     )
     async with pool:
@@ -2304,6 +2389,33 @@ def test_prepare_virtual_env_offline_llama_cpp_warns_cpu_fallback(monkeypatch, c
     assert "installing the CPU build" in caplog.text
 
 
+def test_prepare_virtual_env_pins_missing_breeze_torchcodec(monkeypatch):
+    from importlib import metadata
+
+    original_version = metadata.version
+
+    def version(name):
+        if name == "torchcodec":
+            raise metadata.PackageNotFoundError(name)
+        if name == "torch":
+            return "2.9.1+cu128"
+        return original_version(name)
+
+    monkeypatch.setattr(metadata, "version", version)
+    manager = DummyVirtualEnvManager()
+    settings = VirtualEnvSettings(
+        packages=["#system_torch#", "#system_torchcodec#"],
+        inherit_pip_config=False,
+    )
+    WorkerActor._prepare_virtual_env(
+        manager, settings, None, model_engine="PyTorch", model_name="Breeze-TTS-2"
+    )
+    packages, _ = manager.calls[0]
+    assert "torchcodec>=0.8,<0.10" in packages
+    assert "#system_torchcodec#" not in packages
+    assert "#system_torch#" in packages
+
+
 def test_prepare_virtual_env_keeps_system_markers():
     manager = DummyVirtualEnvManager()
     settings = VirtualEnvSettings(
@@ -3272,7 +3384,9 @@ def test_wait_for_metrics_export_server_times_out(monkeypatch):
     metrics_thread.is_alive.return_value = True
     monotonic_values = iter((100.0, 101.0))
     monkeypatch.setattr(
-        "xinference.core.worker.time.monotonic", lambda: next(monotonic_values)
+        worker_module,
+        "time",
+        SimpleNamespace(monotonic=lambda: next(monotonic_values)),
     )
 
     with pytest.raises(
@@ -5088,3 +5202,45 @@ async def test_terminate_missing_model_does_not_destroy_none(setup_pool, monkeyp
     destroy.assert_not_called()
     presence = await worker.get_launch_state_presence_for_test("already-removed-rep0")
     assert not any(presence.values())
+
+
+@pytest.mark.asyncio
+async def test_terminate_dead_model_removes_all_cached_rank_pools(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    pool = SimpleNamespace(remove_sub_pool=AsyncMock())
+    worker = WorkerActor("test", None, pool, gpu_devices=[])
+    uid = "dead-model-rep0"
+    model = SimpleNamespace(
+        get_pool_addresses=AsyncMock(side_effect=xo.ServerClosed("model is dead")),
+        stop=AsyncMock(side_effect=xo.ServerClosed("model is dead")),
+    )
+    worker._model_uid_to_model[uid] = model
+    worker._model_uid_to_addr[uid] = "model-pool"
+    worker._model_uid_to_subpool_addresses[uid] = {
+        "model-pool",
+        "rank-0-pool",
+        "rank-1-pool",
+    }
+    worker._model_uid_to_model_status[uid] = ModelStatus(model_state="error")
+    worker._status_guard_ref = SimpleNamespace(update_instance_info=AsyncMock())
+    monkeypatch.setattr(worker, "get_supervisor_ref", AsyncMock())
+    monkeypatch.setattr(worker, "_update_model_state", AsyncMock())
+    monkeypatch.setattr(worker, "_remove_persisted_launch_args", lambda _: None)
+    monkeypatch.setattr(
+        xo, "destroy_actor", AsyncMock(side_effect=xo.ServerClosed("model is dead"))
+    )
+
+    await worker.terminate_model(uid)
+
+    model.get_pool_addresses.assert_not_called()
+    calls = pool.remove_sub_pool.await_args_list
+    assert len(calls) == 3
+    assert {call.args[0] for call in calls} == {
+        "model-pool",
+        "rank-0-pool",
+        "rank-1-pool",
+    }
+    assert all(call.kwargs == {"force": True} for call in calls)
+    assert uid not in worker._model_uid_to_model
+    assert uid not in worker._model_uid_to_subpool_addresses

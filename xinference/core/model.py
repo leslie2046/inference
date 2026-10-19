@@ -47,6 +47,7 @@ if TYPE_CHECKING:
     from .progress_tracker import ProgressTrackerActor
     from .worker import WorkerActor
     from ..model.llm.core import LLM
+    from ..model.llm.weight_cache import WeightCachedModel
     import PIL
 
 import logging
@@ -94,6 +95,8 @@ def request_limit(fn):
     """
 
     async def wrapped_func(self, *args, **kwargs):
+        if getattr(self, "_model_state", None) == "reloading":
+            raise ModelNotReadyError("Model is reloading")
         logger.debug(
             f"Request {fn.__name__}, current serve request count: {self._serve_count}, request limit: {self._request_limits} for the model {self.model_uid()}"
         )
@@ -113,60 +116,66 @@ def request_limit(fn):
             raise RuntimeError(
                 f"Rate limit reached for the model. Request limit {self._request_limits} for the model: {self.model_uid()}"
             )
-        await self.record_metrics(
-            "model_serve_count",
-            "set",
-            {"labels": self._metrics_labels, "value": self._serve_count},
-        )
         start_time = time.time()
         ret = None
         _error = False
+        released = False
+        stream_transferred = False
         try:
-            ret = await fn(self, *args, **kwargs)
-        except Exception:
-            _error = True
-            raise
-        finally:
-            duration = time.time() - start_time
-            _is_stream = ret is not None and (
-                inspect.isasyncgen(ret)
-                or inspect.isgenerator(ret)
-                or isinstance(ret, IteratorWrapper)
-            )
-            stream_label = "true" if _is_stream else "false"
-            await self.record_metrics(
-                "model_request_total",
-                "add",
-                {
-                    "labels": {**self._metrics_labels, "stream": stream_label},
-                    "value": 1,
-                },
-            )
-            if _is_stream:
-                # stream case, let client call model_ref to decrease self._serve_count
-                pass
-            else:
-                self._serve_count = max(0, self._serve_count - 1)
+            try:
                 await self.record_metrics(
                     "model_serve_count",
                     "set",
                     {"labels": self._metrics_labels, "value": self._serve_count},
                 )
-                logger.debug(
-                    f"After request {fn.__name__}, current serve request count: {self._serve_count} for the model {self.model_uid()}"
+                ret = await fn(self, *args, **kwargs)
+            except Exception:
+                _error = True
+                raise
+            finally:
+                duration = time.time() - start_time
+                _is_stream = ret is not None and (
+                    inspect.isasyncgen(ret)
+                    or inspect.isgenerator(ret)
+                    or isinstance(ret, IteratorWrapper)
                 )
-            await self.record_metrics(
-                "model_request_duration_seconds",
-                "observe",
-                {"labels": self._metrics_labels, "value": duration},
-            )
-            if _error:
+                if not _is_stream:
+                    self._serve_count = max(0, self._serve_count - 1)
+                    released = True
+                stream_label = "true" if _is_stream else "false"
                 await self.record_metrics(
-                    "model_request_errors_total",
+                    "model_request_total",
                     "add",
-                    {"labels": self._metrics_labels, "value": 1},
+                    {
+                        "labels": {**self._metrics_labels, "stream": stream_label},
+                        "value": 1,
+                    },
                 )
-        return ret
+                if not _is_stream:
+                    await self.record_metrics(
+                        "model_serve_count",
+                        "set",
+                        {"labels": self._metrics_labels, "value": self._serve_count},
+                    )
+                    logger.debug(
+                        f"After request {fn.__name__}, current serve request count: {self._serve_count} for the model {self.model_uid()}"
+                    )
+                await self.record_metrics(
+                    "model_request_duration_seconds",
+                    "observe",
+                    {"labels": self._metrics_labels, "value": duration},
+                )
+                if _error:
+                    await self.record_metrics(
+                        "model_request_errors_total",
+                        "add",
+                        {"labels": self._metrics_labels, "value": 1},
+                    )
+            stream_transferred = _is_stream
+            return ret
+        finally:
+            if not released and not stream_transferred:
+                self._serve_count = max(0, self._serve_count - 1)
 
     return wrapped_func
 
@@ -211,6 +220,8 @@ class ModelActor(xo.StatelessActor, CancelMixin):
         from ..model.llm.transformers.core import PytorchModel as LLMPytorchModel
         from ..model.llm.vllm.core import VLLMModel as LLMVLLMModel
         from ..model.rerank.core import RerankModel
+
+        await ModelActor._close_gpu_caches(self)
 
         if hasattr(self._model, "stop") and callable(self._model.stop):
             await asyncio.to_thread(self._model.stop)
@@ -350,7 +361,7 @@ class ModelActor(xo.StatelessActor, CancelMixin):
     def _require_ready(self):
         """Guard for all inference methods: reject if not in ready state."""
         if self._model_state != "ready":
-            if self._model_state in ("registering", "loading"):
+            if self._model_state in ("registering", "loading", "reloading"):
                 raise ModelNotReadyError(
                     f"Model is {self._model_state}, not ready for inference"
                 )
@@ -388,6 +399,10 @@ class ModelActor(xo.StatelessActor, CancelMixin):
             store_address=self._xavier_config.get("store_address"),  # type: ignore
             store_port=self._xavier_config.get("store_port"),  # type: ignore
             world_addresses=rank_addresses,
+            freeze_initialization_gc=(
+                self._model._is_vllm_v1()
+                and self._xavier_config.get("gpu_cache_bytes") is None
+            ),
         )
         await self._model.init_xavier()
         logger.debug(
@@ -471,6 +486,13 @@ class ModelActor(xo.StatelessActor, CancelMixin):
 
         return isinstance(self._model, SGLANGModel)
 
+    def get_sglang_pd_bootstrap(self) -> dict:
+        from ..model.llm.sglang.core import SGLANGModel
+
+        if not isinstance(self._model, SGLANGModel):
+            raise ValueError("SGLang P/D bootstrap requires a SGLang replica")
+        return self._model.get_pd_bootstrap()
+
     async def load(self):
         self._model_state = "loading"
         try:
@@ -496,7 +518,9 @@ class ModelActor(xo.StatelessActor, CancelMixin):
                     and str(e).find("busy or unavailable") >= 0
                 ):
                     await asyncio.sleep(5)
-                    logger.warning("Retry to load model {model_uid}: %d times", i)
+                    logger.warning(
+                        "Retry to load model %s: %d times", self._replica_model_uid, i
+                    )
                     continue
                 raise
         logger.info(f"{self} loaded")
@@ -511,6 +535,60 @@ class ModelActor(xo.StatelessActor, CancelMixin):
         if hasattr(self._model, "wait_for_load"):
             await asyncio.to_thread(self._model.wait_for_load)
         self._model_state = "ready"
+
+    def _get_weight_cached_model(self) -> "WeightCachedModel":
+        from ..model.llm.weight_cache import WeightCachedModel
+
+        if not isinstance(self._model, WeightCachedModel):
+            raise ValueError("Reload with retained weights requires vLLM or SGLang")
+        return self._model
+
+    def get_reload_config(self) -> Dict[str, Any]:
+        return self._get_weight_cached_model().get_reload_config()
+
+    async def validate_reload(self, model_config: Dict[str, Any]) -> None:
+        self._require_ready()
+        await asyncio.to_thread(
+            self._get_weight_cached_model().validate_reload, model_config
+        )
+        self._reload_status: Dict[str, Any] = {}
+
+    def get_reload_status(self) -> Dict[str, Any]:
+        return dict(getattr(self, "_reload_status", {}))
+
+    async def reload(self, model_config: Dict[str, Any], drain_timeout: float) -> None:
+        from ..model.llm.weight_cache import ModelReloadError
+
+        await self.validate_reload(model_config)
+        model = self._get_weight_cached_model()
+        self._model_state = "reloading"
+        self._reload_status = {"stage": "draining"}
+        try:
+            deadline = time.monotonic() + drain_timeout
+            while self._serve_count:
+                if time.monotonic() >= deadline:
+                    raise ModelReloadError(
+                        "Timed out draining requests; the original engine is still running",
+                        restored=True,
+                    )
+                await asyncio.sleep(0.05)
+            await asyncio.to_thread(
+                model.reload,
+                model_config,
+                lambda stage: self._reload_status.update(stage=stage),
+            )
+        except ModelReloadError as exc:
+            self._model_state = "ready" if exc.restored else "error"
+            self._reload_status.update(stage="error", restored=exc.restored)
+            raise
+        except Exception:
+            # Validation inside reload happens before engine teardown.
+            self._model_state = "ready"
+            self._reload_status.update(stage="error", restored=True)
+            raise
+        else:
+            self._model_state = "ready"
+            self._reload_status.update(stage="ready")
 
     def need_create_pools(self):
         return getattr(self._model, "need_create_pools", False)
@@ -545,8 +623,26 @@ class ModelActor(xo.StatelessActor, CancelMixin):
         # will hold driver information includes dist store etc.
         return self._driver_info
 
+    async def _close_gpu_caches(self):
+        config = getattr(self, "_xavier_config", None)
+        if config is None or config.get("gpu_cache_bytes") is None:
+            return
+        from ..model.llm.vllm.core import VLLMModel as LLMVLLMModel
+
+        if isinstance(self._model, LLMVLLMModel) and self._transfer_ref is not None:
+            # Release imported CUDA IPC handles while EngineCore still owns the
+            # allocations, after any in-flight transfer has completed.
+            try:
+                await self._transfer_ref.close_gpu_caches_v1()
+            except Exception:
+                logger.warning(
+                    "Failed to close Xavier GPU caches; continuing model cleanup",
+                    exc_info=True,
+                )
+
     async def stop(self):
         self._model_state = "stopping"
+        await ModelActor._close_gpu_caches(self)
         if hasattr(self._model, "stop"):
             await asyncio.to_thread(self._model.stop)
         elif hasattr(self._model, "close"):

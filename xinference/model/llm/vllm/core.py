@@ -78,6 +78,7 @@ from ..utils import (
     ChatModelMixin,
     generate_completion_chunk,
 )
+from ..weight_cache import WeightCachedModel
 from .utils import vllm_check
 
 logger = logging.getLogger(__name__)
@@ -496,11 +497,15 @@ def _update_vllm_supported_lists() -> None:
     if effective_version >= version.parse("0.28.0"):
         _append_unique(VLLM_SUPPORTED_CHAT_MODELS, "BailingMoeV3ForCausalLM")
 
+    if effective_version >= version.parse("0.30.0.dev0"):
+        _append_unique(VLLM_SUPPORTED_MULTI_MODEL_LIST, "DeepseekV41ForCausalLM")
+
 
 _update_vllm_supported_lists()
 
 
-class VLLMModel(LLM):
+class VLLMModel(WeightCachedModel, LLM):
+    _weight_cache_engine = "vllm"
     allow_batch = True
     support_draft_model = True
 
@@ -518,7 +523,12 @@ class VLLMModel(LLM):
         self._active_request_ids: Set[str] = set()
         self.lora_modules = peft_model
         self.lora_requests: List[Any] = []
-        self._xavier_config = None
+        self._xavier_config = cast(Dict[str, Any], model_config or {}).pop(
+            "_xavier_cache_config", None
+        )
+        self._nixl_config = cast(Dict[str, Any], model_config or {}).pop(
+            "_nixl_config", None
+        )
         self._context_length: Optional[int] = None
         # distributed inference
         self._device_count = None
@@ -538,8 +548,15 @@ class VLLMModel(LLM):
         self._all_worker_ready: Optional[threading.Event] = None
         # used to call async
         self._loop = None
+        self._init_weight_cache(model_config or {})
 
     def set_xavier_config(self, value: Optional[Dict]):
+        if (
+            value is None
+            and self._xavier_config
+            and self._xavier_config.get("heterogeneous")
+        ):
+            return
         self._xavier_config = value  # type: ignore
 
     def set_worker_addresses(self, shard: int, worker_addresses: List[str]):
@@ -589,6 +606,8 @@ class VLLMModel(LLM):
     def _native_mp_route(self) -> Tuple[bool, str]:
         backend = self._get_xinference_executor_backend()
         if backend == "xoscar":
+            if self._enable_weight_cache:
+                raise ValueError("Weight caching requires the native vLLM executor")
             return False, "explicit xoscar backend"
 
         if self._n_worker != 1:
@@ -632,6 +651,9 @@ class VLLMModel(LLM):
         if backend == "native_mp":
             self._get_native_mp_parallelism()
             return True, "explicit native_mp backend"
+        if self._enable_weight_cache:
+            self._get_native_mp_parallelism()
+            return True, "persistent GPU weight cache"
         if self._is_qwen4_exp():
             self._get_native_mp_parallelism()
             return True, "Qwen4Exp single-worker multi-GPU auto route"
@@ -746,6 +768,12 @@ class VLLMModel(LLM):
             multiprocessing.set_start_method("fork", force=True)
 
         self._device_count = self._get_cuda_count()
+        if self._xavier_config and self._xavier_config.get("heterogeneous"):
+            from .xavier.cross_engine import configure_cross_engine
+
+            configure_cross_engine(
+                self.model_path, self._model_config, self._xavier_config
+            )
         self._model_config = self._sanitize_model_config(self._model_config)
         reasoning_content = self._model_config.pop("reasoning_content")
         enable_thinking = self._model_config.pop("enable_thinking", False)
@@ -753,6 +781,7 @@ class VLLMModel(LLM):
             reasoning_content, enable_thinking=enable_thinking
         )
         self.prepare_parse_tool_calls()
+        self._prepare_weight_cache()
 
         if (
             isinstance(self.model_spec, LlamaCppLLMSpecV2)
@@ -790,12 +819,26 @@ class VLLMModel(LLM):
             f"Enable lora: {enable_lora}. Lora count: {max_loras}."
         )
 
+        if self._nixl_config is not None:
+            from .pd import configure_nixl_engine
+
+            if isinstance(self, VLLMMultiModel) and not self._model_config.get(
+                "language_model_only", False
+            ):
+                raise ValueError(
+                    "Native NIXL PD requires text-only models or language_model_only=True"
+                )
+            if isinstance(self, VLLMMultiModel) and VLLM_VERSION < version.parse(
+                "0.22.0"
+            ):
+                raise ValueError(
+                    "Native NIXL PD for language_model_only models requires vLLM >= 0.22.0"
+                )
+            configure_nixl_engine(self._model_config, VLLM_VERSION, enable_lora)
         use_native_mp, native_mp_reason = self._native_mp_route()
         if self._xavier_config is not None:
             from .xavier.engine import XavierEngine
 
-            # Enabling Xavier means that `enable_prefix_caching` is enabled by default.
-            self._model_config.setdefault("enable_prefix_caching", True)
             xavier_transfer_block_num = self._model_config.pop(
                 "xavier_transfer_block_num", 512
             )
@@ -830,7 +873,7 @@ class VLLMModel(LLM):
                 model=self.model_path,
                 enable_lora=enable_lora,
                 max_loras=max_loras,
-                **self._model_config,
+                **self._weight_cache_engine_config(self._model_config),
             )
             self._enable_v1_if_supported(engine_args)
 
@@ -968,7 +1011,7 @@ class VLLMModel(LLM):
                                 n_worker=self._n_worker,
                             )
                             if VLLM_VERSION >= version.parse("0.19.0"):
-                                executor_cls.supports_async_scheduling = lambda: True  # type: ignore
+                                executor_cls.supports_async_scheduling = XinferenceDistributedExecutorV1.supports_async_scheduling  # type: ignore
                             # patch vllm Executor.get_class
                             Executor.get_class = lambda vllm_config: executor_cls
                             self._engine = AsyncLLMEngine.from_engine_args(engine_args)
@@ -986,7 +1029,7 @@ class VLLMModel(LLM):
                 model=self.model_path,
                 enable_lora=enable_lora,
                 max_loras=max_loras,
-                **self._model_config,
+                **self._weight_cache_engine_config(self._model_config),
             )
             self._enable_v1_if_supported(engine_args)
 
@@ -1145,12 +1188,24 @@ class VLLMModel(LLM):
             )
 
     def stop(self):
+        try:
+            self._stop_engine()
+        finally:
+            if self._weight_cache is not None:
+                self._weight_cache.stop()
+                self._weight_cache = None
+
+    def _stop_engine(self):
         # though the vLLM engine will shutdown when deleted,
         # but some issue e.g. GH#1682 reported
         # when deleting, the engine exists still
         logger.info("Stopping vLLM engine")
         if self._check_health_task:
-            self._check_health_task.cancel()
+            if self._loop is not None:
+                self._loop.call_soon_threadsafe(self._check_health_task.cancel)
+            else:
+                self._check_health_task.cancel()
+            self._check_health_task = None
         # Wait for loading thread to finish so EngineCore subprocess
         # can be properly shut down below.
         if self._loading_thread and self._loading_thread.is_alive():
@@ -1319,7 +1374,9 @@ class VLLMModel(LLM):
             model_config = VLLMModelConfig()
 
         architectures = getattr(self.model_family, "architectures", []) or []
-        if "DeepseekV32ForCausalLM" in architectures:
+        if "DeepseekV41ForCausalLM" in architectures:
+            model_config.setdefault("tokenizer_mode", "deepseek_v41")
+        elif "DeepseekV32ForCausalLM" in architectures:
             model_config.setdefault("tokenizer_mode", "deepseek_v32")
         else:
             model_config.setdefault("tokenizer_mode", "auto")
@@ -1363,7 +1420,10 @@ class VLLMModel(LLM):
             default_block_size = 128 if is_npu_available() else 256
         else:
             default_block_size = 16
-        model_config.setdefault("block_size", default_block_size)
+        # V4.1 has a different sparse-attention cache layout; let vLLM choose
+        # its block size rather than inheriting the generic or V4 defaults.
+        if "DeepseekV41ForCausalLM" not in architectures:
+            model_config.setdefault("block_size", default_block_size)
         if VLLM_VERSION < version.parse("0.18.0"):
             model_config.setdefault("swap_space", 4)
         model_config.setdefault("gpu_memory_utilization", 0.90)
@@ -1683,6 +1743,22 @@ class VLLMModel(LLM):
         )
 
     @staticmethod
+    def _get_completion_usage(request_output: "RequestOutput") -> CompletionUsage:
+        prompt_tokens = len(request_output.prompt_token_ids)
+        completion_tokens = sum(
+            len(output.token_ids) for output in request_output.outputs
+        )
+        usage = CompletionUsage(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=prompt_tokens + completion_tokens,
+        )
+        cached_tokens = getattr(request_output, "num_cached_tokens", None)
+        if cached_tokens is not None:
+            usage["prompt_tokens_details"] = {"cached_tokens": cached_tokens}
+        return usage
+
+    @staticmethod
     def _convert_request_output_to_completion(
         request_id: str, model: str, request_output: "RequestOutput"
     ) -> Completion:
@@ -1699,15 +1775,7 @@ class VLLMModel(LLM):
                 )
             )
 
-        prompt_tokens = len(request_output.prompt_token_ids)
-        completion_tokens = sum(
-            len(output.token_ids) for output in request_output.outputs
-        )
-        usage = CompletionUsage(
-            prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
-            total_tokens=prompt_tokens + completion_tokens,
-        )
+        usage = VLLMModel._get_completion_usage(request_output)
         return Completion(
             id=request_id,
             object="text_completion",
@@ -1985,6 +2053,18 @@ class VLLMModel(LLM):
                 )
             sampling_params = SamplingParams(**sanitized_generate_config)
 
+        if generate_config and "_pd_kv_transfer_params" in generate_config:
+            from .xavier.transport import uses_direct_handoff
+
+            if self._nixl_config is None and not uses_direct_handoff(
+                self._xavier_config
+            ):
+                raise ValueError("KV handoff requires NIXL or Xavier direct PD")
+            sampling_params.extra_args = {
+                **(sampling_params.extra_args or {}),
+                "kv_transfer_params": generate_config["_pd_kv_transfer_params"],
+            }
+
         prompt_or_token_ids: Union[str, Dict[str, Any], List[int]] = prompt
         if sampling_params.max_tokens is None:
             # no max_tokens set, try to get the max tokens
@@ -2002,6 +2082,29 @@ class VLLMModel(LLM):
 
         if not request_id:
             request_id = str(uuid.uuid1())
+
+        xavier_config = getattr(self, "_xavier_config", None)
+        if (
+            xavier_config
+            and xavier_config.get("heterogeneous")
+            and generate_config
+            and "_pd_kv_transfer_params" in generate_config
+        ):
+            from ..xavier.pd_contract import prepare_pd_request
+
+            if isinstance(prompt_or_token_ids, str):
+                prompt_or_token_ids = await self._gen_tokens_prompt(
+                    await self._get_tokenizer(lora_request),
+                    prompt_or_token_ids,
+                    cast(dict, sanitized_generate_config),
+                )
+            if isinstance(prompt_or_token_ids, list):
+                prompt_or_token_ids = {"prompt_token_ids": prompt_or_token_ids}
+            await prepare_pd_request(
+                xavier_config,
+                cast(Dict[str, Any], prompt_or_token_ids)["prompt_token_ids"],
+                sampling_params.extra_args["kv_transfer_params"],
+            )
 
         assert self._engine is not None
         start_wall_time = time.time()
@@ -2025,12 +2128,17 @@ class VLLMModel(LLM):
             previous_texts = [""] * sanitized_generate_config["n"]
             previous_logprobs_counts = [0] * sanitized_generate_config["n"]
             prompt_tokens, completion_tokens, total_tokens = 0, 0, 0
+            usage = CompletionUsage(
+                prompt_tokens=0, completion_tokens=0, total_tokens=0
+            )
             complete_response = ""
             match_tool_call_tmp_results = []
             is_match_tool_call = False
             chunk = None
             finish_reason = None
             async for _request_output in results_generator:
+                if _request_output.finished:
+                    self._log_pd_request_metrics(_request_output)
                 chunk, finish_reason = self._convert_request_output_to_completion_chunk(
                     request_id=request_id,
                     model=self.model_uid,
@@ -2050,16 +2158,11 @@ class VLLMModel(LLM):
                         previous_logprobs_counts[i] = current_count
                     complete_response += delta
 
-                prompt_tokens = len(_request_output.prompt_token_ids)
-                completion_tokens = sum(
-                    len(output.token_ids) for output in _request_output.outputs
-                )
-                total_tokens = prompt_tokens + completion_tokens
-                chunk["usage"] = CompletionUsage(
-                    prompt_tokens=prompt_tokens,
-                    completion_tokens=completion_tokens,
-                    total_tokens=total_tokens,
-                )
+                usage = self._get_completion_usage(_request_output)
+                prompt_tokens = usage["prompt_tokens"]
+                completion_tokens = usage["completion_tokens"]
+                total_tokens = usage["total_tokens"]
+                chunk["usage"] = usage
 
                 if tools:
                     """
@@ -2122,7 +2225,7 @@ class VLLMModel(LLM):
             )
 
             # match OpenAI API stream
-            yield generate_completion_chunk(
+            final_chunk = generate_completion_chunk(
                 chunk_text="",
                 finish_reason=finish_reason,
                 chunk_id=request_id,
@@ -2131,6 +2234,8 @@ class VLLMModel(LLM):
                 completion_tokens=completion_tokens,
                 total_tokens=total_tokens,
             )
+            final_chunk["usage"] = usage
+            yield final_chunk
 
             if include_usage:
                 chunk = CompletionChunk(
@@ -2140,11 +2245,7 @@ class VLLMModel(LLM):
                     model=self.model_uid,
                     choices=[],
                 )
-                chunk["usage"] = CompletionUsage(
-                    prompt_tokens=prompt_tokens,
-                    completion_tokens=completion_tokens,
-                    total_tokens=total_tokens,
-                )
+                chunk["usage"] = usage
                 yield chunk
 
         if stream:
@@ -2155,9 +2256,65 @@ class VLLMModel(LLM):
                 final_output = request_output
 
             assert final_output is not None
-            return self._convert_request_output_to_completion(
+            transfer = getattr(final_output, "kv_transfer_params", None)
+            if (
+                xavier_config
+                and xavier_config.get("heterogeneous")
+                and isinstance(transfer, dict)
+                and transfer.get("xavier_error")
+            ):
+                raise RuntimeError(transfer["xavier_error"])
+            self._log_pd_request_metrics(final_output)
+            completion = self._convert_request_output_to_completion(
                 request_id, model=self.model_uid, request_output=final_output
             )
+            from .xavier.transport import uses_direct_handoff
+
+            if (
+                self._nixl_config is not None and self._nixl_config["role"] == "prefill"
+            ) or (
+                uses_direct_handoff(self._xavier_config)
+                and self._xavier_config.get("role") == "prefill"
+            ):
+                completion["_pd_kv_transfer_params"] = getattr(
+                    final_output, "kv_transfer_params", None
+                )
+            return completion
+
+    def _log_pd_request_metrics(self, output: Any) -> None:
+        config = self._nixl_config or self._xavier_config
+        metrics = getattr(output, "metrics", None)
+        if not config or metrics is None or not logger.isEnabledFor(logging.DEBUG):
+            return
+        fields = (
+            (
+                "arrival_time",
+                "queued_ts",
+                "scheduled_ts",
+                "first_token_ts",
+                "last_token_ts",
+                "first_token_latency",
+            )
+            if VLLM_VERSION >= version.parse("0.21.0")
+            else (
+                "arrival_time",
+                "first_scheduled_time",
+                "first_token_time",
+                "finished_time",
+                "time_in_queue",
+                "scheduler_time",
+                "model_forward_time",
+                "model_execute_time",
+            )
+        )
+        values = {name: getattr(metrics, name, None) for name in fields}
+        logger.debug(
+            "PD engine metrics: model=%s role=%s request=%s metrics=%s",
+            self.model_uid,
+            config.get("role"),
+            output.request_id,
+            values,
+        )
 
     def _track_engine_request(self, request_id: str, results_generator: Any) -> Any:
         """Track a vLLM request and abort it when consumption ends early."""
@@ -2168,6 +2325,15 @@ class VLLMModel(LLM):
             completed = False
             try:
                 async for request_output in results_iterator:
+                    # vLLM V1 reports failed KV loads as terminal outputs, not
+                    # exceptions. Raise before either completion conversion path.
+                    if any(
+                        output.finish_reason == "error"
+                        for output in getattr(request_output, "outputs", ())
+                    ):
+                        raise RuntimeError(
+                            f"vLLM request {request_id} failed (finish_reason=error)"
+                        )
                     yield request_output
                 completed = True
             finally:
@@ -2242,6 +2408,12 @@ class VLLMChatModel(VLLMModel, ChatModelMixin):
                 False,
                 "vLLM chat mode supports pytorch/gptq/awq/fp4/fp8/bnb/ggufv2 formats only",
             )
+        model_family = llm_family.model_family or llm_family.model_name
+        if model_family == "glm-5.3":
+            if _get_effective_vllm_version_for_family(llm_family) < version.parse(
+                "0.28.0"
+            ):
+                return False, "GLM-5.3 requires vLLM >= 0.28.0"
         is_ling3 = llm_family.has_architecture("BailingMoeV3ForCausalLM")
         if is_ling3:
             if llm_spec.model_format not in ("pytorch", "fp8", "fp4"):
@@ -2380,6 +2552,11 @@ class VLLMChatModel(VLLMModel, ChatModelMixin):
             )
             or {}
         )
+        if model_family == "glm-5.3":
+            # The shared parser normalizes this always-thinking model. Pass
+            # the effective mode to decoding too, to retain special tokens.
+            generate_config = dict(generate_config or {})
+            generate_config["chat_template_kwargs"] = chat_template_kwargs
         chat_context_var.set(chat_template_kwargs)
         full_context_kwargs = chat_template_kwargs.copy()
         if tools:
@@ -2435,10 +2612,16 @@ class VLLMChatModel(VLLMModel, ChatModelMixin):
             )
             assert not isinstance(c, AsyncGenerator)
             if tools:
-                return self._post_process_completion(
+                result = self._post_process_completion(
                     self.model_family, self.model_uid, c
                 )
-            return self._to_chat_completion(c, self.reasoning_parser)
+            else:
+                result = self._to_chat_completion(c, self.reasoning_parser)
+            if "_pd_kv_transfer_params" in c:
+                result["_pd_kv_transfer_params"] = cast(Dict[str, Any], c)[
+                    "_pd_kv_transfer_params"
+                ]
+            return result
 
 
 class VLLMMultiModel(VLLMModel, ChatModelMixin):
@@ -2481,6 +2664,13 @@ class VLLMMultiModel(VLLMModel, ChatModelMixin):
                     return False, "gptq quantization must be 4 bit for vLLM <0.3.3"
         supported_architectures = list(VLLM_SUPPORTED_MULTI_MODEL_LIST)
         effective_version = _get_effective_vllm_version_for_family(llm_family)
+        if llm_family.has_architecture("DeepseekV41ForCausalLM"):
+            if effective_version < version.parse("0.30.0.dev0"):
+                return (
+                    False,
+                    "DeepSeek-V4.1-Flash requires vLLM >= 0.30.0.dev0 (nightly with DeepseekV41 support)",
+                )
+            _append_unique(supported_architectures, "DeepseekV41ForCausalLM")
         if effective_version >= version.parse("0.22.0"):
             _append_unique(
                 supported_architectures, "MiniCPMV4_6ForConditionalGeneration"
@@ -2720,7 +2910,10 @@ class VLLMMultiModel(VLLMModel, ChatModelMixin):
                 chat_template = getattr(tokenizer, "chat_template", None)
         if not chat_template:
             supports_native_renderer = (
-                model_family in KIMI_K3_TOOL_CALL_FAMILY
+                (
+                    model_family in KIMI_K3_TOOL_CALL_FAMILY
+                    or self.model_family.has_architecture("DeepseekV41ForCausalLM")
+                )
                 and tokenizer is not None
                 and callable(getattr(tokenizer, "apply_chat_template", None))
             )
@@ -2764,6 +2957,13 @@ class VLLMMultiModel(VLLMModel, ChatModelMixin):
                 ):
                     self._handle_base64_media(messages, temp_dir)
 
+                # The V4.1 prompt encoder accepts OpenAI image_url parts,
+                # while the media readers below need Qwen image parts.
+                prompt_messages = (
+                    messages
+                    if self.model_family.has_architecture("DeepseekV41ForCausalLM")
+                    else None
+                )
                 messages = self._transform_messages(messages)
 
                 chat_template_kwargs = (
@@ -2772,6 +2972,14 @@ class VLLMMultiModel(VLLMModel, ChatModelMixin):
                     )
                     or {}
                 )
+                # V4.1's native tokenizer lets effort="none" override both
+                # thinking flags. Keep response parsing in the same mode.
+                if (
+                    self.model_family.has_architecture("DeepseekV41ForCausalLM")
+                    and chat_template_kwargs.get("reasoning_effort") == "none"
+                ):
+                    chat_template_kwargs["enable_thinking"] = False
+                    chat_template_kwargs["thinking"] = False
                 chat_context_var.set(chat_template_kwargs)
                 full_context_kwargs = chat_template_kwargs.copy()
                 if tools and (
@@ -2780,6 +2988,7 @@ class VLLMMultiModel(VLLMModel, ChatModelMixin):
                     or model_family in GLM5_TOOL_CALL_FAMILY
                     or model_family in KIMI_K3_TOOL_CALL_FAMILY
                     or model_family in MINICPM5_TOOL_CALL_FAMILY
+                    or self.model_family.has_architecture("DeepseekV41ForCausalLM")
                 ):
                     full_context_kwargs["tools"] = tools
                 assert self.model_family.chat_template is not None
@@ -2809,7 +3018,10 @@ class VLLMMultiModel(VLLMModel, ChatModelMixin):
                     )
 
                 prompt = self.get_full_context(
-                    messages, chat_template, tokenizer=tokenizer, **full_context_kwargs
+                    prompt_messages if prompt_messages is not None else messages,
+                    chat_template,
+                    tokenizer=tokenizer,
+                    **full_context_kwargs,
                 )
             else:
                 # get_specific_prompt fetches through load_media_bytes, so the urls
@@ -2865,7 +3077,13 @@ class VLLMMultiModel(VLLMModel, ChatModelMixin):
             )
             assert not isinstance(c, AsyncGenerator)
             if tools:
-                return self._post_process_completion(
+                result = self._post_process_completion(
                     self.model_family, self.model_uid, c
                 )
-            return self._to_chat_completion(c, self.reasoning_parser)
+            else:
+                result = self._to_chat_completion(c, self.reasoning_parser)
+            if "_pd_kv_transfer_params" in c:
+                result["_pd_kv_transfer_params"] = cast(Dict[str, Any], c)[
+                    "_pd_kv_transfer_params"
+                ]
+            return result

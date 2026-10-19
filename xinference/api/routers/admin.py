@@ -629,6 +629,7 @@ async def reset_monitor_config(request: Request) -> JSONResponse:
 
 _FIELD_NAME_RE = re.compile(r"^[a-zA-Z0-9_.@]+$")
 _TEXT_FIELDS = {"message", "error.message"}
+_LOG_NODE_FIELDS = ("address", "address.keyword", "node", "node.keyword")
 _LOG_SOURCE_EXCLUDES = ["@version", "request_body", "request_body_raw"]
 _LOG_SEARCH_TEXT_FIELDS = ["message", "error.message"]
 _LOG_SEARCH_PREFIX_FIELDS = ["request_id", "correlation_id"]
@@ -853,6 +854,23 @@ def _build_log_search_clause(query: str) -> dict[str, Any]:
     }
 
 
+def _build_log_exact_filter_clause(
+    field_name: str, values: list[str], *, multiple: bool
+) -> dict[str, Any]:
+    # ``node`` is the physical hostname stored in the log record. It must stay
+    # independent of the address-based field selected for node aggregation.
+    # Query both mappings so this filter also works with legacy indices where
+    # the exact value is exposed only through ``node.keyword``.
+    fields = ("node", "node.keyword") if field_name == "node" else (field_name,)
+    query_type = "terms" if multiple else "term"
+    clauses = [
+        {query_type: {field: values if multiple else values[0]}} for field in fields
+    ]
+    if len(clauses) == 1:
+        return clauses[0]
+    return {"bool": {"should": clauses, "minimum_should_match": 1}}
+
+
 async def search_logs(
     q: str = "",
     level: str = "",
@@ -878,8 +896,7 @@ async def search_logs(
     size = max(1, min(size, 500))
     page_from = max(0, page_from)
     time_from, time_to = _freeze_es_time_bounds(time_from, time_to)
-    if node_field not in ("node", "node.keyword"):
-        node_field = "node"
+    node_field = _normalize_log_node_field(node_field)
 
     must = []
     filter_clauses: list[dict[str, Any]] = [
@@ -912,8 +929,6 @@ async def search_logs(
         op = token[0]
         field_name = token[1:sep]
         field_value = token[sep + 1 :]
-        if field_name == "node":
-            field_name = node_field
         if not _FIELD_NAME_RE.match(field_name) or not field_value:
             continue
         if op == "+":
@@ -922,7 +937,11 @@ async def search_logs(
             if field_name in _TEXT_FIELDS:
                 must_not.append({"match_phrase": {field_name: field_value}})
             else:
-                must_not.append({"term": {field_name: field_value}})
+                must_not.append(
+                    _build_log_exact_filter_clause(
+                        field_name, [field_value], multiple=False
+                    )
+                )
 
     for field_name, values in plus_filters.items():
         if field_name in _TEXT_FIELDS:
@@ -934,7 +953,9 @@ async def search_logs(
                 }
             )
         else:
-            filter_clauses.append({"terms": {field_name: values}})
+            filter_clauses.append(
+                _build_log_exact_filter_clause(field_name, values, multiple=True)
+            )
 
     query: dict[str, Any] = {
         "bool": {"must": must, "filter": filter_clauses, "must_not": must_not}
@@ -974,6 +995,31 @@ async def search_logs(
     return JSONResponse(content={"hits": hits, "total": total})
 
 
+def _normalize_log_node_field(value: str) -> str:
+    return value if value in _LOG_NODE_FIELDS else "node"
+
+
+def _normalize_log_node_role(value: Any) -> Optional[str]:
+    normalized = str(value or "").lower()
+    for role in ("supervisor", "worker", "local", "unknown"):
+        if role in normalized:
+            return role
+    return None
+
+
+def _get_log_node_role(bucket: dict[str, Any]) -> Optional[str]:
+    hits = bucket.get("latest_identity", {}).get("hits", {}).get("hits", [])
+    for hit in hits:
+        source = hit.get("_source", {})
+        if not isinstance(source, dict):
+            continue
+        for field in ("node_role", "role", "log_type"):
+            role = _normalize_log_node_role(source.get(field))
+            if role:
+                return role
+    return None
+
+
 async def list_log_nodes() -> JSONResponse:
     es_url = os.environ.get("XINFERENCE_ES_URL", "")
     if not es_url:
@@ -995,7 +1041,25 @@ async def list_log_nodes() -> JSONResponse:
     url = f"{es_url.rstrip('/')}/{es_index}/_search"
 
     async def _aggregate(field: str) -> Optional[list[dict[str, Any]]]:
-        body = {"size": 0, "aggs": {"nodes": {"terms": {"field": field, "size": 200}}}}
+        body = {
+            "size": 0,
+            "aggs": {
+                "nodes": {
+                    "terms": {"field": field, "size": 200},
+                    "aggs": {
+                        "latest_identity": {
+                            "top_hits": {
+                                "size": 5,
+                                "sort": [{"@timestamp": {"order": "desc"}}],
+                                "_source": {
+                                    "includes": ["node_role", "role", "log_type"]
+                                },
+                            }
+                        }
+                    },
+                }
+            },
+        }
         timeout = aiohttp.ClientTimeout(total=10)
         async with aiohttp.ClientSession(timeout=timeout, auth=auth) as session:
             async with session.post(url, json=body, headers=headers) as resp:
@@ -1005,13 +1069,22 @@ async def list_log_nodes() -> JSONResponse:
         return data.get("aggregations", {}).get("nodes", {}).get("buckets", [])
 
     try:
-        # "node" is usually a keyword field; fall back to "node.keyword" if the
-        # mapping is text (terms aggregation requires a keyword/fielddata field).
-        buckets = await _aggregate("node")
-        node_field = "node"
-        if buckets is None:
-            buckets = await _aggregate("node.keyword")
-            node_field = "node.keyword"
+        # Prefer the Xinference role address used by cluster information and
+        # runtime logs. Older indices may only contain the physical node name.
+        first_success: Optional[tuple[str, list[dict[str, Any]]]] = None
+        selected: Optional[tuple[str, list[dict[str, Any]]]] = None
+        for field in _LOG_NODE_FIELDS:
+            field_buckets = await _aggregate(field)
+            if field_buckets is None:
+                continue
+            if first_success is None:
+                first_success = (field, field_buckets)
+            if field_buckets:
+                selected = (field, field_buckets)
+                break
+
+        if selected is None:
+            selected = first_success
     except (aiohttp.ClientError, asyncio.TimeoutError) as e:
         logger.error("ES connection error or timeout: %s", e)
         raise HTTPException(
@@ -1019,12 +1092,31 @@ async def list_log_nodes() -> JSONResponse:
             detail="Failed to connect to Elasticsearch or query timed out",
         )
 
-    if buckets is None:
-        logger.error("ES node aggregation failed for both 'node' and 'node.keyword'")
+    if selected is None:
+        logger.error(
+            "ES node aggregation failed for fields: %s", ", ".join(_LOG_NODE_FIELDS)
+        )
         raise HTTPException(status_code=502, detail="Elasticsearch query failed")
 
-    nodes = [b["key"] for b in buckets if b.get("key")]
-    return JSONResponse(content={"nodes": nodes, "node_field": node_field})
+    node_field, buckets = selected
+
+    nodes = [bucket["key"] for bucket in buckets if bucket.get("key")]
+    node_roles = {}
+    for bucket in buckets:
+        node = bucket.get("key")
+        if not node:
+            continue
+        role = _get_log_node_role(bucket)
+        if role:
+            node_roles[node] = role
+
+    return JSONResponse(
+        content={
+            "nodes": nodes,
+            "node_field": node_field,
+            "node_roles": node_roles,
+        }
+    )
 
 
 async def search_logs_context(
@@ -1044,8 +1136,7 @@ async def search_logs_context(
     es_auth = os.environ.get("XINFERENCE_ES_AUTH", "")
 
     size = max(1, min(size, 50))
-    if node_field not in ("node", "node.keyword"):
-        node_field = "node"
+    node_field = _normalize_log_node_field(node_field)
 
     node_filter: list[dict[str, Any]] = []
     if node:
@@ -1481,6 +1572,19 @@ def _es_substring_clause(field_name: str, value: str) -> dict[str, Any]:
     }
 
 
+def _es_exact_terms_clause(field_name: str, values: list[str]) -> dict[str, Any]:
+    """Build an exact query compatible with direct and dynamic ES mappings."""
+    return {
+        "bool": {
+            "should": [
+                {"terms": {field: values}}
+                for field in (field_name, f"{field_name}.keyword")
+            ],
+            "minimum_should_match": 1,
+        }
+    }
+
+
 _AUDIT_TEXT_FILTER_FIELDS = (
     "user",
     "api_key_name",
@@ -1638,6 +1742,7 @@ async def _search_audit_from_file(
     client_ip: str,
     page_from: int,
     size: int,
+    request_id: str = "",
 ) -> JSONResponse:
     """Fallback: search audit events from local audit.log file."""
     from ...constants import XINFERENCE_LOG_DIR
@@ -1665,6 +1770,11 @@ async def _search_audit_from_file(
     auth_type_set = (
         {v.strip().lower() for v in auth_type.split(",") if v.strip()}
         if auth_type
+        else set()
+    )
+    request_id_candidates = (
+        set(_correlated_request_id_candidates(_validate_request_id(request_id)))
+        if request_id
         else set()
     )
 
@@ -1716,6 +1826,11 @@ async def _search_audit_from_file(
                         ("auth_type", auth_type_set),
                     )
                     if allowed
+                ):
+                    continue
+                if (
+                    request_id_candidates
+                    and entry.get("request_id") not in request_id_candidates
                 ):
                     continue
 
@@ -1879,9 +1994,15 @@ async def search_audit_logs(
     auth_type: str = "",
     status: str = "",
     client_ip: str = "",
+    request_id: str = "",
     page_from: int = 0,
     size: int = 50,
 ) -> JSONResponse:
+    request_id_candidates = (
+        _correlated_request_id_candidates(_validate_request_id(request_id))
+        if request_id
+        else []
+    )
     es_url = os.environ.get("XINFERENCE_ES_URL", "")
     if not es_url:
         return await _search_audit_from_file(
@@ -1898,6 +2019,7 @@ async def search_audit_logs(
             client_ip=client_ip,
             page_from=page_from,
             size=size,
+            request_id=request_id,
         )
 
     from ...constants import XINFERENCE_AUDIT_ES_INDEX
@@ -1913,6 +2035,10 @@ async def search_audit_logs(
     filter_clauses: list[dict[str, Any]] = [
         {"range": {"@timestamp": {"gte": time_from, "lte": time_to}}}
     ]
+    if request_id_candidates:
+        filter_clauses.append(
+            _es_exact_terms_clause("request_id", request_id_candidates)
+        )
 
     for field_name, value in [
         ("user", user),

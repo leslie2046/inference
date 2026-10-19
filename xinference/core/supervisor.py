@@ -239,10 +239,13 @@ class ReplicaInfo:
 class SupervisorActor(xo.StatelessActor):
     def __init__(self):
         self._pd_model_mapping: Dict[str, Any] = {}
+        self._xavier_cache_mapping: Dict[str, xo.ActorRefType] = {}
+        self._xavier_source_mapping: Dict[str, List[xo.ActorRefType]] = {}
         self._pd_roles: Dict[str, Dict[int, str]] = {}
         super().__init__()
         self._worker_address_to_worker: Dict[str, xo.ActorRefType["WorkerActor"]] = {}  # type: ignore
         self._worker_status: Dict[str, WorkerStatus] = {}  # type: ignore
+        self._extension_worker_resources: Dict[str, Dict[str, Any]] = {}
         self._worker_metadata: Dict[str, Dict[str, Any]] = {}
         self._worker_metadata_generation: Dict[str, int] = {}
         self._worker_metadata_next_generation = 0
@@ -258,6 +261,8 @@ class SupervisorActor(xo.StatelessActor):
             ],
         ] = {}
         self._model_uid_to_replica_info: Dict[str, ReplicaInfo] = {}  # type: ignore
+        self._model_reload_status: Dict[str, Dict[str, Any]] = {}
+        self._model_reload_tasks: Dict[str, asyncio.Task] = {}
         self._uptime = None
         self._lock = asyncio.Lock()
         # Scale operations may interleave because SupervisorActor is stateless.
@@ -900,6 +905,9 @@ class SupervisorActor(xo.StatelessActor):
                 )
 
     async def __post_create__(self):
+        from ..extensions import get_extensions
+
+        get_extensions()
         self._uptime = time.time()
         if XINFERENCE_ENABLE_OTEL:
             try:
@@ -1063,10 +1071,10 @@ class SupervisorActor(xo.StatelessActor):
                 signal.SIGTERM, lambda: asyncio.create_task(signal_handler())
             )
 
-        from ..model.llm.vllm.xavier.block_tracker import VLLMBlockTracker
-        from ..model.llm.vllm.xavier.collective_manager import CollectiveManager
+        from ..model.llm.xavier.block_tracker import BlockTracker
+        from ..model.llm.xavier.collective_manager import CollectiveManager
 
-        self._block_tracker_mapping: Dict[str, xo.ActorRefType[VLLMBlockTracker]] = {}  # type: ignore
+        self._block_tracker_mapping: Dict[str, xo.ActorRefType[BlockTracker]] = {}  # type: ignore
         self._collective_manager_mapping: Dict[  # type: ignore
             str, xo.ActorRefType[CollectiveManager]
         ] = {}
@@ -1648,8 +1656,13 @@ class SupervisorActor(xo.StatelessActor):
         return max_gpu_count
 
     async def _choose_worker(
-        self, available_workers: Optional[List[str]] = None
+        self,
+        available_workers: Optional[List[str]] = None,
+        *,
+        require_resource_admission: bool = False,
     ) -> xo.ActorRefType["WorkerActor"]:
+        from ..extensions import get_extensions
+
         # TODO: better allocation strategy.
         min_running_model_count = None
         target_worker = None
@@ -1657,6 +1670,16 @@ class SupervisorActor(xo.StatelessActor):
         for worker_addr, worker in self._worker_address_to_worker.items():
             if available_workers and worker_addr not in available_workers:
                 continue
+            if require_resource_admission and get_extensions():
+                try:
+                    self.get_worker_resource_policy(worker_addr)
+                except Exception as error:
+                    logger.warning(
+                        "Worker %s rejected during launch placement: %s",
+                        worker_addr,
+                        error,
+                    )
+                    continue
             running_model_count = await worker.get_model_count()
             if (
                 min_running_model_count is None
@@ -2973,6 +2996,21 @@ class SupervisorActor(xo.StatelessActor):
         **kwargs,
     ) -> str:
         n_worker = normalize_n_worker(n_worker)
+        from ..model.llm.weight_cache import parse_weight_cache_option
+
+        if parse_weight_cache_option(kwargs.get("enable_weight_cache", False)):
+            if (model_type or "LLM").lower() != "llm":
+                raise ValueError("enable_weight_cache requires an LLM model")
+            if (model_engine or "").lower() not in ("vllm", "sglang"):
+                raise ValueError("enable_weight_cache requires vLLM or SGLang")
+            if (
+                n_worker != 1
+                or replica != 1
+                or (replica_config is not None and len(replica_config) != 1)
+            ):
+                raise ValueError(
+                    "enable_weight_cache currently requires one worker and one replica"
+                )
         if (model_type or "").lower() == "audio":
             from ..model.audio.core import resolve_audio_model_name_and_engine
 
@@ -3094,12 +3132,142 @@ class SupervisorActor(xo.StatelessActor):
         from ..model.llm.vllm.xavier.transport import normalize_xavier_transport_backend
 
         transport_backend = normalize_xavier_transport_backend(transport_backend)
+        if transport_backend == "nixl" and not pd_enabled:
+            raise ValueError("NIXL requires explicit prefill and decode replica roles")
+        replica_engines = [
+            (cfg.model_engine or model_engine or "").lower()
+            for cfg in replica_config or []
+        ]
+        heterogeneous_pd = pd_enabled and len(set(replica_engines)) > 1
+        host_handoff = heterogeneous_pd and "mlx" in replica_engines
+        if (
+            pd_enabled
+            and not heterogeneous_pd
+            and any(cfg.model_engine for cfg in replica_config or [])
+        ):
+            model_engine = next(
+                cfg.model_engine for cfg in replica_config or [] if cfg.model_engine
+            )
+        if heterogeneous_pd and transport_backend != "xavier":
+            raise ValueError(
+                "Cross-engine PD requires Xavier transport"
+                if host_handoff
+                else "Cross-engine PD requires Xavier GPU transport"
+            )
         # Xavier-related
+        requested_xavier = bool(kwargs.pop("enable_xavier", False))
+        if (
+            requested_xavier
+            and not pd_enabled
+            and replica <= 1
+            and (model_engine or "").lower() in ("mlx", "sglang")
+        ):
+            logger.warning("Enabling xavier when replica<=1 is meaningless.")
+            requested_xavier = False
+        mlx_xavier = (
+            (requested_xavier or pd_enabled)
+            and transport_backend == "xavier"
+            and (model_engine or "").lower() == "mlx"
+            and not heterogeneous_pd
+        )
+        if (
+            (requested_xavier or pd_enabled)
+            and (model_engine or "").lower() == "mlx"
+            and not heterogeneous_pd
+        ):
+            if transport_backend != "xavier":
+                raise ValueError("MLX Xavier requires the xavier transport")
+            if (
+                model_type not in (None, "LLM")
+                or model_format != "mlx"
+                or quantization not in (None, "none", "fp16", "bf16")
+            ):
+                raise ValueError("MLX Xavier requires unquantized MLX text weights")
+            kwargs["_xavier_cache_config"] = {
+                "address": self.address,
+                "uid": f"xavier-cache-{model_uid}",
+            }
+        sglang_xavier = (
+            (requested_xavier or pd_enabled)
+            and transport_backend == "xavier"
+            and model_engine is not None
+            and model_engine.lower() == "sglang"
+            and not heterogeneous_pd
+        )
+        sglang_nixl = (
+            pd_enabled
+            and transport_backend == "nixl"
+            and model_engine is not None
+            and model_engine.lower() == "sglang"
+        )
+        if sglang_nixl and (requested_xavier or n_worker != 1):
+            raise ValueError(
+                "SGLang native NIXL requires one worker per replica without enable_xavier"
+            )
+        cache_bytes = kwargs.pop("xavier_cache_bytes", None)
+        mlx_prefill = host_handoff and any(
+            cfg.role == "prefill"
+            and (cfg.model_engine or model_engine or "").lower() == "mlx"
+            for cfg in (replica_config or [])
+        )
+        if cache_bytes is not None and (
+            not (mlx_xavier or mlx_prefill or sglang_xavier and not pd_enabled)
+            or type(cache_bytes) is not int
+            or cache_bytes <= 0
+        ):
+            raise ValueError(
+                "xavier_cache_bytes requires MLX Xavier or SGLang shared CPU caching and a positive integer"
+            )
+        if sglang_xavier and n_worker != 1:
+            raise ValueError(
+                "SGLang Xavier requires the xavier transport and one worker per replica"
+            )
+        if sglang_xavier or heterogeneous_pd:
+            if (
+                model_type not in (None, "LLM")
+                or (not host_handoff and model_format not in (None, "pytorch"))
+                or quantization not in (None, "none")
+            ):
+                raise ValueError(
+                    "Cross-engine Xavier PD requires unquantized PyTorch LLM weights"
+                    if heterogeneous_pd
+                    else "SGLang Xavier requires unquantized PyTorch LLM weights"
+                )
+            if host_handoff:
+                for cfg, engine in zip(replica_config or [], replica_engines):
+                    replica_format = cfg.engine_config.get("model_format", model_format)
+                    allowed_formats = ("mlx",) if engine == "mlx" else (None, "pytorch")
+                    if replica_format not in allowed_formats:
+                        raise ValueError(
+                            "NVIDIA/MLX PD requires PyTorch NVIDIA and MLX Metal weights"
+                        )
+        if sglang_xavier:
+            kwargs["_xavier_cache_config"] = {
+                "address": self.address,
+                "uid": f"xavier-cache-{model_uid}",
+            }
         enable_xavier: bool = (
-            (bool(kwargs.pop("enable_xavier", False)) or pd_enabled)
+            (requested_xavier or pd_enabled)
+            and transport_backend == "xavier"
             and model_engine is not None
             and model_engine.lower() == "vllm"
+            and not heterogeneous_pd
         )
+        from ..model.llm.xavier.transport import validate_gpu_cache_budget
+
+        gpu_cache_bytes = validate_gpu_cache_budget(
+            kwargs.pop("xavier_gpu_cache_bytes", None),
+            enable_xavier or sglang_xavier and pd_enabled or heterogeneous_pd,
+            replica,
+        )
+        if (sglang_xavier or heterogeneous_pd) and gpu_cache_bytes not in (None, 0):
+            raise ValueError(
+                "Cross-engine Xavier GPU PD does not yet support retained GPU history"
+                if heterogeneous_pd
+                else "SGLang Xavier GPU PD does not yet support retained GPU history"
+            )
+        if pd_enabled and enable_xavier and gpu_cache_bytes is None:
+            gpu_cache_bytes = 256 * 1024 * 1024
         store_address = None
         store_port = None
         world_size = None
@@ -3174,6 +3342,7 @@ class SupervisorActor(xo.StatelessActor):
                     ),
                     "vllm_transfer_backend_type": transport_backend,
                     "world_size": world_size,
+                    "gpu_cache_bytes": gpu_cache_bytes,
                     "store_address": store_address,
                     "store_port": store_port,
                 }
@@ -3201,27 +3370,99 @@ class SupervisorActor(xo.StatelessActor):
             _addr = worker_ref.address
             self._workers_launching[_addr] = self._workers_launching.get(_addr, 0) + 1
 
+            replica_kwargs = dict(kwargs)
+            replica_engine = model_engine
+            replica_path = model_path
+            replica_format = model_format
+            if pd_enabled:
+                assert replica_config is not None
+                cfg = replica_config[rank - 1]
+                replica_engine = cfg.model_engine or model_engine
+                replica_kwargs.update(cfg.engine_config)
+                replica_path = replica_kwargs.pop("model_path", model_path)
+                replica_format = replica_kwargs.pop("model_format", model_format)
+            if heterogeneous_pd:
+                assert replica_config is not None
+                from ..model.llm.xavier.transport import get_transport_host
+
+                replica_kwargs["_xavier_cache_config"] = {
+                    "address": self.address,
+                    "uid": f"xavier-cache-{model_uid}",
+                    "role": replica_config[rank - 1].role,
+                    "rank": rank,
+                    "host": get_transport_host(worker_ref.address),
+                    "heterogeneous": True,
+                    "gpu_cache_bytes": 0,
+                    "host_handoff": host_handoff,
+                }
+            if sglang_xavier and pd_enabled:
+                assert replica_config is not None
+                from ..model.llm.xavier.transport import get_transport_host
+
+                replica_kwargs["_xavier_cache_config"] = {
+                    **kwargs["_xavier_cache_config"],
+                    "role": replica_config[rank - 1].role,
+                    "rank": rank,
+                    "host": get_transport_host(worker_ref.address),
+                }
+            elif mlx_xavier and pd_enabled:
+                assert replica_config is not None
+                replica_kwargs["_xavier_cache_config"] = {
+                    **kwargs["_xavier_cache_config"],
+                    "role": replica_config[rank - 1].role,
+                }
+            if pd_enabled and transport_backend == "nixl":
+                assert replica_config is not None
+                replica_kwargs["_nixl_config"] = {
+                    "role": replica_config[rank - 1].role,
+                }
+                if sglang_nixl:
+                    from ..model.llm.xavier.transport import get_transport_host
+
+                    replica_kwargs["_nixl_config"]["host"] = get_transport_host(
+                        worker_ref.address
+                    )
             try:
+                if (
+                    heterogeneous_pd
+                    and (replica_engine or "").lower() == "mlx"
+                    and cfg.role == "prefill"
+                ):
+                    from ..model.llm.xavier.backends.bytes.pd import XavierHostPDSource
+
+                    source_uid = f"xavier-host-pd-{model_uid}-{rank}"
+                    source = await xo.create_actor(
+                        XavierHostPDSource,
+                        self._xavier_cache_mapping[model_uid],
+                        rank,
+                        capacity_bytes=cache_bytes or 512 * 1024**2,
+                        address=worker_ref.address,
+                        uid=source_uid,
+                    )
+                    self._xavier_source_mapping.setdefault(model_uid, []).append(source)
+                    replica_kwargs["_xavier_cache_config"].update(
+                        source_address=source.address, source_uid=source_uid
+                    )
                 subpool_address = await worker_ref.launch_builtin_model(
                     model_uid=_replica_model_uid,
                     model_name=model_name,
                     model_size_in_billions=model_size_in_billions,
-                    model_format=model_format,
+                    model_format=replica_format,
                     quantization=quantization,
-                    model_engine=model_engine,
+                    model_engine=replica_engine,
                     model_type=model_type,
                     n_gpu=n_gpu if replica_n_gpu is None else replica_n_gpu,
                     request_limits=request_limits,
                     peft_model_config=peft_model_config,
                     gpu_idx=replica_gpu_idx,
                     download_hub=download_hub,
-                    model_path=model_path,
+                    model_path=replica_path,
                     enable_virtual_env=enable_virtual_env,
                     virtual_env_packages=virtual_env_packages,
                     virtual_env_find_links=virtual_env_find_links,
                     envs=envs,
                     xavier_config=xavier_config,
-                    **kwargs,
+                    **replica_kwargs,
                 )
                 # Track the worker before waiting so a failed load is cleaned up.
                 # Worker.get_model rejects requests until wait_for_load completes.
@@ -3252,16 +3493,59 @@ class SupervisorActor(xo.StatelessActor):
         async def _launch_model():
             nonlocal download_hub
             try:
-                if enable_xavier:
-                    from ..model.llm.vllm.xavier.block_tracker import VLLMBlockTracker
-                    from ..model.llm.vllm.xavier.collective_manager import (
-                        CollectiveManager,
+                if heterogeneous_pd:
+                    from ..model.llm.sglang.xavier.directory import XavierPDDirectory
+
+                    cache_ref = await xo.create_actor(
+                        XavierPDDirectory,
+                        address=self.address,
+                        uid=f"xavier-cache-{model_uid}",
                     )
+                    if not hasattr(self, "_xavier_cache_mapping"):
+                        self._xavier_cache_mapping = {}
+                    self._xavier_cache_mapping[model_uid] = cache_ref
+                if sglang_xavier or mlx_xavier:
+                    if mlx_xavier:
+                        from ..model.llm.xavier.backends.bytes.storage import (
+                            XavierBytesCacheActor,
+                        )
+
+                        cache_ref = await xo.create_actor(
+                            XavierBytesCacheActor,
+                            capacity_bytes=cache_bytes or 512 * 1024 * 1024,
+                            address=self.address,
+                            uid=kwargs["_xavier_cache_config"]["uid"],
+                        )
+                    elif pd_enabled:
+                        from ..model.llm.sglang.xavier.directory import (
+                            XavierPDDirectory,
+                        )
+
+                        cache_ref = await xo.create_actor(
+                            XavierPDDirectory,
+                            address=self.address,
+                            uid=kwargs["_xavier_cache_config"]["uid"],
+                        )
+                    else:
+                        from ..model.llm.xavier.backends.torch.storage import (
+                            XavierCacheActor,
+                        )
+
+                        cache_ref = await xo.create_actor(
+                            XavierCacheActor,
+                            capacity_bytes=cache_bytes or 512 * 1024 * 1024,
+                            address=self.address,
+                            uid=kwargs["_xavier_cache_config"]["uid"],
+                        )
+                    self._xavier_cache_mapping[model_uid] = cache_ref
+                if enable_xavier:
+                    from ..model.llm.xavier.block_tracker import BlockTracker
+                    from ..model.llm.xavier.collective_manager import CollectiveManager
 
                     self._block_tracker_mapping[model_uid] = await xo.create_actor(
-                        VLLMBlockTracker,
+                        BlockTracker,
                         address=self.address,
-                        uid=f"{VLLMBlockTracker.default_uid()}-{model_uid}",
+                        uid=f"{BlockTracker.default_uid()}-{model_uid}",
                     )
                     self._collective_manager_mapping[model_uid] = await xo.create_actor(
                         CollectiveManager,
@@ -3311,11 +3595,16 @@ class SupervisorActor(xo.StatelessActor):
                             )
                             continue
                         if isinstance(alloc, Exception):
-                            logger.debug(
+                            from ..extensions import get_extensions
+
+                            log = logger.warning if get_extensions() else logger.debug
+                            log(
                                 "Failed to fetch GPU allocation snapshot from worker %s: %s",
                                 w_ref.address,
                                 alloc,
                             )
+                            if get_extensions():
+                                continue
                             alloc = None
                         worker_candidates.append(
                             {"ref": w_ref, "count": count, "alloc": alloc}
@@ -3423,7 +3712,6 @@ class SupervisorActor(xo.StatelessActor):
                     target_gpu_idx,
                     target_n_gpu,
                 ) in placements:
-
                     if enable_xavier and _idx == 0:
                         """
                         Start the rank 0 model actor on the worker that holds the rank 1 replica,
@@ -3512,6 +3800,12 @@ class SupervisorActor(xo.StatelessActor):
                     pd_ref = await xo.create_actor(
                         PDModelActor,
                         model_uid,
+                        transport_backend=transport_backend,
+                        model_engine=(
+                            "heterogeneous" if heterogeneous_pd else model_engine
+                        ),
+                        handoff_mode="host" if host_handoff else "gpu",
+                        mlx_prefill=mlx_prefill,
                         address=self.address,
                         uid=f"{model_uid}-{PDModelActor.default_uid()}",
                     )
@@ -3662,7 +3956,9 @@ class SupervisorActor(xo.StatelessActor):
                     )
                     worker_refs: List[xo.ActorRefType["WorkerActor"]] = []
                     for i_worker in range(n_worker):
-                        worker_ref = await self._choose_worker(remaining_workers)
+                        worker_ref = await self._choose_worker(
+                            remaining_workers, require_resource_admission=True
+                        )
                         if worker_ref.address in remaining_workers:
                             remaining_workers.remove(worker_ref.address)
                         self._model_uid_to_replica_info[
@@ -3799,9 +4095,11 @@ class SupervisorActor(xo.StatelessActor):
 
         for request_id, metadata in targets:
             try:
-                progress, info, details = (
-                    await self._progress_tracker.get_progress_details(request_id)
-                )
+                (
+                    progress,
+                    info,
+                    details,
+                ) = await self._progress_tracker.get_progress_details(request_id)
             except KeyError:
                 continue
 
@@ -4695,6 +4993,7 @@ class SupervisorActor(xo.StatelessActor):
                     await self._handle_dead_worker(address)
                     self._worker_status.pop(address, None)
                     self._worker_address_to_worker.pop(address, None)
+                    self._extension_worker_resources.pop(address, None)
                     self._discard_worker_metadata(address)
                     self._clear_worker_model_gpu_memory(address)
                 if dead_nodes:
@@ -4774,6 +5073,7 @@ class SupervisorActor(xo.StatelessActor):
                             await self._handle_dead_worker(address)
                             self._worker_status.pop(address, None)
                             self._worker_address_to_worker.pop(address, None)
+                            self._extension_worker_resources.pop(address, None)
                             self._discard_worker_metadata(address)
                             self._clear_worker_model_gpu_memory(address)
                             self._schedule_autostart()
@@ -4808,9 +5108,99 @@ class SupervisorActor(xo.StatelessActor):
                 logger.exception("Failed to monitor Router Agent lifecycle")
             await asyncio.sleep(XINFERENCE_TOKEN_ROUTER_AGENT_MONITOR_SECONDS)
 
+    def _get_reload_target(self, model_uid: str):
+        if model_uid not in self._model_uid_to_replica_info:
+            raise ValueError(f"Model not found: {model_uid}")
+        replicas = list(self._iter_active_replica_model_uids(model_uid))
+        if len(replicas) != 1:
+            raise ValueError("Weight-preserving reload currently requires one replica")
+        replica_uid = replicas[0]
+        workers = self._replica_model_uid_to_worker.get(replica_uid)
+        if not isinstance(workers, (list, tuple)):
+            workers = [workers]
+        if len(workers) != 1 or workers[0] is None:
+            raise ValueError("Weight-preserving reload currently requires one worker")
+        return replica_uid, workers[0]
+
+    async def get_model_reload_config(self, model_uid: str) -> Dict[str, Any]:
+        replica_uid, worker = self._get_reload_target(model_uid)
+        return await worker.get_model_reload_config(replica_uid)
+
+    async def get_model_reload_status(self, model_uid: str) -> Dict[str, Any]:
+        replica_uid, worker = self._get_reload_target(model_uid)
+        status = dict(self._model_reload_status.get(model_uid, {"status": "idle"}))
+        if status["status"] == "reloading":
+            status.update(await worker.get_model_reload_status(replica_uid))
+        return status
+
+    async def reload_model(
+        self, model_uid: str, config: Dict[str, Any], drain_timeout: float = 300
+    ) -> Dict[str, Any]:
+        import uuid
+
+        if model_uid in self._model_reload_tasks:
+            raise RuntimeError("This model already has a reload in progress")
+        async with self._get_model_replica_lock(model_uid):
+            if model_uid in self._model_reload_tasks:
+                raise RuntimeError("This model already has a reload in progress")
+            replica_uid, worker = self._get_reload_target(model_uid)
+            # Preflight runs before scheduling any operation that stops serving.
+            await worker.validate_model_reload(replica_uid, config)
+            status = {
+                "operation_id": str(uuid.uuid4()),
+                "model_uid": model_uid,
+                "status": "reloading",
+                "stage": "queued",
+                "started_at": time.time(),
+                "weights_reused": False,
+            }
+            self._model_reload_status[model_uid] = status
+
+            async def run() -> None:
+                try:
+                    if self._get_reload_target(model_uid) != (replica_uid, worker):
+                        raise ValueError("Model placement changed before reload")
+                    status["stage"] = "draining"
+                    await worker.reload_model(replica_uid, config, drain_timeout)
+                    status["weights_reused"] = True
+                    async with self._autostart_store_lock:
+                        await asyncio.to_thread(
+                            self._launch_history_store.update_autostart_launch_config,
+                            model_uid,
+                            config,
+                        )
+                except asyncio.CancelledError:
+                    status.update(status="cancelled", stage="cancelled")
+                    raise
+                except Exception as exc:
+                    status.update(status="error", stage="error", error=str(exc))
+                    try:
+                        status.update(await worker.get_model_reload_status(replica_uid))
+                    except Exception:
+                        pass
+                    logger.exception("Reload of %s failed", model_uid)
+                else:
+                    status.update(status="ready", stage="ready", weights_reused=True)
+                finally:
+                    status["finished_at"] = time.time()
+                    if (
+                        self._model_reload_tasks.get(model_uid)
+                        is asyncio.current_task()
+                    ):
+                        self._model_reload_tasks.pop(model_uid, None)
+                    self._invalidate_list_models_debounce_cache()
+
+            self._model_reload_tasks[model_uid] = asyncio.create_task(run())
+            return dict(status)
+
     @log_async(logger=logger)
     async def terminate_model(self, model_uid: str, suppress_exception=False):
         async with self._get_model_replica_lock(model_uid):
+            task = self._model_reload_tasks.pop(model_uid, None)
+            if task is not None:
+                # Do not await an actor RPC cancellation: a hung engine cannot
+                # acknowledge it. Worker termination forcibly removes the pool.
+                task.cancel()
             return await self._terminate_model(model_uid, suppress_exception)
 
     async def _terminate_model(self, model_uid: str, suppress_exception=False):
@@ -4844,6 +5234,7 @@ class SupervisorActor(xo.StatelessActor):
         if errors and not suppress_exception:
             raise errors[0]
         self._model_uid_to_replica_info.pop(model_uid, None)
+        self._model_reload_status.pop(model_uid, None)
         self._clear_unexpected_down_replicas(model_uid)
         for replica_model_uid in rep_model_uids:
             self._clear_replica_model_gpu_memory(replica_model_uid)
@@ -4875,6 +5266,8 @@ class SupervisorActor(xo.StatelessActor):
         self, n_gpu: Optional[Union[int, str]]
     ) -> Tuple[xo.ActorRefType["WorkerActor"], Optional[List[int]]]:
         """Select a scale-up target using launch-time load/GPU snapshots."""
+        from ..extensions import get_extensions
+
         workers = list(self._worker_address_to_worker.values())
         if not workers:
             raise RuntimeError("No available worker found")
@@ -4899,11 +5292,14 @@ class SupervisorActor(xo.StatelessActor):
                 )
                 continue
             if isinstance(alloc, Exception):
-                logger.debug(
+                log = logger.warning if get_extensions() else logger.debug
+                log(
                     "Failed to fetch GPU allocation snapshot from worker %s: %s",
                     worker_ref.address,
                     alloc,
                 )
+                if get_extensions():
+                    continue
                 alloc = None
             candidates.append({"ref": worker_ref, "count": count, "alloc": alloc})
 
@@ -4978,6 +5374,8 @@ class SupervisorActor(xo.StatelessActor):
             raise ValueError("The replica count to add must be at least 1")
         if replica_configs is not None and len(replica_configs) != replica:
             raise ValueError("replica_configs length must match replica")
+        if any(cfg.model_engine or cfg.engine_config for cfg in replica_configs or []):
+            raise ValueError("Per-replica engine settings require explicit PD roles")
 
         async with self._get_model_replica_lock(model_uid):
             results: List[Dict[str, Any]] = []
@@ -5030,6 +5428,14 @@ class SupervisorActor(xo.StatelessActor):
         ``worker_address`` for the caller.
         """
         # ---- 1. Look up the model ------------------------------------------------
+        if model_uid in self._pd_model_mapping:
+            raise ValueError(
+                "PD topology cannot be resized in place; terminate and relaunch the model"
+            )
+        if replica_config and (
+            replica_config.model_engine or replica_config.engine_config
+        ):
+            raise ValueError("Per-replica engine settings require explicit PD roles")
         replica_info = self._model_uid_to_replica_info.get(model_uid)
         if replica_info is None:
             raise ValueError(f"Model not found in the model list, uid: {model_uid}")
@@ -5065,6 +5471,12 @@ class SupervisorActor(xo.StatelessActor):
             )
 
         # ---- 5. Check scale-up eligibility ---------------------------------------
+        from ..model.llm.weight_cache import parse_weight_cache_option
+
+        if parse_weight_cache_option(launch_args.get("enable_weight_cache", False)):
+            raise ValueError(
+                "Adding replicas to weight-cached models is not supported."
+            )
         if launch_args.get("xavier_config"):
             raise ValueError(
                 "Adding replicas to Xavier-distributed models is not supported."
@@ -5394,6 +5806,7 @@ class SupervisorActor(xo.StatelessActor):
         keeps it for the failure gauge).
         """
         pd_ref = self._pd_model_mapping.pop(model_uid, None)
+        cache_ref = self._xavier_cache_mapping.pop(model_uid, None)
         self._pd_roles.pop(model_uid, None)
         if pd_ref is not None:
             try:
@@ -5401,6 +5814,20 @@ class SupervisorActor(xo.StatelessActor):
             except Exception:
                 logger.debug(
                     "Failed to destroy PD router for %s", model_uid, exc_info=True
+                )
+        for source in self._xavier_source_mapping.pop(model_uid, []):
+            try:
+                await xo.wait_for(xo.destroy_actor(source), timeout=5)
+            except Exception:
+                logger.warning(
+                    "Destroy Xavier host source failed for %s", model_uid, exc_info=True
+                )
+        if cache_ref is not None:
+            try:
+                await xo.destroy_actor(cache_ref)
+            except Exception:
+                logger.warning(
+                    "Destroy Xavier cache failed for %s", model_uid, exc_info=True
                 )
 
         rank0_uid = model_uid + "-rank0"
@@ -5970,7 +6397,7 @@ class SupervisorActor(xo.StatelessActor):
             ), "worker_ref must be a single worker"
             model_ref = await actor_call(
                 worker_ref,
-                "get_model",
+                "get_model_for_abort",
                 model_uid=rep_mid,
                 _rpc_operation_request_id=request_id,
             )
@@ -5991,6 +6418,11 @@ class SupervisorActor(xo.StatelessActor):
         return res
 
     async def __pre_destroy__(self) -> None:
+        # Finish retained-weight operations before tearing down actor state.
+        if self._model_reload_tasks:
+            await asyncio.gather(
+                *list(self._model_reload_tasks.values()), return_exceptions=True
+            )
         tasks = list(self._worker_metadata_refresh_tasks.values())
         self._worker_metadata_refresh_tasks.clear()
         self._worker_metadata_generation.clear()
@@ -6151,6 +6583,36 @@ class SupervisorActor(xo.StatelessActor):
         worker_ref = await xo.actor_ref(
             address=worker_address, uid=WorkerActor.default_uid()
         )
+        from ..extensions import get_extensions
+
+        expected = {extension.name for extension in get_extensions()}
+        try:
+            try:
+                resources = await worker_ref.get_extension_resources()
+            except AttributeError as error:
+                # Older upstream workers have no extension metadata RPC. Accept
+                # them only when this supervisor also has no extensions.
+                if "get_extension_resources" not in str(error):
+                    raise
+                if expected:
+                    raise RuntimeError(
+                        "Worker and supervisor extensions must match: "
+                        "worker does not support extensions"
+                    ) from error
+                resources = None
+            if set((resources or {}).get("extensions", {})) != expected:
+                raise RuntimeError("Worker and supervisor extensions must match")
+        except Exception:
+            # Rejected re-registration must not retain the old process's
+            # registration or extension inventory at this address.
+            self._worker_address_to_worker.pop(worker_address, None)
+            self._extension_worker_resources.pop(worker_address, None)
+            self._discard_worker_metadata(worker_address)
+            raise
+        if resources is not None:
+            self._extension_worker_resources[worker_address] = resources
+        else:
+            self._extension_worker_resources.pop(worker_address, None)
         self._worker_address_to_worker[worker_address] = worker_ref
 
         # Refresh static node metadata on every registration. Clear and cancel
@@ -6225,6 +6687,24 @@ class SupervisorActor(xo.StatelessActor):
             )
         self._schedule_autostart()
 
+    def get_worker_resource_policy(self, worker_address: str) -> List[int]:
+        from ..extensions import filter_worker_resources
+
+        resources = self._extension_worker_resources.get(worker_address)
+        if resources is None or worker_address not in self._worker_address_to_worker:
+            raise RuntimeError("Worker has not registered extension resources")
+        inventory = [
+            info
+            for address, info in self._extension_worker_resources.items()
+            if address in self._worker_address_to_worker
+        ]
+        return filter_worker_resources(resources, inventory)
+
+    def call_extension(self, name: str, operation: str, payload: Dict[str, Any]) -> Any:
+        from ..extensions import call_extension
+
+        return call_extension(name, operation, payload)
+
     async def update_system_settings(self, settings: Dict[str, Any]) -> None:
         """Apply settings locally and fan them out to registered workers."""
         from .system_settings_store import SystemSettings, apply_system_settings
@@ -6265,6 +6745,7 @@ class SupervisorActor(xo.StatelessActor):
             )
 
         self._worker_status.pop(worker_address, None)
+        self._extension_worker_resources.pop(worker_address, None)
         self._discard_worker_metadata(worker_address)
         self._clear_worker_model_gpu_memory(worker_address)
         self._invalidate_list_models_debounce_cache()

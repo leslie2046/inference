@@ -41,6 +41,126 @@ from ..virtual_env_manager import (
 )
 
 
+@pytest.mark.parametrize(
+    "torch_version, expected",
+    [
+        ("2.4.1", "==0.0.3"),
+        ("2.5.1", ">=0.1,<0.2"),
+        ("2.6.0", ">=0.2,<0.3"),
+        ("2.7.1", ">=0.3,<0.6"),
+        ("2.8.0", ">=0.6,<0.8"),
+        ("2.9.1+cu128", ">=0.8,<0.10"),
+        ("2.10.0", ">=0.10,<0.11"),
+        ("2.11.0", ">=0.11,<0.17"),
+        ("2.12.0", ">=0.12,<0.17"),
+    ],
+)
+@pytest.mark.parametrize("include_torch_pin", [False, True])
+def test_missing_system_torchcodec_uses_torch_compatibility(
+    monkeypatch, torch_version, expected, include_torch_pin
+):
+    from importlib import metadata
+
+    from packaging.requirements import Requirement
+    from xoscar.virtualenv.core import VirtualEnvManager
+
+    def version(name):
+        if name == "torch":
+            return torch_version
+        raise metadata.PackageNotFoundError(name)
+
+    monkeypatch.setattr(metadata, "version", version)
+    packages = ["#system_torchcodec#"]
+    if include_torch_pin:
+        packages.append("#system_torch#")
+    original = packages.copy()
+    result = ensure_system_torch_pin(packages)
+    # Exercise the downstream marker resolver: it must not see a bare codec.
+    assert [
+        Requirement(package) for package in VirtualEnvManager.process_packages(result)
+    ] == [
+        Requirement(f"torchcodec{expected}"),
+        Requirement(f"torch=={torch_version.split('+')[0]}"),
+    ]
+    assert packages == original
+
+
+def test_missing_system_torchcodec_after_condition_filtering(monkeypatch):
+    from importlib import metadata
+
+    def version(name):
+        if name == "torch":
+            return "2.9.1"
+        raise metadata.PackageNotFoundError(name)
+
+    monkeypatch.setattr(metadata, "version", version)
+    packages = ['#system_torchcodec# ; #engine# == "PyTorch"', "#system_torch#"]
+    from ..utils import filter_virtualenv_packages_by_markers
+
+    active = filter_virtualenv_packages_by_markers(packages, "PyTorch", None)
+    assert ensure_system_torch_pin(active) == [
+        "torchcodec>=0.8,<0.10",
+        "#system_torch#",
+    ]
+
+
+@pytest.mark.parametrize(
+    "packages",
+    [
+        ["#system_torch#"],
+        ["#system_torch#", "torchcodec==0.8.1"],
+        ["torch==2.10.0", "#system_torchcodec#"],
+    ],
+)
+def test_missing_system_torchcodec_does_not_override_explicit_packages(packages):
+    assert ensure_system_torch_pin(packages) is packages
+
+
+def test_missing_system_torchcodec_skips_inactive_marker():
+    packages = ['#system_torchcodec# ; #engine# == "PyTorch"', "#system_torch#"]
+    from ..utils import filter_virtualenv_packages_by_markers
+
+    active = filter_virtualenv_packages_by_markers(packages, "Other", None)
+    assert ensure_system_torch_pin(active) == ["#system_torch#"]
+
+
+def test_system_torchcodec_keeps_installed_host_version(monkeypatch):
+    from importlib import metadata
+
+    monkeypatch.setattr(metadata, "version", lambda name: "0.8.1")
+    packages = ["#system_torch#", "#system_torchcodec#"]
+    assert ensure_system_torch_pin(packages) is packages
+
+
+def test_missing_system_torchcodec_reports_missing_host_torch(monkeypatch):
+    from importlib import metadata
+
+    def version(name):
+        raise metadata.PackageNotFoundError(name)
+
+    monkeypatch.setattr(metadata, "version", version)
+    packages = ["#system_torch#", "#system_torchcodec#"]
+    with pytest.raises(
+        ValueError, match="Torch is not installed.*virtual_env_packages"
+    ):
+        ensure_system_torch_pin(packages)
+
+
+@pytest.mark.parametrize("torch_version", ["2.3.1", "2.12.0.dev20260930"])
+def test_missing_system_torchcodec_reports_unknown_torch(monkeypatch, torch_version):
+    from importlib import metadata
+
+    def version(name):
+        if name == "torch":
+            return torch_version
+        raise metadata.PackageNotFoundError(name)
+
+    monkeypatch.setattr(metadata, "version", version)
+    packages = ["#system_torch#", "#system_torchcodec#"]
+    with pytest.raises(ValueError, match="virtual_env_packages"):
+        ensure_system_torch_pin(packages)
+
+
 @pytest.mark.parametrize(("value", "expected"), [(None, 1), (1, 1), ("2", 2)])
 def test_normalize_n_worker(value, expected):
     assert normalize_n_worker(value) == expected
@@ -1187,3 +1307,145 @@ async def test_log_async_separates_correlation_and_operation_request_ids(caplog)
     assert records[1].xinference_fields["request_id"] == "http-correlation-id"
     assert records[1].xinference_fields["operation_request_id"] == "operation-id"
     assert records[1].xinference_fields["phase"] == "leave"
+
+
+def test_log_sync_separates_correlation_and_operation_request_ids(caplog):
+    from ..utils import log_sync
+
+    test_logger = logging.getLogger("xinference.test.log_sync.correlation")
+    received = []
+
+    @log_sync(test_logger)
+    def operation(*, request_id=None):
+        received.append(request_id)
+        return "ok"
+
+    with caplog.at_level(logging.DEBUG, logger=test_logger.name):
+        result = operation(
+            request_id="operation-id",
+            __xinf_rpc_metadata__={
+                "version": 1,
+                "correlation_id": "http-correlation-id",
+                "actor_call_id": "actor-call-id",
+                "parent_call_id": "parent-call-id",
+            },
+        )
+
+    assert result == "ok"
+    assert received == ["operation-id"]
+    records = [record for record in caplog.records if record.name == test_logger.name]
+    assert len(records) == 2
+    assert records[0].xinference_fields == {
+        "request_id": "http-correlation-id",
+        "correlation_id": "http-correlation-id",
+        "operation_request_id": "operation-id",
+        "actor_call_id": "actor-call-id",
+        "parent_call_id": "parent-call-id",
+        "operation": "operation",
+        "phase": "enter",
+    }
+    assert "elapsed_ms" not in records[0].xinference_fields
+    assert records[1].xinference_fields["request_id"] == "http-correlation-id"
+    assert records[1].xinference_fields["operation_request_id"] == "operation-id"
+    assert records[1].xinference_fields["phase"] == "leave"
+    assert records[1].xinference_fields["elapsed_ms"] >= 0
+
+
+@pytest.mark.parametrize("log_exception", [True, False])
+def test_log_sync_error_includes_request_id_and_elapsed_ms(caplog, log_exception):
+    from ..rpc_context import get_current_rpc_metadata
+    from ..utils import log_sync
+
+    test_logger = logging.getLogger(f"xinference.test.log_sync.error.{log_exception}")
+
+    @log_sync(test_logger, log_exception=log_exception)
+    def operation(*, request_id=None):
+        raise RuntimeError("boom")
+
+    with caplog.at_level(logging.DEBUG, logger=test_logger.name):
+        with pytest.raises(RuntimeError, match="boom"):
+            operation(
+                request_id="operation-id",
+                __xinf_rpc_metadata__={
+                    "version": 1,
+                    "correlation_id": "http-correlation-id",
+                },
+            )
+
+    records = [record for record in caplog.records if record.name == test_logger.name]
+    assert len(records) == 2
+    assert records[1].xinference_fields["request_id"] == "http-correlation-id"
+    assert records[1].xinference_fields["operation_request_id"] == "operation-id"
+    assert records[1].xinference_fields["phase"] == "error"
+    assert records[1].xinference_fields["error_type"] == "RuntimeError"
+    assert records[1].xinference_fields["elapsed_ms"] >= 0
+    assert get_current_rpc_metadata() is None
+
+
+def test_log_sync_uses_operation_request_id_without_correlation_id(caplog):
+    from ..utils import log_sync
+
+    test_logger = logging.getLogger("xinference.test.log_sync.operation_id")
+
+    @log_sync(test_logger)
+    def operation(*, request_id=None):
+        return request_id
+
+    with caplog.at_level(logging.DEBUG, logger=test_logger.name):
+        result = operation(request_id="operation-id")
+
+    assert result == "operation-id"
+    records = [record for record in caplog.records if record.name == test_logger.name]
+    assert len(records) == 2
+    assert records[0].xinference_fields["request_id"] == "operation-id"
+    assert records[0].xinference_fields["correlation_id"] == ""
+    assert records[0].xinference_fields["operation_request_id"] == "operation-id"
+    assert records[0].getMessage().startswith("[request operation-id] Enter")
+    assert records[1].xinference_fields["elapsed_ms"] >= 0
+
+
+def test_log_sync_does_not_generate_request_id_without_context(caplog):
+    from ..utils import log_sync
+
+    test_logger = logging.getLogger("xinference.test.log_sync.no_context")
+
+    @log_sync(test_logger)
+    def operation():
+        return "ok"
+
+    with caplog.at_level(logging.DEBUG, logger=test_logger.name):
+        result = operation()
+
+    assert result == "ok"
+    records = [record for record in caplog.records if record.name == test_logger.name]
+    assert len(records) == 2
+    assert "request_id" not in records[0].xinference_fields
+    assert records[0].xinference_fields["correlation_id"] == ""
+    assert records[0].xinference_fields["operation_request_id"] == ""
+    assert "[request " not in records[0].getMessage()
+    assert "request_id" not in records[1].xinference_fields
+    assert records[1].xinference_fields["elapsed_ms"] >= 0
+
+
+def test_log_sync_sanitizes_and_truncates_request_id(caplog):
+    from ..utils import log_sync
+
+    test_logger = logging.getLogger("xinference.test.log_sync.safe_request_id")
+    unsafe_request_id = "unsafe\n" + "x" * 300
+
+    @log_sync(test_logger)
+    def operation(*, request_id=None):
+        return request_id
+
+    with caplog.at_level(logging.DEBUG, logger=test_logger.name):
+        result = operation(request_id=unsafe_request_id)
+
+    assert result == unsafe_request_id
+    records = [record for record in caplog.records if record.name == test_logger.name]
+    assert len(records) == 2
+    request_id = records[0].xinference_fields["request_id"]
+    assert len(request_id) == 256
+    assert request_id.startswith("unsafe?")
+    assert "\n" not in request_id
+    assert records[0].getMessage().startswith(f"[request {request_id}] Enter")
+    assert records[1].xinference_fields["request_id"] == request_id

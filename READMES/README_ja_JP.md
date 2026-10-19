@@ -41,13 +41,16 @@ Xorbits Inference（Xinference）は、言語、音声認識、マルチモー�
 
 ## 🔥 注目のトピック
 ### フレームワークの強化
-- Xinference 3.0.0 が公開され、移行メモと破壊的変更を確認できます: [リリースノート](https://xinference.co/release_notes/v3.0.0.html)
+- Xinference 4.0.0 が公開され、マルチエンジン Xavier、異種環境 P/D 分離、実行中のモデル再構成をサポートします: [リリースノート](https://github.com/xorbitsai/inference/releases/tag/v4.0.0)
 - Agent ネイティブ配信：Xinference は [Xagent](https://github.com/xorbitsai/xagent) と統合し、動的プランニング、ツール利用、自己完結型の複数ステップ推論を可能にし、静的なパイプラインの限界を超えます。
 - 自動バッチ処理：複数の同時リクエストを自動的にバッチ化し、スループットを大幅に向上させます。: [#4197](https://github.com/xorbitsai/inference/pull/4197)
 - [Xllamacpp](https://github.com/xorbitsai/xllamacpp): Xinference チームが管理する新しい llama.cpp の Python バインディングは、継続的なバッチ処理をサポートし、より本番運用に適しています。: [#2997](https://github.com/xorbitsai/inference/pull/2997)
 - 分散推論：ワーカー間でモデルを実行できます: [#2877](https://github.com/xorbitsai/inference/pull/2877)
 - VLLM の強化：複数レプリカ間で KV キャッシュを共有: [#2732](https://github.com/xorbitsai/inference/pull/2732)
 ### 新規モデル
+- [EmbeddingGemma 2](https://huggingface.co/google/embeddinggemma-2) を組み込みでサポート: [#5644](https://github.com/xorbitsai/inference/pull/5644)
+- [Confucius4-TTS](https://huggingface.co/netease-youdao/Confucius4-TTS) を組み込みでサポート: [#5591](https://github.com/xorbitsai/inference/pull/5591)
+- [jina-ocr-v1](https://huggingface.co/jinaai/jina-ocr-v1) を組み込みでサポート: [#5588](https://github.com/xorbitsai/inference/pull/5588)
 - [TeleOCR](https://huggingface.co/StarDoc-AI/TeleOCR) を組み込みでサポート: [#5583](https://github.com/xorbitsai/inference/pull/5583)
 - Ming-Image シリーズ（[Design](https://huggingface.co/inclusionAI/Ming-Image-0.1-Design)、[Design Layer](https://huggingface.co/inclusionAI/Ming-Image-0.1-Design-Layer)） を組み込みでサポート: [#5582](https://github.com/xorbitsai/inference/pull/5582)
 - [Qwen-Image-2.1](https://huggingface.co/Qwen/Qwen-Image-2.1) を組み込みでサポート: [#5571](https://github.com/xorbitsai/inference/pull/5571)
@@ -57,11 +60,6 @@ Xorbits Inference（Xinference）は、言語、音声認識、マルチモー�
 - Irodori-TTS v4.1 シリーズ（[Anime](https://huggingface.co/phasefield-audio/Irodori-TTS-v4.1-Anime)、[Small](https://huggingface.co/Aratako/Irodori-TTS-v4.1-Small)） を組み込みでサポート: [#5527](https://github.com/xorbitsai/inference/pull/5527)
 - [YuE2-3B](https://huggingface.co/m-a-p/YuE2-3B) を組み込みでサポート: [#5526](https://github.com/xorbitsai/inference/pull/5526)
 - AuK シリーズ（[AuK](https://huggingface.co/tencent/AuK)、[AuK-Flash](https://huggingface.co/tencent/AuK-Flash)） を組み込みでサポート: [#5525](https://github.com/xorbitsai/inference/pull/5525)
-- [MiniCPM5-2B](https://huggingface.co/openbmb/MiniCPM5-2B) を組み込みでサポート: [#5506](https://github.com/xorbitsai/inference/pull/5506)
-- Fish Audio シリーズ（[S1-mini](https://huggingface.co/fishaudio/s1-mini)、[S2-Pro](https://huggingface.co/fishaudio/s2-pro)） を組み込みでサポート: [#5490](https://github.com/xorbitsai/inference/pull/5490)
-- [MonkeyOCR](https://huggingface.co/echo840/MonkeyOCR) を組み込みでサポート: [#5475](https://github.com/xorbitsai/inference/pull/5475)
-- [dots.ocr](https://huggingface.co/rednote-hilab/dots.ocr) を組み込みでサポート: [#5468](https://github.com/xorbitsai/inference/pull/5468)
-- JoyAI 画像編集シリーズ（[Edit](https://huggingface.co/jdopensource/JoyAI-Image-Edit-Diffusers)、[Edit Plus](https://huggingface.co/jdopensource/JoyAI-Image-Edit-Plus-Diffusers)） を組み込みでサポート: [#5458](https://github.com/xorbitsai/inference/pull/5458)
 ### 統合
 - [Xagent](https://github.com/xorbitsai/xagent): 計画、メモリ、ツール利用を備えたエンタープライズ向けエージェントプラットフォームです。
 - [Dify](https://docs.dify.ai/advanced/model-configuration/xinference): LLMOps プラットフォームで、視覚化・操作可能な形で迅速にアプリを構築できます。
@@ -99,10 +97,11 @@ Xorbits Inference（Xinference）は、言語、音声認識、マルチモー�
 ## Xinference の使い方
 
 - **セルフホスティング Xinference Community Edition**
-  この [スターターガイド](#getting-started) に従って、自分の環境で Xinference を素早く起動してください。詳細はドキュメント（https://inference.readthedocs.io/）を参照してください。
+  この [スターターガイド](#入門) に従って、自分の環境で Xinference を素早く起動してください。詳細はドキュメント（https://inference.readthedocs.io/）を参照してください。
 
 - **企業/組織向け Xinference**
-  企業向けの追加機能を提供しています。企業ニーズについてはメール（mailto:info@xinference.co?subject=[GitHub]Business%20License%20Inquiry）でお問い合わせください。
+  **Xinference Enterprise** は、本番環境でモデルを運用するチーム向けの商用版です。自社のクラウドやデータセンターに導入するか、**Xinference Cloud** によるマネージド専用環境を選択できます。ホスト型の **Model API** では、推論インフラを管理することなく、OpenAI 互換 API を通じて対応モデルにアクセスできます。詳細は [xinference.co](https://xinference.co) をご覧ください。
+  企業向けのお問い合わせは、[メール](mailto:info@xinference.co?subject=[GitHub]Business%20License%20Inquiry)でご連絡ください。
 
 ## 常に先を行くために
 
@@ -116,6 +115,31 @@ GitHub で Xinference にスターを付けると、新しいリリースの通�
 * [組み込みモデル](https://inference.readthedocs.io/en/latest/models/builtin/index.html)
 * [カスタムモデル](https://inference.readthedocs.io/en/latest/models/custom.html)
 * [デプロイメントドキュメント](https://inference.readthedocs.io/en/latest/getting_started/using_xinference.html)
+
+### クイックスタート
+
+**pip**
+
+```bash
+pip install xinference
+xinference-local
+```
+
+**ワンコマンドインストール**
+
+Linux/macOS:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/xorbitsai/inference/main/scripts/install.sh | sh
+```
+
+Windows PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/xorbitsai/inference/main/scripts/install.ps1 | iex
+```
+
+[インストールガイド](https://inference.readthedocs.io/en/latest/getting_started/installation.html#one-line-install) · [利用ガイド](https://inference.readthedocs.io/en/latest/getting_started/using_xinference.html#run-xinference-locally)
 
 ### Docker
 
@@ -142,22 +166,6 @@ helm install xinference xinference/xinference -n xinference --version 0.0.1-v<xi
 ```
 
 詳細な K8s 向けカスタムインストールについてはドキュメントを参照してください。
-
-### クイックスタート
-
-pip を使って Xinference をインストールします（詳細はインストールページ参照）。
-
-```bash
-pip install "xinference[all]"
-```
-
-ローカルインスタンスを起動するには次を実行します：
-
-```bash
-$ xinference-local
-```
-
-起動後は Web UI、cURL、CLI、または Xinference の Python クライアントを通じて試すことができます。詳細はドキュメントを参照してください。
 
 ![web UI](../assets/screenshot.png)
 

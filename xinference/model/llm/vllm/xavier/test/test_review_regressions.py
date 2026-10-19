@@ -1,5 +1,6 @@
 # Copyright 2022-2026 Xinference Holdings Pte. Ltd
 # Licensed under the Apache License, Version 2.0.
+import asyncio
 from collections import deque
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -54,12 +55,18 @@ def test_cache_layout_round_trip(connector, connector_module, kv_first):
     source = canonical.movedim(0, 1).contiguous() if kv_first else canonical
     sent = []
 
-    async def stage(request, layer, keys, blocks):
-        sent.append((keys, blocks.clone()))
+    async def stage(entries, layouts):
+        for (_, keys, blocks), (shape, dtype) in zip(entries, layouts):
+            sent.append((keys, blocks.view(dtype).view(shape).clone()))
 
-    connector._stage_layer_blocks = stage
+    connector._get_transfer_ref = AsyncMock(
+        return_value=SimpleNamespace(
+            stage_layer_batches_v1=AsyncMock(side_effect=stage)
+        )
+    )
+    connector.register_kv_caches({"layer": source})
     request = connector_module.XavierStoreRequest("r", [2, 5], [111, 222], [[2, 5]])
-    connector._stage_kv_layer_for_request(request, "layer", source)
+    connector._call(connector._stage_cpu_requests([request]))
     assert sent[0][0] == [111, 222]
     assert torch.equal(sent[0][1], canonical[[2, 5]])
     destination = torch.zeros_like(source)
@@ -124,22 +131,18 @@ def test_unsupported_configs_rejected(connector_module, connector_config, field)
 
 @pytest.mark.asyncio
 async def test_reused_request_id_publishes_new_content(connector, connector_module):
-    tracker = SimpleNamespace(
-        register_blocks=AsyncMock(), unregister_blocks=AsyncMock()
-    )
     transfer = SimpleNamespace(
-        publish_blocks_v1=AsyncMock(side_effect=[([111], []), ([222], [111])])
+        refresh_snapshot_blocks_v1=AsyncMock(side_effect=[([111], []), ([222], [111])])
     )
-    connector._get_tracker_ref = AsyncMock(return_value=tracker)
     connector._get_transfer_ref = AsyncMock(return_value=transfer)
     connector._registered_kv_caches = {"layer": torch.zeros(8, 2, 16, 2, 4)}
     for key in [111, 222]:
         await connector._register_blocks(
             [connector_module.XavierStoreRequest("r", [1], [key], [[1]])]
         )
-    assert tracker.register_blocks.await_count == 2
-    tracker.register_blocks.assert_awaited_with(0, [(222, 222)], 1)
-    tracker.unregister_blocks.assert_awaited_once_with(0, 1, [111])
+    assert transfer.refresh_snapshot_blocks_v1.await_count == 2
+    assert transfer.refresh_snapshot_blocks_v1.await_args.args[:2] == ([222], {"layer"})
+    assert connector._exported_keys == {222}
     assert not hasattr(connector, "_stored_requests")
 
 
@@ -158,7 +161,7 @@ def test_load_failure_releases_snapshot(connector, connector_module):
         lambda: connector_module.XavierConnectorMetadata(load_requests=[request])
     )
     connector._registered_kv_caches = {"layer": torch.zeros(8, 2, 16, 2, 4)}
-    connector._load_layer_blocks = Mock(side_effect=RuntimeError("failed"))
+    connector._load_request_blocks = Mock(side_effect=RuntimeError("failed"))
     connector._release_load_request = AsyncMock()
     with pytest.raises(RuntimeError):
         connector.start_load_kv(SimpleNamespace())
@@ -176,10 +179,14 @@ async def test_partial_reservation_rolls_back(monkeypatch):
         reserve_blocks_v1=AsyncMock(return_value=False), release_blocks_v1=AsyncMock()
     )
     monkeypatch.setattr(xo, "actor_ref", AsyncMock(side_effect=[first, second]))
-    actor = SimpleNamespace(_world_addresses=["zero", "one", "two"])
+    actor = SimpleNamespace(
+        _world_addresses=["zero", "one", "two"],
+        _kv_schema_v1=(16, {"layer": ((2,), torch.float32)}, "auto"),
+    )
     assert not await TransferActor.reserve_remote_blocks_v1(
         actor, "3:r", {1: {111: 0}, 2: {222: 1}}
     )
+    first.reserve_blocks_v1.assert_awaited_once_with("3:r", [111], actor._kv_schema_v1)
     first.release_blocks_v1.assert_awaited_once_with("3:r")
 
 
@@ -243,3 +250,232 @@ async def test_snapshot_store_configured_once(connector, monkeypatch):
     assert await connector._get_transfer_ref() is ref
     assert await connector._get_transfer_ref() is ref
     ref.configure_snapshots_v1.assert_awaited_once_with(8)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "count,width,expected_calls",
+    [(65, 1, 2), (130, 1, 3), (130, 8192, 5), (3, 262144, 3), (2, 262145, 2)],
+)
+async def test_batched_reads_bound_payload_and_preserve_order(
+    connector_module, count, width, expected_calls
+):
+    calls = []
+
+    async def read(rank, layer, mapping, shape, dtype):
+        calls.append(mapping)
+        assert shape == (len(mapping), width)
+        assert len(mapping) <= 64
+        assert len(mapping) * width * 4 <= 1024 * 1024 or len(mapping) == 1
+        return (
+            torch.tensor(list(mapping), dtype=dtype)
+            .view(-1, 1)
+            .expand(shape)
+            .contiguous()
+        )
+
+    transfer = SimpleNamespace(read_layer_blocks_v1=read)
+    connector = SimpleNamespace(_get_transfer_ref=AsyncMock(return_value=transfer))
+    mapping = {2000 + i: 5000 - i for i in range(count)}
+    result = await connector_module.XavierConnector._read_layer_blocks(
+        connector, "layer", 1, mapping, (count, width), torch.float32
+    )
+    assert len(calls) == expected_calls
+    assert [item for batch in calls for item in batch.items()] == list(mapping.items())
+    assert result[:, 0].tolist() == list(mapping)
+
+
+@pytest.mark.asyncio
+async def test_later_read_batch_failure_propagates(connector_module):
+    read = AsyncMock(side_effect=[torch.zeros(64, 1), KeyError("missing block")])
+    connector = SimpleNamespace(
+        _get_transfer_ref=AsyncMock(
+            return_value=SimpleNamespace(read_layer_blocks_v1=read)
+        )
+    )
+    with pytest.raises(KeyError, match="missing block"):
+        await connector_module.XavierConnector._read_layer_blocks(
+            connector, "layer", 1, {i: i for i in range(130)}, (130, 1), torch.float32
+        )
+    assert read.await_count == 2
+
+
+@pytest.mark.parametrize("noncontiguous", [False, True])
+def test_bf16_snapshot_and_connector_preserve_all_bits(
+    connector, connector_module, noncontiguous
+):
+    # Includes infinities, NaNs, subnormals and values above the FP16 range.
+    bits = torch.arange(65536, dtype=torch.int32).to(torch.int16)
+    source = bits.view(torch.bfloat16).reshape(8, 8192)
+    if noncontiguous:
+        source = source.t().contiguous().t()
+        assert not source.is_contiguous()
+    actor = SimpleNamespace(_rank=0, _snapshot_store=KVSnapshotStore(8))
+    TransferActor.stage_layer_blocks_v1(actor, "r", "layer", list(range(8)), source)
+    payload = actor._snapshot_store.read("layer", list(range(8)))
+    assert payload.dtype == torch.float16
+    assert payload.element_size() == 2
+    assert torch.equal(payload.view(torch.int16), bits.reshape(8, 8192))
+
+    async def read(layer, rank, mapping, shape, dtype):
+        assert dtype == torch.bfloat16
+        # Exercise the NumPy transport representation, without numeric casts.
+        result = torch.from_numpy(payload.numpy().copy())
+        if noncontiguous:
+            result = result.t().contiguous().t()
+            assert not result.is_contiguous()
+        return result
+
+    connector._read_layer_blocks = read
+    destination = torch.empty_like(source)
+    request = connector_module.XavierLoadRequest(
+        "r",
+        {1: {i: i for i in range(8)}},
+        local_transfers_by_group={0: {1: {i: i for i in range(8)}}},
+    )
+    connector._load_layer_blocks("layer", destination, request)
+    assert torch.equal(destination.view(torch.int16), source.view(torch.int16))
+
+
+def test_connector_rejects_unexpected_transport_dtype(connector, connector_module):
+    async def read(*args):
+        return torch.ones(1, 2, dtype=torch.float32)
+
+    connector._read_layer_blocks = read
+    destination = torch.zeros(8, 2, dtype=torch.bfloat16)
+    request = connector_module.XavierLoadRequest(
+        "r", {1: {1: 0}}, local_transfers_by_group={0: {1: {1: 0}}}
+    )
+    with pytest.raises(RuntimeError, match="torch.float32.*torch.bfloat16"):
+        connector._load_layer_blocks("layer", destination, request)
+    assert destination.count_nonzero() == 0
+
+
+def test_snapshot_logical_dtype_tracks_immutable_blocks_and_eviction():
+    store = KVSnapshotStore(1)
+    carrier = torch.ones(1, 2, dtype=torch.float16)
+    store.stage("K", [1], carrier, logical_dtype=torch.bfloat16)
+    store.stage("K", [1], carrier, logical_dtype=torch.float16)
+    assert store.logical_dtypes[1]["K"] == torch.bfloat16
+    store.stage("K", [2], carrier)
+    assert 1 not in store.logical_dtypes
+    assert store.logical_dtypes == {2: {"K": torch.float16}}
+
+
+@pytest.mark.asyncio
+async def test_transfer_cleanup_continues_after_gpu_close_error():
+    close = AsyncMock(side_effect=RuntimeError("sticky CUDA error"))
+    task = Mock()
+    context = Mock()
+    actor = SimpleNamespace(
+        close_gpu_caches_v1=close, _layer_send_tasks_v1={task}, _context=context
+    )
+    await TransferActor.__pre_destroy__(actor)
+    task.cancel.assert_called_once_with()
+    context.closeConnections.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_gpu_connector_mapping_staging_and_load_fences(
+    connector, connector_module, monkeypatch
+):
+    import torch.multiprocessing.reductions as reductions
+
+    calls = []
+    cache = torch.zeros(8, 2, 16, 2, 4)
+    connector._gpu_budget = 64
+    connector._gpu_cache_mapped = False
+    connector._registered_kv_caches = {"layer": cache}
+    transfer = SimpleNamespace(
+        map_gpu_caches_v1=AsyncMock(
+            side_effect=lambda *args, **kwargs: calls.append("map")
+        ),
+        stage_gpu_requests_v1=AsyncMock(
+            side_effect=lambda *args: calls.append("stage")
+        ),
+        load_gpu_requests_v1=AsyncMock(side_effect=lambda *args: calls.append("load")),
+        close_gpu_caches_v1=AsyncMock(),
+    )
+    connector._get_transfer_ref = AsyncMock(return_value=transfer)
+    monkeypatch.setattr(torch.Tensor, "is_cuda", property(lambda self: True))
+    monkeypatch.setattr(
+        reductions, "reduce_tensor", lambda tensor: (None, ("descriptor",))
+    )
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: calls.append("fence"))
+    request = connector_module.XavierStoreRequest("r", [2, 5], [111, 222], [[2, 5]])
+    await connector._stage_gpu_requests([request])
+    assert calls == ["fence", "map", "fence", "stage"]
+    transfer.stage_gpu_requests_v1.assert_awaited_once_with(
+        [{"layer": ([111, 222], [2, 5])}]
+    )
+    calls.clear()
+    load = connector_module.XavierLoadRequest(
+        "r", {1: {111: 0}}, local_transfers_by_group={0: {1: {111: 3}}}
+    )
+    await connector._submit_gpu_requests([load])
+    await next(iter(connector._gpu_load_jobs))
+    assert calls == ["fence", "load"]
+    transfer.load_gpu_requests_v1.assert_awaited_once_with(
+        [{1: {"layer": {111: 3}}}], [(load.lease, load.transfers)]
+    )
+    assert transfer.map_gpu_caches_v1.await_count == 1
+    connector._get_connector_metadata = (
+        lambda: connector_module.XavierConnectorMetadata(store_requests=[request])
+    )
+    calls.clear()
+    connector.save_kv_layer("layer", cache, None)
+    assert not calls
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fail_first", [False, True])
+async def test_gpu_mapping_serializes_callers_and_retries(
+    connector, connector_module, monkeypatch, fail_first
+):
+    from torch.multiprocessing import reductions
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    calls = []
+
+    async def register(descriptors, budget, *, direct_handoff):
+        assert direct_handoff == connector._direct_handoff
+        calls.append((descriptors, budget))
+        if len(calls) == 1:
+            entered.set()
+            await release.wait()
+            if fail_first:
+                raise RuntimeError("registration failed")
+
+    transfer = SimpleNamespace(map_gpu_caches_v1=register)
+    connector._get_transfer_ref = AsyncMock(return_value=transfer)
+    connector._registered_kv_caches = {"K": object()}
+    connector._gpu_budget = 256
+    tensor = SimpleNamespace(is_cuda=True)
+    connector._iter_kv_tensors = lambda *args: [("K", tensor)]
+    monkeypatch.setattr(connector_module, "block_major_view", lambda t, n: t)
+    monkeypatch.setattr(reductions, "reduce_tensor", lambda t: (None, ("descriptor",)))
+    monkeypatch.setattr(torch.cuda, "synchronize", Mock())
+
+    first = asyncio.create_task(connector._ensure_gpu_cache_mapping())
+    await asyncio.wait_for(entered.wait(), timeout=2)
+    second = asyncio.create_task(connector._ensure_gpu_cache_mapping())
+    try:
+        await asyncio.sleep(0)
+        assert len(calls) == 1
+        assert not connector._gpu_cache_mapped
+    finally:
+        release.set()
+        results = await asyncio.wait_for(
+            asyncio.gather(first, second, return_exceptions=True), timeout=2
+        )
+    assert results[1] is transfer
+    if fail_first:
+        assert isinstance(results[0], RuntimeError)
+        assert str(results[0]) == "registration failed"
+    else:
+        assert results[0] is transfer
+    assert len(calls) == (2 if fail_first else 1)
+    assert connector._gpu_cache_mapped
+    assert await connector._ensure_gpu_cache_mapping() is transfer
+    assert len(calls) == (2 if fail_first else 1)

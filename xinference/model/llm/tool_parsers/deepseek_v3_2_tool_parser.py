@@ -1,3 +1,4 @@
+import json
 import logging
 import re
 from typing import Any, Dict, List, Optional, Tuple
@@ -71,9 +72,8 @@ class DeepseekV3_2ToolParser(ToolParser):
             rf"{open_tag}invoke\s+name=\"([^\"]+)\"\s*>(.*?)</{close_body}invoke>",
             re.DOTALL,
         )
-        _non_cap = "(?:"  # noqa: E231 — split to avoid flake8 false positive on "?:"
         self.parameter_complete_regex = re.compile(
-            rf'{open_tag}parameter\s+name="([^"]+)"\s+string="{_non_cap}true|false)"\s*>'
+            rf'{open_tag}parameter\s+name="([^"]+)"\s+string="(true|false)"\s*>'
             rf"(.*?)</{close_body}parameter>",
             re.DOTALL,
         )
@@ -81,8 +81,15 @@ class DeepseekV3_2ToolParser(ToolParser):
     def _parse_invoke_params(self, invoke_str: str) -> dict:
         """Parse parameter name-value pairs from an invoke block."""
         param_dict = {}
-        for param_name, param_val in self.parameter_complete_regex.findall(invoke_str):
-            param_dict[param_name] = param_val
+        for param_name, is_string, param_val in self.parameter_complete_regex.findall(
+            invoke_str
+        ):
+            try:
+                param_dict[param_name] = (
+                    param_val if is_string == "true" else json.loads(param_val)
+                )
+            except json.JSONDecodeError:
+                param_dict[param_name] = param_val
         return param_dict
 
     def _detect_format(self, text: str) -> bool:
@@ -165,12 +172,12 @@ class DeepseekV3_2ToolParser(ToolParser):
                     self._use_dsml = self._detect_format(current_text)
                     self._build_regexes(self._use_dsml)
                 else:
-                    # Still in plain-text region — check for partial start tokens
-                    for tok in self.tool_call_start_tokens:
-                        for i in range(1, len(tok)):
-                            if current_text.endswith(tok[:i]):
-                                return None
-                    return (delta_text, None, None) if delta_text else None
+                    # Still in plain-text region. Hold back a trailing partial
+                    # start token and release it once it turns out to be text.
+                    content = self._plain_text_delta(
+                        current_text, delta_text, self.tool_call_start_tokens
+                    )
+                    return (content, None, None) if content else None
 
             # Inside tool-call region: check for newly completed invokes
             complete_invokes = self.invoke_complete_regex.findall(current_text)

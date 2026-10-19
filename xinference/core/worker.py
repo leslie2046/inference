@@ -617,6 +617,52 @@ async def _wait_pids_dead(pids: set, timeout: float = 5.0):
             await asyncio.sleep(0.2)
 
 
+def _stop_reload_children(processes: List[Any]) -> None:
+    """Reap retained process identities after force-removing their actor pool."""
+    import psutil
+
+    def live(process: Any) -> bool:
+        try:
+            return process.is_running() and process.status() != psutil.STATUS_ZOMBIE
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            return False
+
+    def wait(processes: List[Any], timeout: float) -> List[Any]:
+        deadline = time.monotonic() + timeout
+        while processes and time.monotonic() < deadline:
+            processes = [process for process in processes if live(process)]
+            if processes:
+                time.sleep(0.05)
+        return processes
+
+    owned = {process.pid: process for process in processes if live(process)}
+    for process in list(owned.values()):
+        try:
+            # A loading engine may have spawned more ranks since capture.
+            owned.update(
+                (child.pid, child) for child in process.children(recursive=True)
+            )
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    for process in owned.values():
+        try:
+            process.terminate()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    alive = wait(list(owned.values()), 3)
+    for process in alive:
+        try:
+            # psutil retains creation time and checks PID reuse before kill.
+            process.kill()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    alive = wait(alive, 5)
+    if alive:
+        logger.warning(
+            "Reload engine children did not exit: %s", [p.pid for p in alive]
+        )
+
+
 def _process_or_ancestor_has_uid(proc: Any, uid_lower: str) -> bool:
     """Return True if proc or any of its ancestors has uid_lower in cmdline."""
     current = proc
@@ -1352,6 +1398,9 @@ class WorkerActor(xo.StatelessActor):
             logger.debug("Startup VRAM poll failed", exc_info=True)
 
     async def __post_create__(self):
+        from ..extensions import get_extensions
+
+        get_extensions()
         self._actor_loop = asyncio.get_running_loop()
         self._supervisor_init_lock = asyncio.Lock()
 
@@ -1598,9 +1647,10 @@ class WorkerActor(xo.StatelessActor):
         add_worker: bool,
     ) -> Any:
         """Execute one complete Supervisor RPC lifecycle on the actor loop."""
-        supervisor_ref, supervisor_generation = (
-            await self._get_supervisor_ref_with_generation(add_worker)
-        )
+        (
+            supervisor_ref,
+            supervisor_generation,
+        ) = await self._get_supervisor_ref_with_generation(add_worker)
         try:
             method = getattr(supervisor_ref, method_name)
             return await xo.wait_for(
@@ -1860,8 +1910,13 @@ class WorkerActor(xo.StatelessActor):
             model_spec = self._model_uid_to_model_spec.get(replica_model_uid, {})
             origin_uid, _ = parse_replica_model_uid(replica_model_uid)
             xavier_config = launch_args.get("xavier_config")
-            if xavier_config is not None:
-                # Xavier recovery still depends on supervisor-owned coordination state,
+            if (
+                xavier_config is not None
+                or launch_args.get("_nixl_config")
+                or launch_args.get("_xavier_cache_config", {}).get("role")
+                in ("prefill", "decode")
+            ):
+                # PD recovery still depends on supervisor-owned routing state,
                 # so only replay replicas that the supervisor can reconstruct safely.
                 continue
             created_ts = int(launch_args.get("launch_ts") or time.time())
@@ -1981,6 +2036,16 @@ class WorkerActor(xo.StatelessActor):
         skipped = 0
         failed = 0
         for model_uid, launch_args in persisted.items():
+            # Worker restart cannot rebuild the supervisor-owned native PD
+            # route. Do not allocate an unregistered replacement replica.
+            if launch_args.get("_nixl_config") is not None or launch_args.get(
+                "_xavier_cache_config", {}
+            ).get("role") in ("prefill", "decode"):
+                logger.info(
+                    "Skipping native PD replica %s on worker startup", model_uid
+                )
+                skipped += 1
+                continue
             try:
                 # Cross-validate: check if supervisor still knows about this model
                 origin_uid, rep_id = parse_replica_model_uid(model_uid)
@@ -2102,8 +2167,13 @@ class WorkerActor(xo.StatelessActor):
         model_ref = await supervisor_ref.get_model(_model_uid)
         return await model_ref.is_vllm_backend()
 
-    def allocate_devices(self, model_uid: str, n_gpu: int) -> List[int]:
-        if n_gpu > len(self._total_gpu_devices):
+    def allocate_devices(
+        self, model_uid: str, n_gpu: int, allowed_devices: Optional[List[int]] = None
+    ) -> List[int]:
+        total_devices = (
+            self._total_gpu_devices if allowed_devices is None else allowed_devices
+        )
+        if n_gpu > len(total_devices):
             raise RuntimeError("Requested GPUs exceed the number of available devices")
 
         # If multi-replica-per-GPU is disabled, only pick currently idle GPUs.
@@ -2116,7 +2186,7 @@ class WorkerActor(xo.StatelessActor):
                 if model_infos:
                     occupied_devices.add(dev)
             available_devices = [
-                dev for dev in self._total_gpu_devices if dev not in occupied_devices
+                dev for dev in total_devices if dev not in occupied_devices
             ]
             if n_gpu > len(available_devices):
                 raise RuntimeError("No available slot found for the model")
@@ -2127,7 +2197,7 @@ class WorkerActor(xo.StatelessActor):
 
         # Default: allow multi-tenant GPUs, pick least-loaded devices.
         gpu_loads: List[Tuple[int, int, int]] = []
-        for dev in self._total_gpu_devices:
+        for dev in total_devices:
             running_models = len(self._gpu_to_model_uids.get(dev, set()))
             load = running_models + len(
                 self._user_specified_gpu_to_model_uids.get(dev, set())
@@ -2148,7 +2218,11 @@ class WorkerActor(xo.StatelessActor):
         return sorted(devices)
 
     async def allocate_devices_with_gpu_idx(
-        self, model_uid: str, model_type: str, gpu_idx: List[int]
+        self,
+        model_uid: str,
+        model_type: str,
+        gpu_idx: List[int],
+        allowed_devices: Optional[List[int]] = None,
     ) -> List[int]:
         """
         When user specifies the gpu_idx, allocate models on user-specified GPUs whenever possible
@@ -2158,6 +2232,10 @@ class WorkerActor(xo.StatelessActor):
             raise ValueError(
                 f"Worker {self.address} cannot use the GPUs with these indexes: {gpu_idx}. "
                 f"Worker {self.address} can only see these GPUs: {self._total_gpu_devices}."
+            )
+        if allowed_devices is not None and not set(gpu_idx) <= set(allowed_devices):
+            raise ValueError(
+                "Requested GPUs are excluded by the worker resource policy"
             )
         # currently just report a warning log when there are already models on these GPUs
         for idx in gpu_idx:
@@ -2184,11 +2262,29 @@ class WorkerActor(xo.StatelessActor):
             self._user_specified_gpu_to_model_uids[idx].add((model_uid, model_type))
         return sorted(gpu_idx)
 
+    def get_extension_resources(self) -> Dict[str, Any]:
+        from ..extensions import worker_extension_metadata
+
+        return {
+            "address": self.address,
+            "gpu_devices": list(self._total_gpu_devices),
+            "extensions": worker_extension_metadata(),
+        }
+
+    async def _get_allowed_gpu_devices(self) -> Optional[List[int]]:
+        from ..extensions import get_extensions
+
+        if not get_extensions():
+            return None
+        supervisor = await self.get_supervisor_ref()
+        return await supervisor.get_worker_resource_policy(self.address)
+
     @log_async(logger=logger)
     async def get_gpu_allocation_status(self) -> Dict[str, Any]:
         """Return current device allocation snapshot for scheduling/diagnostics."""
+        allowed = await self._get_allowed_gpu_devices()
         return {
-            "total": list(self._total_gpu_devices),
+            "total": list(self._total_gpu_devices) if allowed is None else allowed,
             "models": {int(k): list(v) for k, v in self._gpu_to_model_uids.items()},
             "user_specified": {
                 int(k): [list(t) for t in v]
@@ -2238,6 +2334,7 @@ class WorkerActor(xo.StatelessActor):
         env: Optional[Dict[str, str]] = None,
         start_python: Optional[str] = None,
         model_uid: str = "",
+        external_address: Optional[str] = None,
     ) -> str:
         """Append a sub-pool under _subpool_creation_lock with a launch timeout.
 
@@ -2251,10 +2348,15 @@ class WorkerActor(xo.StatelessActor):
         caller can run its own failure-path cleanup (e.g. release_devices).
         env keys are logged (never values) because env may carry secrets.
         """
+        pool_kwargs = (
+            {} if external_address is None else {"external_address": external_address}
+        )
         async with self._subpool_creation_lock:
             try:
                 return await xo.wait_for(
-                    self._main_pool.append_sub_pool(env=env, start_python=start_python),
+                    self._main_pool.append_sub_pool(
+                        env=env, start_python=start_python, **pool_kwargs
+                    ),
                     timeout=XINFERENCE_SUBPOOL_LAUNCH_TIMEOUT,
                 )
             except asyncio.TimeoutError:
@@ -2317,6 +2419,11 @@ class WorkerActor(xo.StatelessActor):
         balancing to work; deferring allocation until after preparation lets
         them all race for the same "idle" GPU snapshot instead.
         """
+        from ..extensions import get_extensions
+
+        allowed_devices = (
+            await self._get_allowed_gpu_devices() if get_extensions() else None
+        )
         env = {} if env is None else env
         devices = []
         env_name = get_available_device_env_name() or "CUDA_VISIBLE_DEVICES"
@@ -2324,7 +2431,9 @@ class WorkerActor(xo.StatelessActor):
             if isinstance(n_gpu, int) or (n_gpu == "auto" and gpu_count() > 0):
                 # Currently, n_gpu=auto means using 1 GPU
                 gpu_cnt = n_gpu if isinstance(n_gpu, int) else 1
-                devices = self.allocate_devices(model_uid=model_uid, n_gpu=gpu_cnt)
+                devices = self.allocate_devices(
+                    model_uid=model_uid, n_gpu=gpu_cnt, allowed_devices=allowed_devices
+                )
                 env[env_name] = ",".join([str(dev) for dev in devices])
                 logger.debug(f"GPU selected: {devices} for model {model_uid}")
             if n_gpu is None:
@@ -2333,7 +2442,7 @@ class WorkerActor(xo.StatelessActor):
         else:
             assert isinstance(gpu_idx, list)
             devices = await self.allocate_devices_with_gpu_idx(
-                model_uid, model_type, gpu_idx  # type: ignore
+                model_uid, model_type, gpu_idx, allowed_devices=allowed_devices  # type: ignore
             )
             env[env_name] = ",".join([str(dev) for dev in devices])
 
@@ -2351,6 +2460,7 @@ class WorkerActor(xo.StatelessActor):
         env: Dict[str, str],
         devices: List[str],
         start_python: Optional[str] = None,
+        external_address: Optional[str] = None,
     ) -> str:
         """Spawn the model sub-pool process for devices already reserved by
         _allocate_subpool_devices."""
@@ -2363,6 +2473,19 @@ class WorkerActor(xo.StatelessActor):
         # live worker's vLLM processes on shared GPUs. Best-effort: any error
         # is logged and the launch proceeds (the timeout below is the backstop).
         _target_device_ints = [int(d) for d in devices] if devices else []
+        from ..extensions import get_extensions
+
+        # Preparation/download may outlive the admission snapshot. Revalidate
+        # before touching GPUs or spawning; outer launch cleanup releases any
+        # reservations if the distribution rejects this operation.
+        if get_extensions():
+            allowed_devices = await self._get_allowed_gpu_devices()
+            if allowed_devices is not None and not set(_target_device_ints) <= set(
+                allowed_devices
+            ):
+                raise ValueError(
+                    "Reserved GPUs are excluded by the worker resource policy"
+                )
         if _target_device_ints:
             try:
                 _free_ratio = _snapshot_gpu_free_ratio(_target_device_ints)
@@ -2404,6 +2527,17 @@ class WorkerActor(xo.StatelessActor):
                     exc_info=True,
                 )
 
+        # VRAM reclamation can await for several seconds; admission may have
+        # changed during cleanup, so check again before creating the process.
+        if get_extensions():
+            allowed_devices = await self._get_allowed_gpu_devices()
+            if allowed_devices is not None and not set(_target_device_ints) <= set(
+                allowed_devices
+            ):
+                raise ValueError(
+                    "Reserved GPUs are excluded by the worker resource policy"
+                )
+
         # H3 + C: serialize sub-pool creation and bound it with a timeout.
         # H3: append_sub_pool has no internal lock; concurrent fork+exec
         # deadlocks on fork+GIL and blocks the event loop, which also
@@ -2419,9 +2553,12 @@ class WorkerActor(xo.StatelessActor):
             start_python,
             sorted(env.keys()) if env else [],
         )
+        pool_kwargs = (
+            {} if external_address is None else {"external_address": external_address}
+        )
         try:
             subpool_address = await self._append_sub_pool_protected(
-                env=env, start_python=start_python, model_uid=model_uid
+                env=env, start_python=start_python, model_uid=model_uid, **pool_kwargs
             )
         except asyncio.TimeoutError:
             # Release devices allocated above; otherwise the GPU allocation
@@ -3350,10 +3487,12 @@ class WorkerActor(xo.StatelessActor):
 
             if not hasattr(sys, "_MEIPASS"):
                 # Normal execution (pip, venv, conda, source, Docker).
-                # Inject parent site-packages via .pth so xinference and xoscar are
-                # discoverable in the child venv while preserving child-venv isolation.
-                # .pth paths are appended AFTER child site-packages so child-installed
-                # packages always take precedence over parent ones.
+                # Process parent site-packages as a site directory, including its
+                # .pth files: editable installs register their import finders there.
+                # The parent environment is trusted: all its .pth import hooks run
+                # in model subprocesses, not only editable-install hooks.
+                # addsitedir appends paths after child site-packages, preserving
+                # precedence for packages installed in the model environment.
                 parent_site_packages = _sysconfig.get_paths()["purelib"]
 
                 # Warn if xinference appears to be user-installed — child venvs
@@ -3383,7 +3522,9 @@ class WorkerActor(xo.StatelessActor):
                     )
                     child_site_packages.mkdir(parents=True, exist_ok=True)
                     pth_file = child_site_packages / "_xinference_parent.pth"
-                    desired_content = parent_site_packages + "\n"
+                    desired_content = (
+                        f"import site; site.addsitedir({parent_site_packages!r})\n"
+                    )
                     # Avoid truncate race when multiple replicas write the
                     # same .pth concurrently: skip if content already correct,
                     # otherwise atomic-write via a temp file + os.replace.
@@ -4643,6 +4784,10 @@ class WorkerActor(xo.StatelessActor):
                         virtual_env_manager,
                         model_engine,
                     )
+                    if kwargs.get("_nixl_config") is not None:
+                        from ..model.llm.vllm.pd import configure_nixl_environment
+
+                        configure_nixl_environment(subpool_envs, self.address)
                     # Auxiliary model downloads may run later in ModelActor.load,
                     # after the worker's download-phase environment has been
                     # restored. Propagate the same effective worker count to the
@@ -4868,11 +5013,24 @@ class WorkerActor(xo.StatelessActor):
                             # Devices were already reserved above; only spawn
                             # the subprocess now that the virtualenv (if any)
                             # is installed.
+                            pool_kwargs = {}
+                            if (
+                                xavier_config is not None
+                                and xavier_config.get("gpu_cache_bytes") is not None
+                            ):
+                                from ..model.llm.vllm.xavier.transport import (
+                                    gpu_pool_options,
+                                )
+
+                                pool_kwargs = gpu_pool_options(
+                                    self.address, subpool_alloc_env
+                                )
                             subpool_address = await self._spawn_subpool(
                                 model_uid,
                                 subpool_alloc_env,
                                 devices,
                                 start_python=subpool_python_path,
+                                **pool_kwargs,
                             )
                             all_subpool_addresses.append(subpool_address)
                         if xavier_config is not None:
@@ -5513,6 +5671,10 @@ class WorkerActor(xo.StatelessActor):
         # Terminate model while its launching is not allow
         if model_uid in self._model_uid_launching_guard:
             raise ValueError(f"{model_uid} is launching")
+        model_status = self._model_uid_to_model_status.get(model_uid)
+        was_reloading = (
+            model_status is not None and model_status.model_state == "reloading"
+        )
         await self._update_model_state(model_uid, "stopping")
         # In special cases, if the suffix is `-rank0`, this is the Xavier's rank 0 model actor.
         if model_uid.endswith("-rank0"):
@@ -5553,14 +5715,36 @@ class WorkerActor(xo.StatelessActor):
         if model_ref is None:
             logger.debug("Model not found, uid: %s", model_uid)
 
-        pool_addresses = None
-        if model_ref is not None:
+        # Keep rank pools reachable for cleanup after the ModelActor has died.
+        # Removing only its primary pool would sync config to a surviving rank
+        # that may be blocked in NCCL and cannot acknowledge the update.
+        pool_addresses = list(self._model_uid_to_subpool_addresses.get(model_uid, ()))
+        if not pool_addresses and model_ref is not None and not was_reloading:
             try:
                 # pool addresses if model.need_create_pools()
                 pool_addresses = await model_ref.get_pool_addresses()
             except Exception as e:
                 # process may disappear, we just ignore it.
                 logger.debug("Fail to get pool addresses, error: %s", e)
+
+        reload_children = []
+        reload_parent = None
+        if was_reloading:
+            import psutil
+
+            # Capture before killing the pool: reparented SGLang/native-MP
+            # children cannot reliably be found by model UID in their cmdline.
+            address = self._model_uid_to_addr.get(model_uid)
+            process = self._main_pool.sub_processes.get(address)
+            if process is not None and process.pid is not None:
+                try:
+                    reload_parent = psutil.Process(process.pid)
+                    # Freeze the loading thread before capturing direct
+                    # children, so it cannot fork another engine before kill.
+                    reload_parent.suspend()
+                    reload_children = reload_parent.children(recursive=True)
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
 
         # Resolve GPU indices for terminate-path orphan cleanup.
         # Prefer launch_args["gpu_idx"] (user-specified), but fall back to
@@ -5582,7 +5766,7 @@ class WorkerActor(xo.StatelessActor):
 
         try:
             logger.debug("Start to destroy model actor: %s", model_ref)
-            if model_ref is not None:
+            if model_ref is not None and not was_reloading:
                 try:
                     await model_ref.stop()
                 except Exception as e:
@@ -5610,6 +5794,7 @@ class WorkerActor(xo.StatelessActor):
             to_remove_addresses.append(subpool_address)
             if pool_addresses:
                 to_remove_addresses.extend(pool_addresses)
+            to_remove_addresses = list(dict.fromkeys(to_remove_addresses))
             logger.debug("Remove sub pools: %s", to_remove_addresses)
             coros = []
             for to_remove_addr in to_remove_addresses:
@@ -5622,6 +5807,13 @@ class WorkerActor(xo.StatelessActor):
                 "Remove sub pool failed, model uid: %s, error: %s", model_uid, e
             )
         finally:
+            if reload_parent is not None:
+                try:
+                    reload_parent.kill()
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+            if reload_children:
+                await asyncio.to_thread(_stop_reload_children, reload_children)
             self._release_virtual_env_usage(model_uid)
 
             self._model_uid_to_model.pop(model_uid, None)
@@ -5754,6 +5946,7 @@ class WorkerActor(xo.StatelessActor):
         status_map = {
             "registering": LaunchStatus.CREATING.name,
             "loading": LaunchStatus.LOADING.name,
+            "reloading": LaunchStatus.UPDATING.name,
             "ready": LaunchStatus.READY.name,
             "error": LaunchStatus.ERROR.name,
             "stopping": LaunchStatus.TERMINATING.name,
@@ -5778,11 +5971,76 @@ class WorkerActor(xo.StatelessActor):
                     exc_info=True,
                 )
 
+    async def get_model_reload_config(self, model_uid: str) -> Dict[str, Any]:
+        return await self._model_uid_to_model[model_uid].get_reload_config()
+
+    async def get_model_reload_status(self, model_uid: str) -> Dict[str, Any]:
+        return await self._model_uid_to_model[model_uid].get_reload_status()
+
+    async def validate_model_reload(self, model_uid: str, config: Dict[str, Any]):
+        await self._model_uid_to_model[model_uid].validate_reload(config)
+
+    async def reload_model(
+        self, model_uid: str, config: Dict[str, Any], drain_timeout: float
+    ) -> None:
+        from ..model.llm.weight_cache import ModelReloadError
+
+        model_ref = self._model_uid_to_model[model_uid]
+        await self._update_model_state(model_uid, "reloading")
+        owned_status = self._model_uid_to_model_status.get(model_uid)
+
+        def still_owns_model() -> bool:
+            return (
+                self._model_uid_to_model.get(model_uid) is model_ref
+                and self._model_uid_to_model_status.get(model_uid) is owned_status
+                and owned_status is not None
+                and owned_status.model_state == "reloading"
+            )
+
+        try:
+            await model_ref.reload(config, drain_timeout)
+        except ModelReloadError as exc:
+            if still_owns_model():
+                await self._update_model_state(
+                    model_uid, "ready" if exc.restored else "error"
+                )
+            raise
+        except (ValueError, ModelNotReadyError):
+            if still_owns_model():
+                await self._update_model_state(model_uid, "ready")
+            raise
+        except asyncio.CancelledError:
+            # Keep the reload marker until terminate_model forcibly removes the
+            # pool. Cancellation cannot stop a load running in a native thread.
+            raise
+        except Exception:
+            if still_owns_model():
+                await self._update_model_state(model_uid, "error")
+            raise
+        else:
+            if not still_owns_model():
+                raise ModelReloadError(
+                    "Model was terminated or recovered during reload"
+                )
+            # Persist only committed changes. Recovery must use the new limits,
+            # while the original launch identity and GPU placement stay intact.
+            self._model_uid_to_launch_args[model_uid].update(config)
+            self._persist_launch_args()
+            await self._update_model_state(model_uid, "ready")
+
+    @log_sync(logger=logger)
+    def get_model_for_abort(self, model_uid: str) -> xo.ActorRefType["ModelActor"]:
+        status = self._model_uid_to_model_status.get(model_uid)
+        if status is not None and status.model_state == "reloading":
+            # Drain keeps existing streams alive; they must remain cancellable.
+            return self._model_uid_to_model[model_uid]
+        return self.get_model(model_uid)
+
     @log_sync(logger=logger)
     def get_model(self, model_uid: str) -> xo.ActorRefType["ModelActor"]:
         model_status = self._model_uid_to_model_status.get(model_uid)
         if model_status:
-            if model_status.model_state in ("registering", "loading"):
+            if model_status.model_state in ("registering", "loading", "reloading"):
                 raise ModelNotReadyError(
                     f"Model {model_uid} is {model_status.model_state}"
                 )
@@ -5802,7 +6060,12 @@ class WorkerActor(xo.StatelessActor):
         model_desc = self._model_uid_to_model_spec.get(model_uid, None)
         if model_desc is None:
             raise ValueError(f"Model not found in the model list, uid: {model_uid}")
-        return model_desc
+        return {
+            **model_desc,
+            "n_worker": self._model_uid_to_launch_args.get(model_uid, {}).get(
+                "n_worker", 1
+            ),
+        }
 
     def _refresh_model_subpool_pids(self) -> None:
         """Refresh model PID ownership from stable sub-pool addresses.
@@ -6629,6 +6892,11 @@ class WorkerActor(xo.StatelessActor):
         }
         return ret
 
+    async def read_runtime_logs(self, cursor: str = "") -> Dict[str, object]:
+        from .runtime_logs import read_runtime_log
+
+        return await asyncio.to_thread(read_runtime_log, cursor)
+
     def update_model_status(self, model_uid: str, **kwargs):
         model_status = self._model_uid_to_model_status.get(model_uid)
         if model_status is not None:
@@ -6708,6 +6976,19 @@ class WorkerActor(xo.StatelessActor):
             await supervisor_ref.call_collective_manager(
                 origin_uid, "unregister_rank", rank
             )
+        elif launch_args.get("_nixl_config") or launch_args.get(
+            "_xavier_cache_config", {}
+        ).get("role") in ("prefill", "decode"):
+            await supervisor_ref.unregister_pd_replica(origin_uid, rep_model_uid)
+            cache_config = launch_args.get("_xavier_cache_config", {})
+            if (
+                cache_config.get("role") in ("prefill", "decode")
+                and "rank" in cache_config
+            ):
+                directory = await xo.actor_ref(
+                    address=cache_config["address"], uid=cache_config["uid"]
+                )
+                await directory.unregister_peer(cache_config["rank"])
         subpool_address = await self.launch_builtin_model(**launch_args)
         if is_xavier:
             model_ref = self._model_uid_to_model[rep_model_uid]
@@ -6723,7 +7004,12 @@ class WorkerActor(xo.StatelessActor):
         # permanent "loading" zombie -- the original 33% symptom. launch_builtin_model
         # already awaited model_ref.load(), so wait_for_load is near-instant here.
         await self.wait_for_load(rep_model_uid)
-        if is_xavier and xavier_config.get("role") in ("prefill", "decode"):
+        if (
+            (is_xavier and xavier_config.get("role") in ("prefill", "decode"))
+            or launch_args.get("_nixl_config")
+            or launch_args.get("_xavier_cache_config", {}).get("role")
+            in ("prefill", "decode")
+        ):
             await supervisor_ref.register_pd_replica(
                 origin_uid, rep_model_uid, self._model_uid_to_model[rep_model_uid]
             )

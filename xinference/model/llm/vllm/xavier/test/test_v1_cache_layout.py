@@ -16,28 +16,33 @@ def test_load_uses_registered_packed_hybrid_cache():
     load = Mock()
     connector = SimpleNamespace(
         _is_consumer=True,
+        _direct_sends=set(),
         _registered_kv_caches={"linear_attn": packed},
         _get_connector_metadata=lambda: XavierConnectorMetadata(
             load_requests=[request]
         ),
-        _load_layer_blocks=load,
+        _load_request_blocks=load,
     )
     context = SimpleNamespace(
         no_compile_layers={"linear_attn": SimpleNamespace(kv_cache=(conv, ssm))}
     )
     XavierConnector.start_load_kv(connector, context)
-    load.assert_called_once_with("linear_attn", packed, request)
+    load.assert_called_once_with(request)
+    assert connector._registered_kv_caches["linear_attn"] is packed
 
 
 @pytest.mark.asyncio
-async def test_read_large_cache_blocks_incrementally():
+async def test_read_large_cache_blocks_incrementally(monkeypatch):
     pytest.importorskip("vllm")
     from unittest.mock import AsyncMock
 
     import torch
 
+    from .. import v1_connector
     from ..v1_connector import XavierConnector
 
+    # A one-element mock block fills the byte budget for this boundary test.
+    monkeypatch.setattr(v1_connector, "_MAX_READ_BYTES", 4)
     transfer = SimpleNamespace(
         read_layer_blocks_v1=AsyncMock(
             side_effect=[torch.tensor([[10.0]]), torch.tensor([[20.0]])]
@@ -57,7 +62,7 @@ async def test_read_large_cache_blocks_incrementally():
     )
 
 
-def test_hybrid_cache_is_rejected_before_serving(monkeypatch):
+def test_recurrent_prefix_cache_is_rejected_before_serving(monkeypatch):
     pytest.importorskip("vllm")
     from ..v1_connector import KVConnectorBase_V1, XavierConnector
 
@@ -67,11 +72,14 @@ def test_hybrid_cache_is_rejected_before_serving(monkeypatch):
         )
 
     monkeypatch.setattr(KVConnectorBase_V1, "__init__", init_base)
-    config = SimpleNamespace(cache_config=SimpleNamespace(block_size=16))
+    config = SimpleNamespace(
+        cache_config=SimpleNamespace(block_size=16, cache_dtype="auto")
+    )
     caches = SimpleNamespace(
         kv_cache_groups=[
-            SimpleNamespace(kv_cache_spec=SimpleNamespace(mamba_cache_mode="all"))
+            SimpleNamespace(kv_cache_spec=SimpleNamespace(mamba_cache_mode="all")),
+            SimpleNamespace(kv_cache_spec=SimpleNamespace()),
         ]
     )
-    with pytest.raises(ValueError, match="does not yet support hybrid/recurrent"):
+    with pytest.raises(ValueError, match="requires mamba_cache_mode=none"):
         XavierConnector(config, None, caches)

@@ -14,13 +14,16 @@
 
 import asyncio
 import copy
+import json
 import logging
+import time
 import uuid
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Set
 
 import xoscar as xo
 
+from ..model.llm.xavier.constants import CROSS_ENGINE_TRANSFER_ACTOR_UID
 from .rpc_context import actor_call
 from .utils import log_async
 
@@ -81,16 +84,27 @@ class PDModelActor(xo.StatelessActor):
         scheduling_policy: Callable[
             [List[xo.ActorRefType["ModelActor"]]], SchedulingPolicy
         ] = RoundRobinSchedulingPolicy,
+        transport_backend: str = "xavier",
+        model_engine: str = "vllm",
+        handoff_mode: str = "gpu",
+        mlx_prefill: bool = False,
     ):
         super().__init__()
         # Prefill request map, used to skip the timeout task for specific request id.
         self._request_set: Set[str] = set()
+        self._direct_transfers: dict[str, dict] = {}
 
         self._model_uid = model_uid
+        self._transport_backend = transport_backend
+        self._model_engine = (model_engine or "vllm").lower()
+        self._direct_handoff = transport_backend == "xavier"
+        self._handoff_mode = handoff_mode
+        self._mlx_prefill = mlx_prefill
 
         # 使用字典存储副本：{replica_uid: actor_ref}
         self._prefill_replicas: Dict[str, xo.ActorRefType["ModelActor"]] = {}
         self._decode_replicas: Dict[str, xo.ActorRefType["ModelActor"]] = {}
+        self._sglang_bootstrap: dict[str, dict] = {}
 
         self._prefill_policy: Optional[SchedulingPolicy] = None
         self._decode_policy: Optional[SchedulingPolicy] = None
@@ -122,6 +136,10 @@ class PDModelActor(xo.StatelessActor):
     ):
         """添加 Prefill Actor"""
         if self._prefill_replicas.get(replica_uid) != actor:
+            if self._model_engine == "sglang" and self._transport_backend == "nixl":
+                self._sglang_bootstrap[replica_uid] = await actor_call(
+                    actor, "get_sglang_pd_bootstrap"
+                )
             self._prefill_replicas[replica_uid] = actor
             # 更新调度策略的副本列表
             if self._prefill_policy:
@@ -165,6 +183,7 @@ class PDModelActor(xo.StatelessActor):
         """移除 Prefill Actor"""
         if replica_uid in self._prefill_replicas:
             del self._prefill_replicas[replica_uid]
+            self._sglang_bootstrap.pop(replica_uid, None)
             # 更新调度策略的副本列表
             if self._prefill_replicas and self._prefill_policy:
                 self._prefill_policy.update_replicas(
@@ -240,26 +259,52 @@ class PDModelActor(xo.StatelessActor):
         logger.debug(
             f"[PDModelActor] Free prefill model cache for request {request_id}"
         )
+        handoff = self._direct_transfers.pop(request_id, None)
+        if handoff:
+            try:
+                if handoff.get("engine") in ("sglang", "mlx"):
+                    ref = await xo.actor_ref(
+                        address=handoff["address"], uid=handoff["uid"]
+                    )
+                    if handoff.get("mode") in ("gpu", "host"):
+                        if handoff.get("heterogeneous"):
+                            try:
+                                source = await ref.source(handoff["room"])
+                            except RuntimeError:
+                                source = None
+                            if source:
+                                sender = await xo.actor_ref(
+                                    address=source["address"],
+                                    uid=source.get("uid")
+                                    or f"{CROSS_ENGINE_TRANSFER_ACTOR_UID}-{source['rank']}",
+                                )
+                                await sender.abort(handoff["room"])
+                        await ref.release(handoff["room"])
+                    else:
+                        await ref.release_handoff(handoff["ticket"])
+                elif handoff.get("ticket"):
+                    await self._abandon_vllm_handoff(handoff)
+            except Exception:
+                logger.warning("Failed to abandon Xavier handoff", exc_info=True)
         if request_id in self._request_set:
             self._request_set.remove(request_id)
-            if self._prefill_replicas:
-                await asyncio.gather(
-                    *[
-                        actor_call(
-                            model,
-                            "free_model_cache",
-                            request_id,
-                            _rpc_operation_request_id=request_id,
-                        )
-                        for model in self._prefill_replicas.values()
-                    ],
-                    return_exceptions=True,
-                )
         else:
             logger.warning(
                 f"[request {request_id}] Prefill model cache has been freed already"
             )
             return
+
+    @staticmethod
+    async def _abandon_vllm_handoff(handoff):
+        from ..model.llm.vllm.xavier.transfer import TransferActor
+
+        ref = await xo.actor_ref(
+            address=handoff["address"],
+            uid=f"{TransferActor.default_uid()}-{handoff['rank']}",
+        )
+        # D owns claimed tickets until its writes drain. Only reclaim
+        # a handoff that was never accepted by D (router failure/abort).
+        await ref.abandon_direct_gpu_v1(handoff["ticket"])
 
     async def is_vllm_backend(self):
         return True
@@ -276,19 +321,82 @@ class PDModelActor(xo.StatelessActor):
         kwargs["request_id"] = request_id
         if request_id in self._request_set:
             raise ValueError(f"Request {request_id} is already running")
+        if "generate_config" in kwargs:
+            if args:
+                raise TypeError("Generation config supplied twice")
+            args = (kwargs.pop("generate_config"),)
         if args and args[0] is not None and not isinstance(args[0], dict):
             raise TypeError("Generation config must be a dict or None")
+        if args and args[0] and args[0].get("n", 1) != 1:
+            # Handoff leases cover one decoder, not parallel sampling children.
+            raise ValueError("PD KV handoff currently requires n=1")
+        if self._model_engine == "heterogeneous":
+            config = (args[0] if args else {}) or {}
+            if self._mlx_prefill and any(
+                parameters.get(key) is not None
+                for parameters in (config, kwargs.get("raw_params") or {})
+                for key in ("min_p", "presence_penalty", "frequency_penalty", "seed")
+            ):
+                raise ValueError(
+                    "MLX cross-engine prefill does not support min_p, presence_penalty, frequency_penalty or seed"
+                )
+            if (
+                any(
+                    config.get(key) is not None and config.get(key) is not False
+                    for key in ("logprobs", "prompt_logprobs")
+                )
+                or any(
+                    config.get(key)
+                    for key in (
+                        "top_logprobs",
+                        "return_logprob",
+                        "top_logprobs_num",
+                        "guided_json",
+                        "guided_regex",
+                        "guided_choice",
+                        "guided_grammar",
+                        "guided_json_object",
+                        "structured_outputs",
+                        "json_schema",
+                        "regex",
+                        "ebnf",
+                    )
+                )
+                or (
+                    isinstance(config.get("response_format"), dict)
+                    and config["response_format"].get("type")
+                    in ("json_object", "json_schema")
+                )
+            ):
+                raise ValueError(
+                    "Cross-engine PD does not yet transfer structured sampling or logprobs"
+                )
+        if self._model_engine in ("sglang", "heterogeneous"):
+            return await self._infer_sglang(method, inputs, args, kwargs, request_id)
         prefill = self._prefill_policy.schedule()
         decode = self._decode_policy.schedule()
+        logger.debug(
+            "PD route: request=%s prefill=%s decode=%s backend=%s",
+            request_id,
+            prefill.uid,
+            decode.uid,
+            self._transport_backend,
+        )
         prefill_args = list(copy.deepcopy(args))
         if not prefill_args or prefill_args[0] is None:
             prefill_args = [{}] + prefill_args[1:]
         prefill_args[0]["max_tokens"] = 1
         prefill_args[0]["stream"] = False
+        prefill_args[0]["n"] = 1
+        prefill_args[0]["_pd_kv_transfer_params"] = {
+            "do_remote_decode": True,
+            "do_remote_prefill": False,
+        }
         prefill_kwargs = copy.deepcopy(kwargs)
         if isinstance(prefill_kwargs.get("raw_params"), dict):
             prefill_kwargs["raw_params"].update(max_tokens=1, stream=False)
         self._request_set.add(request_id)
+        prefill_start = time.perf_counter()
         try:
             result = await actor_call(
                 prefill, method, inputs, *prefill_args, **prefill_kwargs
@@ -296,16 +404,35 @@ class PDModelActor(xo.StatelessActor):
             if hasattr(result, "__aiter__"):
                 async for _ in result:
                     pass
+            logger.debug(
+                "PD prefill complete: request=%s backend=%s elapsed_s=%.6f",
+                request_id,
+                self._transport_backend,
+                time.perf_counter() - prefill_start,
+            )
+            payload = json.loads(result) if isinstance(result, (bytes, str)) else result
+            transfer = (
+                payload.get("_pd_kv_transfer_params")
+                if isinstance(payload, dict)
+                else None
+            )
+            if self._direct_handoff and isinstance(transfer, dict):
+                handoff = (
+                    transfer.get("xavier_direct")
+                    or transfer.get("sglang_xavier")
+                    or transfer.get("mlx_xavier")
+                )
+                if handoff:
+                    self._direct_transfers[request_id] = handoff
+            if not isinstance(transfer, dict) or not transfer.get("do_remote_prefill"):
+                raise RuntimeError("PD prefill did not return KV transfer metadata")
+            decode_args = list(copy.deepcopy(args))
+            if not decode_args or decode_args[0] is None:
+                decode_args = [{}] + decode_args[1:]
+            decode_args[0]["_pd_kv_transfer_params"] = transfer
+            args = tuple(decode_args)
             if request_id not in self._request_set:
                 raise asyncio.CancelledError(f"PD request {request_id} was aborted")
-            await actor_call(
-                decode,
-                "set_unpin_handler",
-                self._model_uid,
-                request_id,
-                self.address,
-                _rpc_operation_request_id=request_id,
-            )
             result = await actor_call(
                 decode,
                 method,
@@ -318,6 +445,8 @@ class PDModelActor(xo.StatelessActor):
             await self.free_prefill_model_cache(request_id)
             raise
         if not hasattr(result, "__aiter__"):
+            # A successful D response has already completed its handoff.
+            self._direct_transfers.pop(request_id, None)
             await self.free_prefill_model_cache(request_id)
             return result
 
@@ -325,6 +454,7 @@ class PDModelActor(xo.StatelessActor):
             try:
                 async for chunk in result:
                     yield chunk
+                self._direct_transfers.pop(request_id, None)
             finally:
                 try:
                     if hasattr(result, "aclose"):
@@ -340,6 +470,160 @@ class PDModelActor(xo.StatelessActor):
                         )
                     finally:
                         await self.free_prefill_model_cache(request_id)
+
+        return stream()
+
+    async def _infer_sglang(self, method, inputs, args, kwargs, request_id):
+        """Native SGLang owns live P/D slots until the selected transport drains."""
+        prefill = self._prefill_policy.schedule()
+        decode = self._decode_policy.schedule()
+        native = self._transport_backend == "nixl"
+        bootstrap = (
+            self._sglang_bootstrap[
+                next(
+                    uid for uid, ref in self._prefill_replicas.items() if ref == prefill
+                )
+            ]
+            if native
+            else dict(address=self.address, uid=f"xavier-cache-{self._model_uid}")
+        )
+        handoff = dict(
+            engine="sglang",
+            mode="nixl" if native else self._handoff_mode,
+            room=uuid.uuid4().int % (2**63 - 1) + 1,
+            **bootstrap,
+        )
+        if self._model_engine == "heterogeneous":
+            handoff["heterogeneous"] = True
+        transfer_key = "sglang_nixl" if native else "sglang_xavier"
+        self._request_set.add(request_id)
+        if not native:
+            self._direct_transfers[request_id] = handoff
+        prefill_args = list(copy.deepcopy(args)) or [{}]
+        prefill_args[0] = dict(prefill_args[0] or {})
+        prefill_args[0].update(
+            max_tokens=1,
+            stream=False,
+            n=1,
+            _pd_kv_transfer_params={"do_remote_decode": True, transfer_key: handoff},
+        )
+        decode_args = list(copy.deepcopy(args)) or [{}]
+        decode_args[0] = dict(decode_args[0] or {})
+        decode_args[0]["_pd_kv_transfer_params"] = {
+            "do_remote_prefill": True,
+            transfer_key: handoff,
+        }
+        prefill_kwargs = copy.deepcopy(kwargs)
+        if isinstance(prefill_kwargs.get("raw_params"), dict):
+            prefill_kwargs["raw_params"].update(max_tokens=1, stream=False)
+        p_task = asyncio.create_task(
+            actor_call(prefill, method, inputs, *prefill_args, **prefill_kwargs)
+        )
+        d_task = asyncio.create_task(
+            actor_call(
+                decode,
+                method,
+                inputs,
+                *decode_args,
+                _rpc_operation_request_id=request_id,
+                **kwargs,
+            )
+        )
+        result = None
+
+        async def close_decode_stream():
+            try:
+                if hasattr(result, "aclose"):
+                    await result.aclose()
+                elif hasattr(result, "destroy"):
+                    await result.destroy()
+            finally:
+                await actor_call(
+                    decode,
+                    "decrease_serve_count",
+                    _rpc_operation_request_id=request_id,
+                )
+
+        async def stop():
+            # Abort both native requests before cancellation so their schedulers
+            # drain GPU work before reclaiming source or destination slots.
+            await asyncio.gather(
+                *(
+                    actor_call(
+                        replica,
+                        "abort_request",
+                        request_id,
+                        30,
+                        _rpc_operation_request_id=request_id,
+                    )
+                    for replica in (prefill, decode)
+                ),
+                return_exceptions=True,
+            )
+            p_task.cancel()
+            d_task.cancel()
+            await asyncio.gather(p_task, d_task, return_exceptions=True)
+            await self.free_prefill_model_cache(request_id)
+
+        try:
+            await asyncio.wait({p_task, d_task}, return_when=asyncio.FIRST_COMPLETED)
+            if p_task.done():
+                await p_task
+            result = await d_task
+            if not hasattr(result, "__aiter__"):
+                await p_task
+                self._direct_transfers.pop(request_id, None)
+                await self.free_prefill_model_cache(request_id)
+                return result
+        except BaseException:
+            await stop()
+            # The decode RPC can transfer stream ownership before the prefill
+            # task fails, including when both tasks finish in the same turn.
+            if d_task.done() and not d_task.cancelled() and d_task.exception() is None:
+                result = d_task.result()
+                if hasattr(result, "__aiter__"):
+                    try:
+                        await close_decode_stream()
+                    except Exception:
+                        logger.warning(
+                            "Failed to close SGLang decode stream", exc_info=True
+                        )
+            raise
+
+        async def stream():
+            completed = False
+            next_chunk = None
+            try:
+                iterator = result.__aiter__()
+                while True:
+                    next_chunk = asyncio.create_task(anext(iterator))
+                    if not p_task.done():
+                        await asyncio.wait(
+                            {p_task, next_chunk}, return_when=asyncio.FIRST_COMPLETED
+                        )
+                    if p_task.done():
+                        await p_task
+                    try:
+                        chunk = await next_chunk
+                    except StopAsyncIteration:
+                        break
+                    # Native D output follows GPU transfer completion.
+                    await p_task
+                    yield chunk
+                await p_task
+                completed = True
+                self._direct_transfers.pop(request_id, None)
+            finally:
+                if next_chunk is not None:
+                    next_chunk.cancel()
+                    await asyncio.gather(next_chunk, return_exceptions=True)
+                try:
+                    await close_decode_stream()
+                finally:
+                    if completed:
+                        await self.free_prefill_model_cache(request_id)
+                    else:
+                        await stop()
 
         return stream()
 
@@ -383,6 +667,7 @@ class PDModelActor(xo.StatelessActor):
         """获取PD分离信息"""
         return {
             "model_uid": self._model_uid,
+            "transport_backend": self._transport_backend,
             "prefill_count": len(self._prefill_replicas),
             "decode_count": len(self._decode_replicas),
             "prefill_replica_uids": list(self._prefill_replicas.keys()),
