@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# CI: linux
+
 import asyncio
 from types import SimpleNamespace
 
@@ -994,6 +996,57 @@ def test_async_prepare_reasoning_keeps_leading_chunk_without_text(leading):
     assert results[0] == leading
     assert results[1]["choices"][0]["text"] == "<think>\n"
     assert results[2] == text
+
+
+@pytest.mark.parametrize("delta_format", [False, True])
+@pytest.mark.parametrize(
+    "texts, reasoning, content, insert_start_tag",
+    [
+        (["\n", "<think>", "a", "</think>", "b"], "a", "b", True),
+        (["\n", "hi"], "\n\nhi", "", True),
+        (["a", "</think>", "b", "</think>", "c"], "\na", "b</think>c", True),
+        (["a", "</think>", "b", "</think>", "c"], "a", "b</think>c", False),
+        (["a</think>b", "c</think>d"], "\na", "bc</think>d", True),
+        (["a", "</think>", "use ", "<think>", "x"], "a", "use <think>x", False),
+    ],
+)
+def test_to_chat_completion_chunks_start_tag_after_leading_whitespace(
+    delta_format, texts, reasoning, content, insert_start_tag
+):
+    parser = ReasoningParser(True, "<think>", "</think>", auto_insert_start_tag=False)
+    ctx = {"enable_thinking": True}
+    if insert_start_tag:
+        ctx["reasoning_content"] = True
+
+    def _source():
+        base = {"id": "cmpl-test", "model": "test-model", "created": 123}
+        for text in texts:
+            if delta_format:
+                choice = {"index": 0, "delta": {"content": text}, "finish_reason": None}
+                yield {**base, "object": "chat.completion.chunk", "choices": [choice]}
+            else:
+                choice = {"index": 0, "text": text, "finish_reason": None}
+                yield {**base, "object": "text_completion", "choices": [choice]}
+
+    async def _chunks():
+        for chunk in _source():
+            yield chunk
+
+    async def _collect():
+        return [
+            chunk
+            async for chunk in ChatModelMixin._async_to_chat_completion_chunks(
+                _chunks(), parser, ctx
+            )
+        ]
+
+    for results in (
+        list(ChatModelMixin._to_chat_completion_chunks(_source(), parser, ctx)),
+        asyncio.run(_collect()),
+    ):
+        deltas = [chunk["choices"][0]["delta"] for chunk in results if chunk["choices"]]
+        assert "".join(d.get("reasoning_content") or "" for d in deltas) == reasoning
+        assert "".join(d.get("content") or "" for d in deltas) == content
 
 
 def test_async_to_chat_completion_chunks_with_reasoning_keeps_empty_stream():
@@ -3157,15 +3210,21 @@ def test_to_chat_completion_stopped_while_thinking(text):
 
 
 @pytest.mark.parametrize(
-    "text, content",
+    "text, reasoning, content",
     [
-        ("\n<think>\nThe user asks\n</think>\n\nHello", "\n\nHello"),
-        ("\n<think>\nThe user asks\n</think>", ""),
+        (
+            "\n<think>\nThe user asks\n</think>\n\nHello",
+            "\nThe user asks\n",
+            "\n\nHello",
+        ),
+        ("\n<think>\nThe user asks\n</think>", "\nThe user asks\n", ""),
+        ("a</think>Use the <think> tag", "a", "Use the <think> tag"),
+        ("a</think>b<think>c</think>d", "a", "b<think>c</think>d"),
     ],
 )
-def test_to_chat_completion_text_before_start_tag(text, content):
-    # A newline comes before the start tag. The content is the text after the
-    # end tag, whatever comes before the start tag.
+def test_to_chat_completion_text_before_start_tag(text, reasoning, content):
+    # The content is the text after the end tag, whatever comes before the start
+    # tag. When the prompt ended with the start tag, one after the end tag is content.
     parser = ReasoningParser(
         reasoning_content=True,
         reasoning_start_tag="<think>",
@@ -3191,7 +3250,7 @@ def test_to_chat_completion_text_before_start_tag(text, content):
     result = ChatModelMixin._to_chat_completion(completion, parser)
 
     message = result["choices"][0]["message"]
-    assert message["reasoning_content"] == "\nThe user asks\n"
+    assert message["reasoning_content"] == reasoning
     assert message["content"] == content
 
 

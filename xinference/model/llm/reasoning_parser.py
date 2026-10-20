@@ -126,6 +126,13 @@ class ReasoningParser:
         """
         delta = ChatCompletionChunkDelta()
 
+        if self.reasoning_end_tag in previous_text:
+            # </think> in previous, reasoning content ended earlier,
+            # so a tag in delta is part of the content
+            delta["reasoning_content"] = None
+            delta["content"] = delta_text
+            return self._log_streaming_result(previous_text, delta_text, delta)
+
         # Check if <think> is present in previous or delta.
         # Keep compatibility with models that don't generate <think> tokens.
         if self.reasoning_start_tag in previous_text:
@@ -140,13 +147,6 @@ class ReasoningParser:
                     delta["content"] = content
                 else:
                     delta["content"] = None
-                return self._log_streaming_result(previous_text, delta_text, delta)
-            elif self.reasoning_end_tag in previous_text:
-                # <think> in previous, </think> in previous,
-                # <think> in previous, </think> in previous,
-                # reasoning content ends
-                delta["reasoning_content"] = None
-                delta["content"] = delta_text
                 return self._log_streaming_result(previous_text, delta_text, delta)
             else:
                 # <think> in previous, no </think> in previous or delta,
@@ -230,11 +230,6 @@ class ReasoningParser:
                 else:
                     delta["content"] = None
                 return self._log_streaming_result(previous_text, delta_text, delta)
-            elif self.reasoning_end_tag in previous_text:
-                # </think> in previous, thinking content ends
-                delta["reasoning_content"] = None
-                delta["content"] = delta_text
-                return self._log_streaming_result(previous_text, delta_text, delta)
             else:
                 # no </think> in previous or delta, reasoning content continues
                 delta["reasoning_content"] = delta_text
@@ -273,7 +268,9 @@ class ReasoningParser:
             return model_output, ""
         else:
             # Add a start token if it's missing to keep compatibility.
-            if self.reasoning_start_tag not in model_output:
+            # A start token after the end token is part of the content.
+            before_end = model_output.split(self.reasoning_end_tag, 1)[0]
+            if self.reasoning_start_tag not in before_end:
                 model_output = f"{self.reasoning_start_tag}{model_output}"
             # Use a regex to find the reasoning content
             reasoning_content = self.reasoning_regex.findall(model_output)[0]
@@ -420,6 +417,7 @@ class ReasoningParser:
             return
 
         is_first_chunk = True
+        leading_space = ""
         async for chunk in chunks:
             if is_first_chunk:
                 choices = chunk.get("choices")
@@ -443,6 +441,13 @@ class ReasoningParser:
                         )
                         yield chunk
                         continue
+                    if text.isspace():
+                        # Whitespace can come before the start tag, so hold it
+                        # back until a chunk shows whether the tag follows.
+                        leading_space += text
+                        delta["content"] = ""
+                        yield chunk
+                        continue
                     # If the first chunk doesn't contain the reasoning_start_tag
                     if self.reasoning_start_tag not in text:
                         logger.debug(
@@ -451,7 +456,7 @@ class ReasoningParser:
                         )
                         # Create and yield chunks with reasoning_start_tag and newline
                         yield self._create_chat_completion_chunk(
-                            chunk, f"{self.reasoning_start_tag}\n"
+                            chunk, f"{self.reasoning_start_tag}\n{leading_space}"
                         )
                 else:
                     # For standard completion chunks
@@ -462,6 +467,13 @@ class ReasoningParser:
                         )
                         yield chunk
                         continue
+                    if text.isspace():
+                        # Whitespace can come before the start tag, so hold it
+                        # back until a chunk shows whether the tag follows.
+                        leading_space += text
+                        choices[0]["text"] = ""
+                        yield chunk
+                        continue
                     # If the first chunk doesn't contain the reasoning_start_tag
                     if self.reasoning_start_tag not in text:
                         logger.debug(
@@ -470,7 +482,7 @@ class ReasoningParser:
                         )
                         # Create and yield chunks with reasoning_start_tag and newline
                         yield self._create_completion_chunk(
-                            chunk, f"{self.reasoning_start_tag}\n"
+                            chunk, f"{self.reasoning_start_tag}\n{leading_space}"
                         )
                 is_first_chunk = False
                 yield chunk
@@ -501,6 +513,7 @@ class ReasoningParser:
             return
 
         is_first_chunk = True
+        leading_space = ""
         for chunk in chunks:
             if is_first_chunk:
                 choices = chunk.get("choices")
@@ -524,6 +537,13 @@ class ReasoningParser:
                         )
                         yield chunk
                         continue
+                    if text.isspace():
+                        # Whitespace can come before the start tag, so hold it
+                        # back until a chunk shows whether the tag follows.
+                        leading_space += text
+                        delta["content"] = ""
+                        yield chunk
+                        continue
                     # If the first chunk doesn't contain the reasoning_start_tag
                     if self.reasoning_start_tag not in text:
                         logger.debug(
@@ -532,7 +552,7 @@ class ReasoningParser:
                         )
                         # Create and yield chunks with reasoning_start_tag and newline
                         yield self._create_chat_completion_chunk(
-                            chunk, f"{self.reasoning_start_tag}\n"
+                            chunk, f"{self.reasoning_start_tag}\n{leading_space}"
                         )
                 else:
                     # For standard completion chunks
@@ -543,6 +563,13 @@ class ReasoningParser:
                         )
                         yield chunk
                         continue
+                    if text.isspace():
+                        # Whitespace can come before the start tag, so hold it
+                        # back until a chunk shows whether the tag follows.
+                        leading_space += text
+                        choices[0]["text"] = ""
+                        yield chunk
+                        continue
                     # If the first chunk doesn't contain the reasoning_start_tag
                     if self.reasoning_start_tag not in text:
                         logger.debug(
@@ -551,7 +578,7 @@ class ReasoningParser:
                         )
                         # Create and yield chunks with reasoning_start_tag and newline
                         yield self._create_completion_chunk(
-                            chunk, f"{self.reasoning_start_tag}\n"
+                            chunk, f"{self.reasoning_start_tag}\n{leading_space}"
                         )
                 is_first_chunk = False
                 yield chunk
