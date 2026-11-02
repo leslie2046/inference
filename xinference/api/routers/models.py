@@ -201,7 +201,7 @@ def register_routes(api: "RESTfulAPI") -> None:
     )
     router.add_api_route(
         "/v1/models/{model_uid}/replicas",
-        api.add_model_replica_dispatch,
+        api.add_model_replica,
         methods=["POST"],
         dependencies=([Security(auth, scopes=["models:write"])] if is_auth else None),
     )

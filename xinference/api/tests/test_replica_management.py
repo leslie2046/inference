@@ -17,11 +17,13 @@ import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
+import httpx
 import pytest
-from fastapi import HTTPException
+from fastapi import APIRouter, FastAPI, HTTPException
 
 from ...core.exceptions import ModelReloadInProgress
 from ..restful_api import RESTfulAPI
+from ..routers import models
 
 
 @pytest.fixture
@@ -30,6 +32,41 @@ def replica_api():
     api._uid_to_model_name = {}
     api._app = SimpleNamespace(router=SimpleNamespace(routes=[]))
     return api
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("payload", [None, {"replica": 2}])
+async def test_add_model_replica_route_accepts_optional_body(replica_api, payload):
+    replica = payload["replica"] if payload else 1
+    replicas = [{"replica_id": replica_id} for replica_id in range(replica)]
+    supervisor = AsyncMock()
+    supervisor.add_model_replicas_with_config.return_value = replicas
+    replica_api._get_supervisor_ref = AsyncMock(return_value=supervisor)
+    replica_api._app = FastAPI()
+    replica_api._router = APIRouter()
+    replica_api._auth_service = None
+    replica_api._advanced_auth_service = None
+
+    models.register_routes(replica_api)
+    replica_api._app.include_router(replica_api._router)
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=replica_api._app), base_url="http://test"
+    ) as client:
+        request_kwargs = {"json": payload} if payload is not None else {}
+        response = await client.post("/v1/models/demo/replicas", **request_kwargs)
+
+    assert response.status_code == 200
+    assert response.json() == (
+        replicas[0] if replica == 1 else {"replica": replica, "replicas": replicas}
+    )
+    supervisor.add_model_replicas_with_config.assert_awaited_once_with(
+        model_uid="demo",
+        replica=replica,
+        replica_configs=None,
+        model_engine=None,
+        n_gpu=None,
+    )
 
 
 @pytest.mark.asyncio
