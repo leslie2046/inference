@@ -47,6 +47,7 @@ def get_llm_version_infos():
 
 
 class LLM(abc.ABC):
+    _auto_yarn_env: Optional[str] = None
     supports_cache_salt = False
     allow_batch = False
     supports_tool_controls = False
@@ -249,7 +250,12 @@ class LLM(abc.ABC):
 
         abilities = set(getattr(self.model_family, "model_ability", []) or [])
         engine = type(self).__module__.split(".")[-2]
-        raw_limit = getattr(self, "_model_config", {}).get("limit_mm_per_prompt")
+        explicit_limit = getattr(self, "_explicit_limit_mm_per_prompt", None)
+        raw_limit = (
+            explicit_limit
+            if explicit_limit is not None
+            else getattr(self, "_model_config", {}).get("limit_mm_per_prompt")
+        )
         max_images = raw_limit.get("image") if isinstance(raw_limit, dict) else None
         reasoning = (
             "reasoning" in abilities
@@ -566,11 +572,18 @@ def create_llm_model_instance(
 
     if model_engine is None:
         raise ValueError("model_engine is required for LLM model")
-    from .context_length import map_context_length
+    from .context_length import configure_auto_yarn, map_context_length
 
-    kwargs = map_context_length(model_engine, kwargs)
+    # Validate early, but retain the per-request value while deriving YaRN.
+    # llama.cpp's native n_ctx is the total capacity across all parallel slots.
+    map_context_length(model_engine, kwargs)
     llm_family = match_llm(
-        model_name, model_format, model_size_in_billions, quantization, download_hub
+        model_name,
+        model_format,
+        model_size_in_billions,
+        quantization,
+        download_hub,
+        model_path,
     )
 
     if not llm_family:
@@ -607,6 +620,11 @@ def create_llm_model_instance(
     if not model_path:
         cache_manager = LLMCacheManager(llm_family, multimodal_projector)
         model_path = cache_manager.cache()
+
+    kwargs, context_env = configure_auto_yarn(
+        llm_family, model_engine, kwargs, model_path
+    )
+    kwargs = map_context_length(model_engine, kwargs)
 
     # Speculative decoding: download the drafter checkpoint paired with this
     # spec (e.g. Gemma 4 ``*-it-assistant`` for MTP) unless the user points at
@@ -649,4 +667,5 @@ def create_llm_model_instance(
             model = llm_cls(model_uid, llm_family, model_path, kwargs)
     else:
         model = llm_cls(model_uid, llm_family, model_path, kwargs)
+    model._auto_yarn_env = context_env
     return model

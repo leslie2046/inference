@@ -127,13 +127,14 @@ def test_engine_budget_reserves_retained_memory_without_mutating_config(
 
 
 @pytest.mark.parametrize(
-    "value, expected", [(True, True), (False, False), ("true", True), ("FALSE", False)]
+    "value, expected",
+    [(None, None), (True, True), (False, False), ("true", True), ("FALSE", False)],
 )
 def test_cache_option(value, expected):
     assert parse_weight_cache_option(value) is expected
 
 
-@pytest.mark.parametrize("value", [None, 0, 1, "yes", {}])
+@pytest.mark.parametrize("value", [0, 1, "yes", {}, "auto"])
 def test_invalid_cache_option(value):
     with pytest.raises(ValueError):
         parse_weight_cache_option(value)
@@ -167,6 +168,74 @@ def test_valid_reload_types():
     )
     with pytest.raises(ValueError):
         validate_reload_patch("sglang", {"cuda_graph_max_bs": 16})
+
+
+@pytest.mark.parametrize(
+    "engine,key", [("vllm", "max_model_len"), ("sglang", "context_length")]
+)
+@pytest.mark.parametrize("launched", [None, 262144, 500000, 1000000])
+def test_reload_rejects_context_increases_before_engine_validation(
+    engine, key, launched
+):
+    from ..llm_family import match_llm
+
+    model = WeightCachedModel()
+    model.model_family = match_llm("qwen3.8", "pytorch", 27, "none")
+    model._weight_cache_engine = engine
+    model._reload_config = {key: launched} if launched else {}
+    original = dict(model._reload_config)
+    current = launched or 262144
+    for requested in (current + 1, 2000000):
+        with pytest.raises(ValueError, match="requires a new deployment"):
+            model.validate_reload({key: requested})
+    assert model._reload_config == original
+
+
+@pytest.mark.parametrize(
+    "engine,key,module,argument_class",
+    [
+        ("vllm", "max_model_len", "vllm.engine.arg_utils", "AsyncEngineArgs"),
+        ("sglang", "context_length", "sglang.srt.server_args", "ServerArgs"),
+    ],
+)
+@pytest.mark.parametrize("requested", [500000, 1000000])
+def test_reload_keeps_launch_rope_settings_within_the_current_window(
+    monkeypatch, engine, key, module, argument_class, requested
+):
+    from ..context_length import configure_auto_yarn, map_context_length
+    from ..llm_family import match_llm
+
+    model = WeightCachedModel()
+    model.model_family = match_llm("qwen3.8", "pytorch", 27, "none")
+    model._weight_cache_engine = engine
+    model.model_path = "/models/qwen"
+    model._reload_config, _ = configure_auto_yarn(
+        model.model_family,
+        engine,
+        map_context_length(engine, {"context_length": 1000000}),
+    )
+    model._weight_cache = SimpleNamespace(
+        client_config=lambda: {}, engine_config=lambda cfg: cfg
+    )
+    model._sanitize_model_config = lambda cfg: cfg
+    validated = []
+
+    class EngineArgs:
+        def __init__(self, **kwargs):
+            validated.append(kwargs)
+
+        def create_engine_config(self):
+            pass
+
+    monkeypatch.setitem(
+        sys.modules, module, SimpleNamespace(**{argument_class: EngineArgs})
+    )
+    result = model.validate_reload({key: requested})
+    assert result[key] == requested
+    assert validated[0][key] == requested
+    assert model._reload_config[key] == 1000000
+    rope_key = "hf_overrides" if engine == "vllm" else "json_model_override_args"
+    assert result[rope_key] == model._reload_config[rope_key]
 
 
 def test_reload_error_survives_actor_serialization():
@@ -419,3 +488,130 @@ def test_missing_socket_refuses_reload_even_if_launcher_is_alive(monkeypatch):
     finally:
         daemon.process = None
         daemon.stop()
+
+
+@pytest.fixture
+def auto_cache_model(monkeypatch):
+    from .. import weight_cache
+
+    model = WeightCachedModel()
+    model._weight_cache_engine = "vllm"
+    model._model_config = {"max_num_seqs": 16}
+    model._n_worker = 1
+    model.model_path = "/models/test"
+    model._init_weight_cache(dict(model._model_config))
+    monkeypatch.setattr(weight_cache, "sys", SimpleNamespace(platform="linux"))
+    monkeypatch.setattr(weight_cache, "package_version", lambda engine: "1.0.0")
+    monkeypatch.setitem(
+        sys.modules,
+        "torch",
+        SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: True)),
+    )
+    daemon = MagicMock()
+    daemon.client_config.return_value = {"load_format": "ipc_cache"}
+    monkeypatch.setattr(
+        weight_cache, "WeightCacheDaemon", MagicMock(return_value=daemon)
+    )
+    return model, daemon
+
+
+@pytest.mark.parametrize("engine", ["vllm", "sglang"])
+@pytest.mark.parametrize("option", [None, True, "true", False, "false"])
+def test_cache_mode_resolves_in_model_environment(auto_cache_model, engine, option):
+    model, daemon = auto_cache_model
+    model._weight_cache_engine = engine
+    model._init_weight_cache({"enable_weight_cache": option, **model._model_config})
+    model._prepare_weight_cache()
+    enabled = option not in (False, "false")
+    assert model.get_reload_config()["enabled"] is enabled
+    assert "enable_weight_cache" not in model._model_config
+    assert "enable_weight_cache" not in model._reload_config
+    assert daemon.start.call_count == int(enabled)
+
+
+@pytest.mark.parametrize("option", [None, True])
+@pytest.mark.parametrize(
+    "case",
+    [
+        "old_engine",
+        "platform",
+        "cpu",
+        "gguf",
+        "executor",
+        "worker",
+        "pipeline",
+        "data",
+        "nodes",
+        "xavier",
+        "nixl",
+        "pd",
+        "sleep",
+        "offload",
+        "loader",
+        "lora",
+        "draft",
+    ],
+)
+def test_unsupported_cache_auto_skips_but_explicit_enable_fails(
+    auto_cache_model, monkeypatch, option, case
+):
+    from .. import weight_cache
+
+    model, daemon = auto_cache_model
+    if case == "old_engine":
+        monkeypatch.setattr(weight_cache, "package_version", lambda engine: "0.30.0")
+    elif case == "platform":
+        monkeypatch.setattr(weight_cache, "sys", SimpleNamespace(platform="darwin"))
+    elif case == "cpu":
+        monkeypatch.setitem(
+            sys.modules,
+            "torch",
+            SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: False)),
+        )
+    elif case == "gguf":
+        model.model_spec = SimpleNamespace(model_format="ggufv2")
+    elif case == "executor":
+        model._get_xinference_executor_backend = lambda: "xoscar"
+    elif case == "worker":
+        model._n_worker = 2
+    else:
+        config = {
+            "pipeline": {"pipeline_parallel_size": 2},
+            "data": {"data_parallel_size": 2},
+            "nodes": {"nnodes": 2},
+            "xavier": {"_xavier_cache_config": {}},
+            "nixl": {"_nixl_config": {}},
+            "pd": {"kv_transfer_config": {"kv_role": "kv_producer"}},
+            "sleep": {"enable_sleep_mode": True},
+            "offload": {"cpu_offload_gb": 1},
+            "loader": {"load_format": "ipc_cache"},
+            "lora": {"enable_lora": True},
+            "draft": {"draft_model_path": "/models/draft"},
+        }[case]
+        model._model_config.update(config)
+    model._init_weight_cache({"enable_weight_cache": option, **model._model_config})
+    if option is True:
+        with pytest.raises(ValueError):
+            model._prepare_weight_cache()
+    else:
+        model._prepare_weight_cache()
+        assert model.get_reload_config()["enabled"] is False
+    daemon.start.assert_not_called()
+
+
+def test_auto_cache_does_not_hide_daemon_startup_failure(auto_cache_model):
+    model, daemon = auto_cache_model
+    daemon.start.side_effect = RuntimeError("daemon failed")
+    with pytest.raises(RuntimeError, match="daemon failed"):
+        model._prepare_weight_cache()
+    assert model._weight_cache is None
+
+
+def test_disabled_cache_does_not_probe_environment(auto_cache_model, monkeypatch):
+    model, daemon = auto_cache_model
+    model._init_weight_cache({"enable_weight_cache": False})
+    probe = MagicMock(side_effect=AssertionError("must not probe"))
+    monkeypatch.setattr(model, "_weight_cache_unavailable_reason", probe)
+    model._prepare_weight_cache()
+    probe.assert_not_called()
+    daemon.start.assert_not_called()

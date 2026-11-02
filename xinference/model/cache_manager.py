@@ -38,7 +38,7 @@ class CacheManager:
         return os.path.exists(cache_dir)
 
     def _cache_from_uri(self, model_spec: "CacheableModelSpec") -> str:
-        from .utils import resolve_model_uri
+        from .utils import link_model_uri, resolve_model_uri
 
         cache_dir = self.get_cache_dir()
         if os.path.exists(cache_dir):
@@ -47,8 +47,13 @@ class CacheManager:
 
         assert model_spec.model_uri is not None
         src_root = resolve_model_uri(model_spec.model_uri, model_spec.model_name)
-        os.symlink(src_root, cache_dir, target_is_directory=True)
-        return cache_dir
+        if os.path.islink(cache_dir):
+            # ``os.path.exists`` follows the link, so a dangling symlink (its
+            # target was moved or removed) gets here while still occupying
+            # ``cache_dir``; drop it so it can be recreated.
+            logger.info("Removing stale cache symlink %s", cache_dir)
+            os.unlink(cache_dir)
+        return link_model_uri(src_root, cache_dir)
 
     def _cache(self) -> str:
         from .utils import (
@@ -98,7 +103,11 @@ class CacheManager:
 
             use_symlinks = cache_config
             if not IS_NEW_HUGGINGFACE_HUB:
-                use_symlinks = {"local_dir_use_symlinks": True, "local_dir": cache_dir}
+                use_symlinks = {
+                    **cache_config,
+                    "local_dir_use_symlinks": True,
+                    "local_dir": cache_dir,
+                }
             download_dir = retry_snapshot_download(
                 hf_download,
                 self._model_family.model_name,

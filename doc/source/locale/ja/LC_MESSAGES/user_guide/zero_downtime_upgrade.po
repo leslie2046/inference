@@ -319,14 +319,20 @@ msgstr "モデルとエンジン"
 
 #: ../source/user_guide/zero_downtime_upgrade.rst:137
 msgid ""
-"Open a running model's detail view and choose **Reconfigure / upgrade model**. Engine "
-"replacement requires **Keep GPU weights for reload** (``enable_weight_cache=true``) at"
-" launch, vLLM 0.31.0+ or SGLang 0.5.21+, Linux with CUDA or ROCm, one Worker, one "
-"replica and fixed tensor parallelism."
+"Open a running model's detail view and choose **Reconfigure / upgrade "
+"model**. Engine replacement requires GPU weight retention enabled at launch,"
+" either automatically on a supported configuration or explicitly with "
+"``enable_weight_cache=True``. See :ref:`launch_weight_cache_reload` for "
+"prerequisites and the **Auto**, **Enabled** and **Disabled** settings. "
+"Multiple replicas are supported: each keeps its own weight cache, and model "
+"reload updates them sequentially. See the linked guide for partial failures,"
+" retries and scale-out."
 msgstr ""
-"稼働中のモデルの詳細画面を開き、 **モデルの再設定 / 更新** を選択します。エンジンの置き換えには、起動時に **再読み込み用に GPU の重みを保持** （ "
-"``enable_weight_cache=true`` ）を有効にし、vLLM 0.31.0+ または SGLang 0.5.21+、CUDA または ROCm を備えた"
-" Linux、単一 Worker、単一レプリカ、固定のテンソル並列度を使用する必要があります。"
+"実行中のモデルの詳細画面を開き、**モデルの再設定 / アップグレード** を選びます。エンジンの置換には起動時の GPU "
+"の重みの保持が必要です。対応する設定では自動的に有効になり、``enable_weight_cache=True`` "
+"で明示的に有効にすることもできます。要件と **自動**、**有効**、**無効** の設定は "
+":ref:`launch_weight_cache_reload` を参照してください。 "
+"複数レプリカに対応し、各レプリカが独立した重みキャッシュを保持して順番に更新されます。部分的な失敗、再試行、レプリカ追加についてはリンク先のガイドを参照してください。"
 
 #: ../source/user_guide/zero_downtime_upgrade.rst:149
 msgid ""
@@ -596,3 +602,54 @@ msgid ""
 "Check for updates again to confirm that all components report the new "
 "version."
 msgstr "もう一度更新を確認し、すべてのコンポーネントが新しいバージョンを表示していることを確認します。"
+
+#: ../source/user_guide/zero_downtime_upgrade.rst:21
+msgid "An extension can optionally require controller sessions for Worker management RPCs. Callers must attach the versioned session and an operation ID; normal Supervisors do not add them automatically. A newer session is acknowledged only after management work drains, and failed drain keeps old sessions fenced. The provider must validate current authority on every check. Election and endpoint discovery are separate responsibilities. Worker replacement and model reload are rejected in this mode until session/resource transfer is supported. Without a provider, normal upgrade behavior is unchanged."
+msgstr "拡張機能は、Worker の管理 RPC にコントローラーセッションを要求できます。呼び出し側は、バージョン付きセッションと操作 ID を付加する必要があります。通常の Supervisor はこれらを自動では追加しません。管理処理が完了してから新しいセッションが承認され、処理の完了待ちに失敗しても古いセッションの拒否は維持されます。プロバイダーは検証のたびに現在の権限状態を確認する必要があります。リーダー選出とエンドポイント検出は別の仕組みが担当します。セッションとリソースの移譲がサポートされるまで、このモードでは Worker の置き換えとモデルの再読み込みが拒否されます。プロバイダーがない場合、通常のアップグレード動作は変わりません。"
+
+#: ../../source/user_guide/zero_downtime_upgrade.rst:23
+msgid "Session metadata is also required through same-process ActorRefs. Startup recovery records are retained until an active session is installed. If installation happens during fencing or reconciliation, retry ``install_controller_session`` after activation to resume recovery. Recovery interrupted by a newer session preserves unfinished records."
+msgstr "同一プロセスの ActorRef 経由でもセッション情報が必要です。起動時の復旧記録は、アクティブなセッションがインストールされるまで保持されます。フェンシングまたは調整中にインストールした場合は、有効化後に ``install_controller_session`` を再実行して復旧を再開してください。新しいセッションによって復旧が中断されても、未完了の記録は保持されます。"
+
+#: ../../source/user_guide/zero_downtime_upgrade.rst:25
+msgid "Worker-owned crash recovery and pending cache inventory publication acquire active-session admission for new events; already admitted operations keep their original session. Model OOM reports update only diagnostics for the current model incarnation and do not authorize management commands. Admitted termination finishes cleanup of its original model registration before drain completes. Interrupted native faults retain their intent and retry under active-session admission during installation or a later status report. This mechanism covers public management methods; private Python helpers remain internal. Lightweight heartbeats continue before session installation, during draining and after a drain timeout; they never register the Worker or resume recovery. Full status reports and their registration/recovery work still require active-session admission."
+msgstr "Worker 自身の障害復旧と保留中のキャッシュ一覧の公開は、新しいイベントごとにアクティブなセッションの実行許可を取得します。許可済みの操作は元のセッションを維持します。モデルの OOM 報告は現在のモデルインスタンスの診断情報のみを更新し、管理コマンドを許可するものではありません。 受け入れ済みの終了処理は、ドレインの完了前に元のモデル登録に属するリソースのクリーンアップを完了します。切り替えで中断されたネイティブ障害の処理要求は保持され、セッションのインストール時または後のステータス報告時に、アクティブセッションの許可を得て再試行されます。この仕組みは公開管理メソッドを対象とし、非公開の Python ヘルパーは内部実装に留まります。 軽量ハートビートはセッションのインストール前、ドレイン中、ドレインのタイムアウト後も継続し、Worker の登録や復旧処理は行いません。完全なステータス報告と、それに伴う登録・復旧処理には、引き続きアクティブセッションの許可が必要です。"
+msgid "A Supervisor authority provider can implement ``create_supervisor_control_authority(context)`` with a fixed process session, ``validate`` and ``close``. ``context.runtime`` supplies process-local ``pause(timeout)``, ``restore_worker(ref, replicas, incarnation)`` and ``resume()`` primitives. Optional async ``execute(operation, payload)`` and ``worker_registered(ref)`` hooks delegate extension-owned behavior. The runtime does not select Workers, probe models, confirm membership or orchestrate replacement. Old processes retain their original session. Fixed-session mode rejects native component replacement until session transfer is supported. These mechanisms add no failover command or HA service. Without a provider, normal upgrade behavior is unchanged. The port also provides a settings snapshot. Async provider callbacks execute on the actor loop and may overlap; providers synchronize their own services. A busy pause is rejected before management admission closes. Inference reads are unavailable before the first successful ``resume()``; afterwards, existing routes remain readable through later management pauses. Session-protected startup recovery retries outside the registration lock and retains persisted intent while access is fenced."
+msgstr "Supervisor 権限プロバイダーは ``create_supervisor_control_authority(context)`` を実装し、固定プロセスセッション、``validate``、``close`` を提供できます。``context.runtime`` はプロセス内の ``pause(timeout)``、``restore_worker(ref, replicas, incarnation)``、``resume()`` を提供します。任意の非同期 ``execute(operation, payload)`` と ``worker_registered(ref)`` フックは拡張の動作をプロバイダーに委譲します。ランタイムは Worker の選択、モデルの検査、メンバーの確認、置換の編成を行いません。旧プロセスは元のセッションを保持します。これらの機構はフェイルオーバーコマンドや HA サービスを追加しません。プロバイダー未設定時の通常のアップグレード動作は変わりません。 ポートは設定のスナップショットも提供します。非同期プロバイダーのコールバックは actor のイベントループで実行され、並行する可能性があるため、サービスの同期はプロバイダーが行います。処理中の一時停止要求は、管理操作の受付を閉じる前に拒否されます。最初の ``resume()`` が成功するまで推論の読み取りは利用できません。その後の管理の一時停止中も既存の推論ルートを参照できます。セッションで保護された起動時の復旧は登録ロックの外で再試行し、アクセスが拒否された間は保存済みの意図を保持します。 固定セッションモードは、セッション転送に対応するまでネイティブコンポーネントの置換を拒否します。"
+
+#: ../../source/user_guide/zero_downtime_upgrade.rst:220
+msgid ""
+"The default for ``enable_weight_cache`` changed from ``False`` to automatic "
+"selection (``None``). Retained-weight models now support multiple replicas, "
+"scale-out and sequential reload."
+msgstr ""
+"``enable_weight_cache`` のデフォルト値が ``False`` から自動選択（``None``）に変更されました。 "
+"重みを保持するモデルで、複数レプリカ、レプリカの追加、順次再読み込みに対応しました。"
+
+#: ../source/user_guide/zero_downtime_upgrade.rst:28
+msgid "Admitted calls can use optional asynchronous provider callbacks: ``around_supervisor_call(invocation, call)``, ``around_worker_call(invocation, call)`` and ``around_control_call(invocation, call)``. The immutable invocation describes the target, method, original control context and arguments. Await ``call()`` to execute; argument overrides preserve that context. The runtime supplies no receipts or replay policy. Worker callbacks also retain their original session when the Supervisor reference changes. Read-only ``controller_resource_state``, ``controller_catalog`` and ``control_operation_receipt`` expose observations or provider evidence; unavailable receipts raise. The local port can capture or replace catalogs and settings, list Worker references and invoke a public Supervisor method. Catalog replacement validates definitions first and does not rewrite registration files."
+msgstr "許可済みの呼び出しには、任意の非同期プロバイダーコールバック ``around_supervisor_call(invocation, call)``、``around_worker_call(invocation, call)``、``around_control_call(invocation, call)`` を使用できます。不変の呼び出し情報には対象、メソッド、元の制御コンテキストと引数が含まれます。``call()`` を待機して実行し、引数を変更してもコンテキストは保持されます。ランタイムは実行記録や再実行ポリシーを提供しません。Supervisor 参照が変わっても Worker のコールバックは元のセッションを保持します。読み取り専用の ``controller_resource_state``、``controller_catalog``、``control_operation_receipt`` は観測結果またはプロバイダーの証拠を返し、実行記録が利用できなければエラーになります。ローカルポートではカタログと設定の取得・置換、Worker 参照の一覧取得、Supervisor の公開メソッドの呼び出しができます。カタログ置換は先に定義を検証し、登録ファイルを書き換えません。"
+
+#: ../source/user_guide/zero_downtime_upgrade.rst:30
+msgid "Providers can opt in to ``controller_inventory(include_services=True)`` for ready specialized replicas, shard identities and coordinator observations. Setting the authority attribute ``include_model_services=True`` includes these replicas in ordinary registration reports as well. The local port supplies ``with_service_address(address, call)``, ``model_services(model_uid)`` and ``restore_model_services(model_uid, services)`` for scoped support-actor placement and reference restoration. An optional async ``model_services_changed(model_uid)`` callback can persist completed routing changes. Default placement and registration behavior are unchanged; these primitives do not select a host or perform recovery."
+msgstr "プロバイダーは ``controller_inventory(include_services=True)`` により、準備済みの専用レプリカ、シャード識別子、コーディネーターの観測情報を取得できます。権限プロバイダーに ``include_model_services=True`` を設定すると通常の登録報告にも含まれます。ローカルポートの ``with_service_address(address, call)``、``model_services(model_uid)``、``restore_model_services(model_uid, services)`` は、呼び出しごとの補助 actor 配置と参照の復元を支援します。任意の非同期 ``model_services_changed(model_uid)`` コールバックで完了したルーティング変更を永続化できます。既定の配置と登録動作は変わりません。これらのプリミティブはホスト選択や復旧を実行しません。"
+
+#: ../source/user_guide/zero_downtime_upgrade.rst:32
+msgid "The optional async ``model_service_address(model_uid)`` callback selects a support-actor address for both internal and public launches."
+msgstr "任意の非同期 ``model_service_address(model_uid)`` コールバックは、内部および公開起動の補助 actor アドレスを選択します。"
+
+#: ../source/user_guide/zero_downtime_upgrade.rst:34
+msgid "Optional ``create_model_service(actor_class, args, kwargs, address, uid)`` and ``destroy_model_service(ref)`` callbacks can delegate actor lifetime to Worker ``create_runtime_actor`` and ``destroy_runtime_actor`` management calls, which participate in session admission and draining. Without callbacks, ordinary actor creation and destruction remain unchanged."
+msgstr "任意の ``create_model_service(actor_class, args, kwargs, address, uid)`` と ``destroy_model_service(ref)`` コールバックは、セッション許可とドレインに従う Worker の ``create_runtime_actor`` と ``destroy_runtime_actor`` 管理呼び出しに actor の寿命を委譲できます。コールバックがなければ通常の作成と破棄は変わりません。"
+
+
+msgid "Interceptors describe admitted method calls, not a single overall operation. Child-task cleanup and Worker recovery helpers may produce additional calls with the original command; distinguish them by target and method. Use ``call(args=..., kwargs=...)`` for explicit argument overrides. The top-level keyword mapping is copied; nested payloads are not deep copies. Actor lifetime callbacks preserve native lifetimes and original exceptions. Cleanup notification failures are logged without aborting termination."
+msgstr "インターセプターは操作全体ではなく、許可されたメソッド呼び出しを表します。子タスクのクリーンアップや Worker の復旧ヘルパーは元のコマンドで追加の呼び出しを行うため、対象とメソッドで区別してください。引数の変更には ``call(args=..., kwargs=...)`` を使います。最上位のキーワード辞書のみがコピーされ、入れ子のデータは深くコピーされません。actor のライフサイクルコールバックは本来の実行期間と例外を保持します。クリーンアップ通知の失敗はログに記録され、終了処理を中断しません。"
+
+
+msgid "``restore_worker(..., coordinators=...)`` accepts a list or tuple of ``-rank0`` UIDs, validated before registry mutation. Async ``filter_worker_inventory(ref, replicas)`` may only narrow observations; errors or its ten-second timeout reject registration before publication. Worker catalog replacement participates in management admission and draining; providers serialize snapshot selection with catalog writes. API extensions may set async ``app.state.system_settings_provider(operation, data)`` for ``get``, ``save`` and ``reset``. It owns persistence and token masking; ``ValueError`` from ``save`` returns HTTP 422."
+msgstr "``restore_worker(..., coordinators=...)`` は ``-rank0`` UID のリストまたはタプルを受け取り、登録状態の変更前に検証します。非同期 ``filter_worker_inventory(ref, replicas)`` は観測を絞り込むことだけが可能で、エラーまたは十秒のタイムアウト時は公開前に登録を拒否します。Worker のカタログ置換は管理操作の准入と drain の対象です。プロバイダーはスナップショットの選択とカタログへの書き込みを直列化します。API 拡張は非同期 ``app.state.system_settings_provider(operation, data)`` を設定し、``get``、``save``、``reset`` を処理できます。永続化と token のマスクはプロバイダーが行い、``save`` の ``ValueError`` は HTTP 422 を返します。"
+
+
+msgid "Providers must await ``call()`` directly in the callback task; task-spawning wrappers such as ``asyncio.wait_for`` and ``asyncio.shield`` are unsupported. Local port restore methods require provider-owned ordering while management is paused. Explicit coordinator UIDs are selected by the caller separately from replica filtering, because a Worker may host only a coordinator."
+msgstr "プロバイダーはコールバックと同じタスクで ``call()`` を直接 await する必要があります。``asyncio.wait_for`` や ``asyncio.shield`` などタスクを作るラッパーは非対応です。管理操作の停止中、ローカルポートの復元メソッドの順序はプロバイダーが管理します。Worker が coordinator のみを持つ場合があるため、明示的な coordinator UID はレプリカの絞り込みとは別に呼び出し元が選びます。"

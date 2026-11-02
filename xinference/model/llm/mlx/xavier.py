@@ -94,11 +94,11 @@ def configure_xavier(model, model_path, model_config, cache_config, n_worker):
         raise ValueError("MLX Xavier requires local safetensors weights")
     dtype = (
         cache_config.get("logical_dtype", "float16")
-        if cache_config.get("heterogeneous")
+        if (cache_config.get("heterogeneous") or cache_config.get("shared_prefix"))
         else "float16"
     )
     if dtype not in ("float16", "bfloat16") or (
-        cache_config.get("heterogeneous")
+        (cache_config.get("heterogeneous") or cache_config.get("shared_prefix"))
         and model_config.get("dtype", "auto") not in (None, "auto", dtype)
     ):
         raise ValueError(f"MLX Xavier requires {dtype} weights and KV")
@@ -107,11 +107,15 @@ def configure_xavier(model, model_path, model_config, cache_config, n_worker):
     # generation never inherits unevaluated operations on its Metal stream.
     mx.eval(model.parameters())
     args = asdict(model.args)
-    if cache_config.get("heterogeneous"):
-        if cache_config.get("role") not in (
-            "prefill",
-            "decode",
-        ) or not cache_config.get("host_handoff"):
+    if cache_config.get("heterogeneous") or cache_config.get("shared_prefix"):
+        if not cache_config.get("shared_prefix") and (
+            cache_config.get("role")
+            not in (
+                "prefill",
+                "decode",
+            )
+            or not cache_config.get("host_handoff")
+        ):
             raise ValueError("Cross-engine MLX Xavier requires a host PD handoff")
         # The shared contract describes checkpoint semantics, not engine-specific
         # defaults. Verify MLX's effective geometry and RoPE before using it.
@@ -170,6 +174,94 @@ class MLXXavierCache:
         self._capacity_pages = 0
         self._writes: set = set()
         self.imported_tokens = 0
+        self._history = (
+            MLXXavierCache(contract, config["prefix_cache"])
+            if self.role == "prefill" and config.get("prefix_cache")
+            else None
+        )
+        self._history_lock = asyncio.Lock()
+
+    def _history_batch_size(self):
+        page_bytes = self.contract.num_layers * self.contract.layer_nbytes
+        return max(1, min(128, 32 * 1024**2 // page_bytes))
+
+    async def _fetch_history(self, tokens, cache_salt=None, cache=None, cached=0):
+        if self._history is None or cached % self.contract.block_size:
+            return cache, cached
+        import mlx.core as mx
+
+        from ..xavier.prefix import prefix_keys
+
+        history = self._history
+        try:
+            async with self._history_lock:
+                await history.initialize()
+                keys = prefix_keys(tokens[:-1], self.contract.block_size, cache_salt)
+                start = cached // self.contract.block_size
+                selected = keys[start : start + history._capacity_pages]
+                batch_size = self._history_batch_size()
+                pages = []
+                for offset in range(0, len(selected), batch_size):
+                    batch_keys = selected[offset : offset + batch_size]
+                    batch = await history._call(
+                        "get",
+                        self.contract.fingerprint,
+                        batch_keys,
+                        timeout=history.config.get("read_timeout", 30) + 1,
+                    )
+                    pages.extend(batch)
+                    if len(batch) < len(batch_keys):
+                        break
+                if not pages:
+                    return cache, cached
+                suffix_length = len(pages) * self.contract.block_size
+                restored = history.decode(pages, suffix_length)
+                if cache is None:
+                    cache = restored
+                else:
+                    for prefix, suffix in zip(cache, restored):
+                        suffix.state = tuple(
+                            mx.concatenate([a, b], axis=2)
+                            for a, b in zip(prefix.state, suffix.state)
+                        )
+                    mx.eval([entry.state for entry in restored])
+                try:
+                    await history._call(
+                        "record_import", self.contract.fingerprint, len(pages)
+                    )
+                except Exception:
+                    logger.warning("Could not record MLX history import", exc_info=True)
+                return restored, cached + suffix_length
+        except Exception:
+            logger.warning(
+                "MLX P-side history unavailable; computing locally", exc_info=True
+            )
+            return cache, cached
+
+    async def _publish_history(self, tokens, pages, start=0, cache_salt=None):
+        if self._history is None or not self._history._configured:
+            return
+        from ..xavier.prefix import prefix_keys
+
+        history = self._history
+        try:
+            keys = prefix_keys(tokens[:-1], self.contract.block_size, cache_salt)
+            end = min(len(keys), history._capacity_pages)
+            batch_size = self._history_batch_size()
+            for offset in range(start, end, batch_size):
+                count = min(batch_size, end - offset)
+                await history._call(
+                    "put",
+                    self.contract.fingerprint,
+                    keys[: offset + count],
+                    pages[offset - start : offset - start + count],
+                    offset,
+                )
+        except Exception:
+            logger.warning(
+                "MLX P-side history publication failed; live P/D continues",
+                exc_info=True,
+            )
 
     async def _ensure_configured(self):
         if self._ref is None:
@@ -190,6 +282,8 @@ class MLXXavierCache:
 
     async def initialize(self):
         await asyncio.wait_for(self._ensure_configured(), timeout=30)
+        if self._history is not None:
+            await self._history.initialize()
 
     async def _call(self, method, *args, timeout=30):
         async def invoke():
@@ -200,6 +294,10 @@ class MLXXavierCache:
 
     def keys(self, tokens, cache_salt=None):
         salt = validate_cache_salt(cache_salt)
+        if self.config.get("shared_prefix"):
+            from ..xavier.prefix import prefix_keys
+
+            return prefix_keys(tokens, self.contract.block_size, salt)
         keys = [
             key.digest
             for key in build_prefix_keys(self.contract, tokens, cache_salt=salt or "")
@@ -461,15 +559,23 @@ class MLXXavierCache:
         async def write():
             try:
                 await self.initialize()
+                published = tokens
+                if self.config.get("shared_prefix"):
+                    published = tokens[
+                        : len(tokens)
+                        // self.contract.block_size
+                        * self.contract.block_size
+                    ]
                 if (
-                    len(tokens) + self.contract.block_size - 1
+                    len(published) + self.contract.block_size - 1
                 ) // self.contract.block_size > self._capacity_pages:
                     return
                 start = (
                     cached_tokens // self.contract.block_size * self.contract.block_size
                 )
-                keys = self.keys(tokens, cache_salt)
-                pages = self.encode(cache, tokens, start)
+                start = min(start, len(published))
+                keys = self.keys(published, cache_salt)
+                pages = self.encode(cache, published, start)
                 await self._call(
                     "put",
                     self.contract.fingerprint,
@@ -520,10 +626,15 @@ class MLXXavierCache:
                 source.reserve(room, self.contract.to_dict(), len(tokens)),
                 timeout=transfer_timeout(),
             )
+            cache, cached = await self._fetch_history(tokens, cache_salt)
             batch = PromptProcessingBatch(
-                model, [0], [make_prompt_cache(model)], prefill_step_size=2048
+                model,
+                [0],
+                [cache if cache is not None else make_prompt_cache(model)],
+                tokens=[tokens[:cached]],
+                prefill_step_size=2048,
             )
-            start = 0
+            start = cached
             while start < len(tokens) - 1:
                 end = min(start + 2048, len(tokens) - 1)
                 if prefix_length is not None and start < prefix_length < end:
@@ -551,6 +662,10 @@ class MLXXavierCache:
             pages = self.encode(batch.extract_cache(0), tokens)
             await source.publish(
                 room, self.contract.to_dict(), pages, first_token, len(tokens)
+            )
+            history_start = cached // self.contract.block_size
+            await self._publish_history(
+                tokens, pages[history_start:], history_start, cache_salt
             )
             # CPU ownership now belongs to the source actor. Native engine slots
             # may only be committed after the consumer completes its import.
@@ -607,6 +722,8 @@ class MLXXavierCache:
                 # GPU and copying it back to CPU solely to hand it to D.
                 return metadata
             cache, cached = await self.fetch(tokens, cache_salt=cache_salt)
+            native_cached = cached
+            cache, cached = await self._fetch_history(tokens, cache_salt, cache, cached)
             cache = cache if cache is not None else make_prompt_cache(model)
             # Use the same batched cache/mask and prompt segment boundaries as
             # ordinary MLX generation. Scalar KVCache prefill uses a different
@@ -623,19 +740,29 @@ class MLXXavierCache:
                 start = end
                 await asyncio.sleep(0)
             cache = batch.extract_cache(0)
-            start = cached // self.contract.block_size * self.contract.block_size
+            # History was restored to Metal, not to the live P/D bytes store.
+            # Publish every page absent from that store, including history hits.
+            start = native_cached // self.contract.block_size * self.contract.block_size
+            pages = self.encode(cache, prefix, start)
             if not all(
                 await self._call(
                     "put",
                     self.contract.fingerprint,
                     keys,
-                    self.encode(cache, prefix, start),
+                    pages,
                     start // self.contract.block_size,
                 )
             ):
                 raise RuntimeError(
                     "MLX Xavier could not publish the complete PD prefix"
                 )
+            history_start = cached // self.contract.block_size
+            await self._publish_history(
+                tokens,
+                pages[history_start - start // self.contract.block_size :],
+                history_start,
+                cache_salt,
+            )
             return metadata
         except BaseException:
             await self._release_handoff(ticket)

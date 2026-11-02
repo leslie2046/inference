@@ -650,14 +650,16 @@ def create_embedding_model_instance(
 
     enable_virtual_env = kwargs.pop("enable_virtual_env", None)
     model_family = match_embedding(model_name, model_format, quantization, download_hub)
-    if model_path is None:
-        cache_manager = EmbeddingCacheManager(model_family)
-        model_path = cache_manager.cache()
 
     if model_engine is None:
         # unlike LLM and for compatibility,
-        # we use sentence_transformers as the default engine for all models
-        model_engine = "sentence_transformers"
+        # we use sentence_transformers as the default engine for all models,
+        # except GGUF specs which can only run on llama.cpp.
+        model_engine = (
+            "llama.cpp"
+            if model_family.model_specs[0].model_format == "ggufv2"
+            else "sentence_transformers"
+        )
 
     from .embed_family import (
         check_engine_by_model_name_and_engine,
@@ -684,6 +686,11 @@ def create_embedding_model_instance(
             model_format,
             quantization,
         )
+    # Cache only after the engine is accepted: an invalid engine must not
+    # download the model before it is rejected.
+    if model_path is None:
+        cache_manager = EmbeddingCacheManager(model_family)
+        model_path = cache_manager.cache()
     # Record the engine actually used (including the default fallback above) on
     # the family object so ``to_description`` can surface it to ``/v1/models``.
     # Copy first to avoid mutating a possibly shared family object.

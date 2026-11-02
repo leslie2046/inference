@@ -320,9 +320,22 @@ class ChatModelMixin:
             extensions=["jinja2.ext.loopcontrols"],
         )
         jinja_env.globals["raise_exception"] = raise_exception
+
         # Model templates use the Transformers filter's json.dumps options,
         # including ensure_ascii, which Jinja's built-in filter does not accept.
-        jinja_env.filters["tojson"] = json.dumps
+        # Like Transformers, keep non-ASCII text unless a template asks otherwise.
+        def tojson(
+            x, ensure_ascii=False, indent=None, separators=None, sort_keys=False
+        ):
+            return json.dumps(
+                x,
+                ensure_ascii=ensure_ascii,
+                indent=indent,
+                separators=separators,
+                sort_keys=sort_keys,
+            )
+
+        jinja_env.filters["tojson"] = tojson
         return jinja_env.from_string(chat_template)
 
     @staticmethod
@@ -331,16 +344,24 @@ class ChatModelMixin:
         # Detect templates that iterate tool-call arguments as a mapping.
         # Content-driven (not name-driven) so future models copying this
         # template style are covered automatically.
-        return chat_template is not None and (
-            "tool_call.arguments|items" in chat_template
+        if chat_template is None:
+            return False
+        # Templates spell the same filter or assignment with or without spaces
+        # (``arguments | items``), so match on a copy without them.
+        compact = re.sub(r"\s*([|=])\s*", r"\1", chat_template)
+        return (
+            "tool_call.arguments|items" in compact
             or (
-                "_args = tc.arguments" in chat_template
-                and "_args.items()" in chat_template
+                (
+                    "_args=tc.arguments" in compact
+                    or "_args=tool_call.arguments" in compact
+                )
+                and "_args.items()" in compact
             )
             or "tool_call.function.arguments is not mapping" in chat_template
             or (
-                "args_dict = tool_call.arguments" in chat_template
-                and "args_dict.items()" in chat_template
+                "args_dict=tool_call.arguments" in compact
+                and "args_dict.items()" in compact
             )
         )
 
@@ -1438,6 +1459,10 @@ class ChatModelMixin:
             "usage": usage,
         }
 
+    @staticmethod
+    def _get_audio_url(audio_url: Union[str, Dict[str, str]]) -> str:
+        return audio_url if isinstance(audio_url, str) else audio_url["url"]
+
     def _transform_messages(
         self,
         messages: Union[List[ChatCompletionMessage], List[dict]],
@@ -1462,7 +1487,10 @@ class ChatModelMixin:
                         )
                     elif "audio_url" in item:
                         new_content.append(
-                            {"type": "audio", "audio": item["audio_url"]["url"]}
+                            {
+                                "type": "audio",
+                                "audio": self._get_audio_url(item["audio_url"]),
+                            }
                         )
                     else:
                         logger.warning(

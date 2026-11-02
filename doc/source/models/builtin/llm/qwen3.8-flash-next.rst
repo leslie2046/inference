@@ -20,7 +20,7 @@ Model Spec 1 (pytorch, 125 Billion)
 - **Model Format:** pytorch
 - **Model Size (in billions):** 125
 - **Quantizations:** none
-- **Engines**: vLLM
+- **Engines**: vLLM, SGLang
 - **Model ID:** Qwen/Qwen3.8-Flash-Next
 - **Model Hubs**:  `Hugging Face <https://huggingface.co/Qwen/Qwen3.8-Flash-Next>`__, `ModelScope <https://modelscope.cn/models/Qwen/Qwen3.8-Flash-Next>`__
 
@@ -36,7 +36,7 @@ Model Spec 2 (fp8, 125 Billion)
 - **Model Format:** fp8
 - **Model Size (in billions):** 125
 - **Quantizations:** FP8
-- **Engines**: vLLM
+- **Engines**: vLLM, SGLang
 - **Model ID:** Qwen/Qwen3.8-Flash-Next-FP8
 - **Model Hubs**:  `Hugging Face <https://huggingface.co/Qwen/Qwen3.8-Flash-Next-FP8>`__, `ModelScope <https://modelscope.cn/models/Qwen/Qwen3.8-Flash-Next-FP8>`__
 
@@ -44,4 +44,20 @@ Execute the following command to launch the model, remember to replace ``${quant
 chosen quantization method from the options listed above::
 
    xinference launch --model-engine ${engine} --model-name qwen3.8-Flash-Next --size-in-billions 125 --model-format fp8 --quantization ${quantization}
+
+
+Model Spec 3 (fp4, 125 Billion)
+++++++++++++++++++++++++++++++++++++++++
+
+- **Model Format:** fp4
+- **Model Size (in billions):** 125
+- **Quantizations:** FP4
+- **Engines**: vLLM, SGLang
+- **Model ID:** nvidia/Qwen3.8-Flash-Next-NVFP4
+- **Model Hubs**:  `Hugging Face <https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4>`__, `ModelScope <https://modelscope.cn/models/nv-community/Qwen3.8-Flash-Next-NVFP4>`__
+
+Execute the following command to launch the model, remember to replace ``${quantization}`` with your
+chosen quantization method from the options listed above::
+
+   xinference launch --model-engine ${engine} --model-name qwen3.8-Flash-Next --size-in-billions 125 --model-format fp4 --quantization ${quantization}
 

@@ -24,6 +24,7 @@ INFERENCE_READS = {
     "describe_running_model",
     "get_model_status",
     "list_models",
+    "list_virtual_models",
     "resolve_token_router_runtime",
     "get_token_router_config_after",
 }
@@ -202,6 +203,7 @@ ROUTING_FIELDS = (
     "_pd_roles",
     "_xavier_cache_mapping",
     "_xavier_source_mapping",
+    "_xavier_history_mapping",
     "_block_tracker_mapping",
     "_collective_manager_mapping",
     "_model_reload_status",
@@ -226,6 +228,7 @@ class SupervisorUpgradeState:
         manager = getattr(owner, "_worker_relaunch_manager", None)
         if (
             owner._workers_launching
+            or owner._initial_model_launches
             or any(not task.done() for task in owner._async_launch_tasks)
             or owner._model_reload_tasks
             or owner._cache_uid_to_task
@@ -420,8 +423,10 @@ class SupervisorUpgradeState:
             raise RuntimeError(
                 "Worker coordinator inventory changed while preparing Supervisor"
             )
+        # Protocol-v1 Supervisors predating P-side history omit this new field.
+        routes = {"_xavier_history_mapping": {}, **snapshot["routes"]}
         for name in ROUTING_FIELDS:
-            setattr(owner, name, snapshot["routes"][name])
+            setattr(owner, name, routes[name])
         owner._token_router_registry._instances = snapshot["router_instances"]
         self._router_snapshot_time = snapshot["captured_at"]
         owner._system_settings = snapshot["system_settings"]

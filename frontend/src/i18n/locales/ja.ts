@@ -1,4 +1,63 @@
 const ja = {
+  benchmarks: {
+    charts: {
+      title: '性能曲線',
+      statistic: 'レイテンシ統計',
+      mean: '平均',
+      differentWorkloads:
+        '選択した記録のワークロードまたは Runner 指標バージョンが異なります。設定を確認してから比較してください。',
+      legend: 'テスト記録',
+      noData: '測定データなし',
+      output_throughput: '出力スループット',
+      ttft_ms: '最初のトークンまでの時間（TTFT）',
+      tpot_ms: '出力トークンあたりの時間（TPOT）',
+      concurrency: '同時実行数',
+      hint: '点は実測値です。取得できない指標は空欄のままです。実行中または中断したテストの曲線は未完成の場合があります。',
+    },
+    title: '性能テスト',
+    description: 'サービスの負荷テストを実行し、保存した結果を比較します。',
+    create: '新規テスト',
+    model: 'モデル',
+    selectModel: '稼働中のチャットモデルを選択',
+    name: '名前',
+    inputTokens: '目標入力トークン数（概算）',
+    outputTokens: '最大出力トークン数',
+    concurrency: '同時実行数（カンマ区切り）',
+    requests: '各段階のリクエスト数',
+    warmup: '各段階のウォームアップ数',
+    seed: '乱数シード',
+    workloadHint:
+      '合成テキストはモデルの tokenizer で調整します。実際の長さは変動します。各段階で異なるプロンプトを使用し、ウォームアップを除外します。稼働中モデルの処理能力を使用します。',
+    start: 'テスト開始',
+    history: '履歴',
+    empty: '性能テストはまだありません。',
+    compare: '比較',
+    compareHint:
+      '同じワークロードと指標バージョンを比較してください。各記録を展開すると設定とハードウェアを確認できます。— は取得不可、ITL はストリームチャンク間の間隔です。',
+    created: '作成日時',
+    status: '状態',
+    actions: '操作',
+    successFailed: '成功 / 失敗',
+    inputThroughput: '入力 tok/s',
+    outputThroughput: '出力 tok/s',
+    actualInput: '実際の入力トークン数（平均）',
+    actualOutput: '実際の出力トークン数（平均）',
+    latency: 'レイテンシ P95（ms）',
+    configuration: '設定と環境',
+    logs: '実行ログ',
+    export: 'JSON をエクスポート',
+    stop: '停止',
+    invalidConcurrency: '1～256 の重複しない同時実行数を 10 個まで入力してください。',
+    states: {
+      queued: '待機中',
+      running: '実行中',
+      completed: '完了',
+      failed: '失敗',
+      stopped: '停止',
+      interrupted: '中断',
+    },
+  },
+
   menu: {
     modelManagement: 'モデル管理',
     monitoringManagement: '監視管理',
@@ -491,14 +550,26 @@ const ja = {
     emptyFile: '空のファイルはアップロードできません。',
   },
   launchModel: {
+    runtimePrecision: '実行精度',
+    runtimePrecisionDefault: 'エンジンの既定値（{{precision}}）',
+    runtimePrecisionCustom: '詳細設定を使用',
+    runtimePrecisionBf16: 'BF16（非量子化）',
+    runtimePrecisionUnsupported:
+      '{{engine}} は {{precision}} に対応していません。別の精度を選択してください。',
+    runtimePrecisionHelp:
+      'DiT とテキストエンコーダーに適用し、VAE はネイティブ精度を維持します。明示的な選択は詳細設定の精度を上書きします。FP8 のスケーリングはエンジンにより異なります。',
+
     updateOneModel: '単一モデルを更新',
     updateOneModelDescription:
       '共有カタログの単一モデルを更新し、他のモデルを保持します。重みのダウンロードや実行中モデルの再起動は行いません。',
     catalogModelNamePlaceholder: '正確なモデル名、または world ファミリー名',
     catalogUpdated: 'モデルカタログを更新しました。',
     enableWeightCache: '再読み込み用に GPU の重みを保持',
+    weightCacheAuto: '自動',
+    weightCacheEnabled: '有効',
+    weightCacheDisabled: '無効',
     enableWeightCacheTip:
-      'vLLM 0.31.0+ または SGLang 0.5.21+、Linux GPU、単一ワーカーと単一レプリカが必要です。エンジンの再読み込み中も重みを GPU メモリに保持します。',
+      '自動では、モデルの環境と設定が対応する場合に重みを保持し、それ以外は通常どおり起動します。vLLM 0.31.0+ または SGLang 0.5.21+、Linux GPU が必要で、各レプリカは単一ワーカーに配置します。有効を選ぶと対応を必須とし、無効を選ぶと使用しません。',
     recommendSetup: '実行環境の準備が必要な場合があります。',
     recommendMemory: '利用可能なメモリは未検証です。',
     recommendConfiguration: '構成を推奨',
@@ -552,6 +623,9 @@ const ja = {
     manageCachedModels: 'キャッシュモデル管理',
     manageVirtualEnvironments: '仮想環境を管理',
     favorite: 'お気に入り',
+    featuredModel: 'おすすめ',
+    featuredModelDescription:
+      'Xinference がおすすめするモデルです。モデル一覧で優先的に表示されます。',
     importFavorites: 'ブラウザーのお気に入りをインポート',
     importFavoritesHint: 'このブラウザーに保存したお気に入りを現在のアカウントにインポートします。',
     importFavoritesSharedHint:
@@ -654,6 +728,10 @@ const ja = {
     contextLengthTip:
       'リクエストごとの入力と出力の合計トークン上限です。未設定の場合はモデルの既定値を使用します。',
     contextLengthDefault: 'モデルの既定値',
+    contextLengthYarn:
+      'リクエストごとの入力と出力の合計トークン上限。標準は {{native}} トークン、拡張上限は {{max}} トークンです。標準を超える長さを選ぶと、モデル起動時に YaRN が自動的に有効になります。未設定の場合は標準値を使用します。',
+    contextLengthNative:
+      'リクエストごとの入力と出力の合計トークン上限。標準は {{native}} トークンです。このモデルとエンジンには自動 YaRN 拡張の対応が宣言されていません。未設定の場合はモデルの標準値を使用します。',
     contextLengthUnknown: '最大コンテキストが不明です。トークン上限を入力してください。',
     contextLengthInvalid: '1 から {{max}} までの整数を入力してください。',
     advancedConfiguration: '高度な設定',
@@ -775,14 +853,39 @@ const ja = {
     downloadCompleted: '完了',
   },
   runningModels: {
+    statusUnavailable: 'モデルの状態を更新できません。再試行しています…',
+    statuses: {
+      CREATING: '起動中',
+      LOADING: '読み込み中',
+      UPDATING: '更新中',
+      READY: '実行中',
+      ERROR: '失敗',
+      TERMINATING: '停止中',
+      TERMINATED: '停止済み',
+    },
+    cancelLaunch: '起動をキャンセル',
+    clearFailedRecord: '失敗した起動記録を削除',
+    clearFailedRecordConfirm: 'モデル {{modelUid}} の失敗した起動記録を削除しますか？',
+    cancelLaunchConfirm: 'モデル {{modelUid}} の起動をキャンセルしますか？',
+    launchFailed: 'モデルの起動に失敗しました。以下のレプリカのエラーを確認してください。',
     reload: {
       title: 'モデルの再設定 / 更新',
-      description: '新しい設定の準備中も現在のエンジンがリクエストを処理します。',
+      description:
+        '新しい設定の準備中もモデルはサービスを継続します。レプリカは一つずつ更新されます。',
+      replicaProgress: '更新済みレプリカ：{{completed}} / {{total}}',
+      mixed: 'レプリカごとに値が異なります',
+      partial:
+        '{{completed}}/{{total}} 個のレプリカが完了し、新しい設定を保持しています。失敗したレプリカを確認してから再試行してください。',
+      ready: '更新済み',
+      error: '失敗',
+      cancelled: 'キャンセル済み',
+      skipped: '未更新',
       disabled: 'エンジンパラメーターを変更するには、起動時に GPU の重み保持を有効にしてください。',
       reasoningHint: '現在のリクエスト完了後に適用され、エンジンは再起動しません。',
       imageLimit: 'リクエストあたりの最大画像数',
       default: 'エンジンの既定値',
       apply: '適用',
+      reapply: '表示中の設定を再適用',
       queued: '再読み込み待機中',
       draining: '現在のリクエストの完了を待機中',
       loading: 'エンジンを再構築中',

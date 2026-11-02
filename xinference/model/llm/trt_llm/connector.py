@@ -34,8 +34,10 @@ _clients: weakref.WeakSet = weakref.WeakSet()
 
 
 class XavierClient:
-    def __init__(self):
-        self.config = json.loads(os.environ[CONFIG_ENV])
+    def __init__(self, config=None):
+        self.config = (
+            json.loads(os.environ[CONFIG_ENV]) if config is None else dict(config)
+        )
         self.contract = KVCacheContract.from_dict(self.config["contract"])
         self.pd_gpu = self.config.get("role") in ("prefill", "decode")
         self._ref = None
@@ -70,6 +72,11 @@ class XavierClient:
                 else:
                     self.rpc("configure", self.namespace)
                 self.capacity_bytes = 0
+            elif self.config.get("shared_prefix"):
+                self.namespace = self.rpc("configure", self.contract.to_dict())[
+                    "namespace"
+                ]
+                self.capacity_bytes = self.rpc("get_stats")["capacity_bytes"]
             else:
                 self.namespace = self.rpc(
                     "configure",
@@ -127,13 +134,25 @@ class XavierClient:
 
     def read_prefix(self, keys):
         pages = []
+        page_bytes = self.contract.layer_nbytes * self.contract.num_layers
+        batch_size = (
+            max(1, min(128, 32 * 1024**2 // page_bytes))
+            if self.config.get("shared_prefix")
+            else 128
+        )
         try:
-            for offset in range(0, len(keys), 128):
-                batch = self.rpc("get", self.namespace, keys[offset : offset + 128])
+            for offset in range(0, len(keys), batch_size):
+                batch_keys = keys[offset : offset + batch_size]
+                batch = self.rpc("get", self.namespace, batch_keys)
                 for page in batch:
                     if page is None:
                         return pages
                     expected = self.contract.layer_nbytes * self.contract.num_layers
+                    if self.config.get("shared_prefix"):
+                        if type(page) is not bytes or len(page) != expected:
+                            raise ValueError("Invalid shared-prefix KV page")
+                        pages.append(page)
+                        continue
                     if (
                         page.dtype != torch.uint8
                         or page.device.type != "cpu"
@@ -141,6 +160,9 @@ class XavierClient:
                     ):
                         raise ValueError("TRT-LLM Xavier returned invalid KV page data")
                     pages.append(page.clone())
+                # The bytes store ends a response at the first missing page.
+                if len(batch) < len(batch_keys):
+                    break
         except Exception:
             # Nothing has been admitted yet: remote loss can safely be a miss.
             logger.warning(
@@ -179,6 +201,17 @@ class XavierConnectorScheduler(KvCacheConnectorScheduler):
         super().__init__(llm_args)
         self.client = XavierClient()
         self.contract = self.client.contract
+        self._history = (
+            XavierClient(
+                {
+                    **self.client.config["prefix_cache"],
+                    "contract": self.contract.to_dict(),
+                }
+            )
+            if getattr(self.client, "config", {}).get("role") == "prefill"
+            and self.client.config.get("prefix_cache")
+            else None
+        )
         self._pending = {}
         self._allocations = {}
         self._pd_requests = {}
@@ -186,6 +219,10 @@ class XavierConnectorScheduler(KvCacheConnectorScheduler):
         self._pd_destinations = {}
 
     def _keys(self, tokens):
+        if self.client.config.get("shared_prefix") or self._history is not None:
+            from ..xavier.prefix import prefix_keys
+
+            return prefix_keys(tokens, self.contract.block_size)
         return [key.digest for key in build_prefix_keys(self.contract, tokens)]
 
     def get_num_new_matched_tokens(self, request, num_computed_tokens):
@@ -199,6 +236,10 @@ class XavierConnectorScheduler(KvCacheConnectorScheduler):
             if state.role == "prefill":
                 self._pd_sources[request_id] = state
                 state.engine_request_id = request_id
+                if self._history is not None:
+                    return self._match_prefix(
+                        request, num_computed_tokens, self._history
+                    )
                 return 0, False
             if num_computed_tokens:
                 raise ValueError("TRT-LLM P/D requires an isolated destination prefix")
@@ -208,6 +249,9 @@ class XavierConnectorScheduler(KvCacheConnectorScheduler):
             return count, bool(count)
         if self.client.pd_gpu:
             return 0, False  # TRT initialization requests do not share history.
+        return self._match_prefix(request, num_computed_tokens, self.client)
+
+    def _match_prefix(self, request, num_computed_tokens, client):
         block = self.contract.block_size
         if num_computed_tokens % block:
             return 0, False
@@ -219,16 +263,21 @@ class XavierConnectorScheduler(KvCacheConnectorScheduler):
         pending_bytes = sum(
             len(pages) * page_bytes for _, pages in self._pending.values()
         )
-        available = max(self.client.capacity_bytes - pending_bytes, 0) // page_bytes
-        pages = self.client.read_prefix(keys[start : start + available])
+        available = max(client.capacity_bytes - pending_bytes, 0) // page_bytes
+        pages = client.read_prefix(keys[start : start + available])
         if pages:
-            self._pending[request_id] = (start, pages)
+            self._pending[request.request_id] = (start, pages)
         return len(pages) * block, False
 
     def update_state_after_alloc(self, request, block_ids):
         state = self._pd_requests.get(request.request_id)
         self._allocations[request.request_id] = (
-            ([] if state is not None else self._keys(list(request.get_tokens(0)))),
+            (
+                []
+                if state is not None
+                and not (state.role == "prefill" and self._history is not None)
+                else self._keys(list(request.get_tokens(0)))
+            ),
             list(block_ids),
         )
 
@@ -261,6 +310,24 @@ class XavierConnectorScheduler(KvCacheConnectorScheduler):
                     raise ValueError("TRT-LLM allocated too few P/D KV blocks")
                 if state.role == "prefill":
                     metadata.pd_saves.append((state, blocks[: state.num_pages]))
+                    if self._history is not None:
+                        imported = 0
+                        if pending is not None:
+                            start, pages = pending
+                            if start + len(pages) > len(blocks):
+                                raise ValueError(
+                                    "TRT-LLM allocated too few history blocks"
+                                )
+                            metadata.loads.extend(
+                                zip(blocks[start : start + len(pages)], pages)
+                            )
+                            imported = len(pages) * self.contract.block_size
+                        complete = (
+                            request.computed_position
+                            + imported
+                            + request.num_scheduled_tokens
+                        ) // self.contract.block_size
+                        metadata.saves.extend(zip(keys[:complete], blocks[:complete]))
                 else:
                     metadata.pd_loads.append((state, blocks[: state.num_pages]))
                 continue
@@ -306,6 +373,17 @@ class XavierConnectorWorker(KvCacheConnectorWorker):
         super().__init__(llm_args)
         self.client = XavierClient()
         self.contract = self.client.contract
+        self._history = (
+            XavierClient(
+                {
+                    **self.client.config["prefix_cache"],
+                    "contract": self.contract.to_dict(),
+                }
+            )
+            if getattr(self.client, "config", {}).get("role") == "prefill"
+            and self.client.config.get("prefix_cache")
+            else None
+        )
         self.pool = None
         self._waiting_saves = set()
         self._finished_saves = set()
@@ -353,11 +431,24 @@ class XavierConnectorWorker(KvCacheConnectorWorker):
             [slot for slot, _ in metadata.loads]
             + [slot for _, slots in metadata.pd_loads for slot in slots]
         )
-        for slot, page in metadata.loads:
-            self.pool[slot].copy_(
-                page.view(self.pool.dtype).reshape(self.pool.shape[1:]),
-                non_blocking=False,
+        if metadata.loads and (
+            self.client.config.get("shared_prefix") or self._history is not None
+        ):
+            from ..xavier.backends.torch.prefix import unpack_pages
+            from .cross_engine import canonical_trt_views
+
+            unpack_pages(
+                canonical_trt_views(self.pool, self.contract),
+                [slot for slot, _ in metadata.loads],
+                [page for _, page in metadata.loads],
+                self.contract,
             )
+        else:
+            for slot, page in metadata.loads:
+                self.pool[slot].copy_(
+                    page.view(self.pool.dtype).reshape(self.pool.shape[1:]),
+                    non_blocking=False,
+                )
         for state, blocks in metadata.pd_loads:
             from .gpu import service
 
@@ -369,8 +460,9 @@ class XavierConnectorWorker(KvCacheConnectorWorker):
         if metadata.loads:
             # Copy completion, not a lookup, is the evidence for imported KV.
             try:
-                self.client.rpc(
-                    "record_import", self.client.namespace, len(metadata.loads)
+                cache_client = self._history or self.client
+                cache_client.rpc(
+                    "record_import", cache_client.namespace, len(metadata.loads)
                 )
             except Exception:
                 logger.warning("Could not record TRT-LLM Xavier imports", exc_info=True)
@@ -401,24 +493,73 @@ class XavierConnectorWorker(KvCacheConnectorWorker):
                 # This cancellation must not escape TRT's batch-wide callback.
                 continue
             state.registered = bool(blocks)
-        for offset in range(0, len(metadata.saves), 128):
-            batch = metadata.saves[offset : offset + 128]
-            keys = [key for key, _ in batch]
-            pages = [
-                self.pool[slot]
-                .detach()
-                .cpu()
-                .contiguous()
-                .view(torch.uint8)
-                .reshape(-1)
-                .clone()
-                for _, slot in batch
+        if not metadata.saves:
+            return
+        cache_client = self._history or self.client
+        shared_prefix = cache_client.config.get("shared_prefix")
+        page_bytes = self.contract.num_layers * self.contract.layer_nbytes
+        batch_size = (
+            max(1, min(128, 32 * 1024**2 // page_bytes)) if shared_prefix else 128
+        )
+        saves = metadata.saves
+        start = 0
+        if shared_prefix:
+            # Request prefixes are causal: keeping their first occurrence also
+            # keeps every head before its suffix, including overlapping requests.
+            slots_by_key = {}
+            for key, slot in saves:
+                slots_by_key.setdefault(key, slot)
+            saves = list(slots_by_key.items())[
+                : min(cache_client.capacity_bytes // page_bytes, 4096)
             ]
+            keys = [key for key, _ in saves]
             try:
-                self.client.rpc("put", self.client.namespace, keys, pages)
+                start = cache_client.rpc(
+                    ("pending_prefix" if self._history is not None else "exists"),
+                    cache_client.namespace,
+                    keys,
+                )
+            except Exception:
+                logger.warning("TRT-LLM Xavier publication failed", exc_info=True)
+                return
+        for offset in range(start, len(saves), batch_size):
+            batch = saves[offset : offset + batch_size]
+            try:
+                if shared_prefix:
+                    from ..xavier.backends.torch.prefix import pack_pages
+                    from .cross_engine import canonical_trt_views
+
+                    pages = pack_pages(
+                        canonical_trt_views(self.pool, self.contract),
+                        [slot for _, slot in batch],
+                        self.contract,
+                    )
+                    cache_client.rpc(
+                        "put",
+                        cache_client.namespace,
+                        keys[: offset + len(batch)],
+                        pages,
+                        offset,
+                    )
+                else:
+                    pages = [
+                        self.pool[slot]
+                        .detach()
+                        .cpu()
+                        .contiguous()
+                        .view(torch.uint8)
+                        .reshape(-1)
+                        .clone()
+                        for _, slot in batch
+                    ]
+                    self.client.rpc(
+                        "put", self.client.namespace, [key for key, _ in batch], pages
+                    )
             except Exception:
                 # Publishing is optional; failure leaves subsequent requests cold.
                 logger.warning("TRT-LLM Xavier publication failed", exc_info=True)
+                if shared_prefix:
+                    break
 
     def get_finished(self, finished_gen_req_ids, started_loading_req_ids):
         if not self.client.pd_gpu:

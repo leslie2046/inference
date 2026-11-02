@@ -47,6 +47,8 @@ class VideoModelFamilyV2(CacheableModelSpec, ModelInstanceInfoMixin):
     engine: Optional[str]
     model_engine: Optional[str] = None
     model_format: Optional[str]
+    runtime_precisions: Optional[List[str]] = None
+    default_runtime_precision: Optional[str] = None
     cache_name: Optional[str]
     gguf_model_id: Optional[str]
     gguf_quantizations: Optional[List[str]]
@@ -198,6 +200,10 @@ def create_video_model_instance(
     )
     model_spec = match_diffusion(model_name, download_hub, model_engine=model_engine)
 
+    from .precision import apply_runtime_precision
+
+    kwargs = apply_runtime_precision(model_spec, model_engine, kwargs)
+
     if model_engine is None:
         available_engines = VIDEO_ENGINES.get(model_name, {})
         model_engine = next(iter(available_engines), "diffusers")
@@ -223,16 +229,22 @@ def create_video_model_instance(
             quantization,
         )
 
+    # Reject an unsupported lightning option before any cache call can download.
+    if (
+        lightning_version or lightning_model_path
+    ) and not model_spec.lightning_versions:
+        raise ValueError(f"Model {model_name} does not support lightning acceleration")
+    if not lightning_model_path and lightning_version:
+        VideoCacheManager(model_spec).check_lightning(lightning_version)
+    if not gguf_model_path and gguf_quantization:
+        VideoCacheManager(model_spec).check_gguf(gguf_quantization)
+
     if not model_path:
         cache_manager = VideoCacheManager(model_spec)
         model_path = cache_manager.cache()
     if not gguf_model_path and gguf_quantization:
         cache_manager = VideoCacheManager(model_spec)
         gguf_model_path = cache_manager.cache_gguf(gguf_quantization)
-    if (
-        lightning_version or lightning_model_path
-    ) and not model_spec.lightning_versions:
-        raise ValueError(f"Model {model_name} does not support lightning acceleration")
     if not lightning_model_path and lightning_version:
         cache_manager = VideoCacheManager(model_spec)
         lightning_model_path = cache_manager.cache_lightning(lightning_version)

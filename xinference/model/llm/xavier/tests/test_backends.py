@@ -187,6 +187,7 @@ def test_packed_export_owns_pages_independently(backend):
 async def test_storage_adapter_releases_every_successful_read_lock():
     storage = module._LMCacheStorage.__new__(module._LMCacheStorage)
     storage._closed = threading.Event()
+    storage._remote_keys = None
     storage._key = lambda key: key
     storage._layout = None
     storage._group_type = lambda *args: args
@@ -224,12 +225,19 @@ def _require_real_lmcache():
 async def _wait_for_disk_writes(store, path, count):
     deadline = asyncio.get_running_loop().time() + 10
     while True:
-        controllers = store._storage.manager.report_status()[
-            "store_controllers"
-        ].values()
-        if len(list(path.rglob("*.data"))) >= count and all(
-            status["pending_keys_count"] == 0 and status["in_flight_task_count"] == 0
-            for status in controllers
+        status = store._storage.manager.report_status()
+        controllers = status["store_controllers"].values()
+        if (
+            len(list(path.rglob("*.data"))) >= count
+            and all(
+                status["pending_keys_count"] == 0
+                and status["in_flight_task_count"] == 0
+                for status in controllers
+            )
+            and all(
+                manager["read_locked_count"] == manager["write_locked_count"] == 0
+                for manager in status["l1_managers"].values()
+            )
         ):
             return
         assert asyncio.get_running_loop().time() < deadline, "Disk writes did not drain"

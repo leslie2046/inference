@@ -20,6 +20,7 @@ import requests
 from ..common import (
     convert_float_to_int_or_str,
     encode_world_reference,
+    normalize_endpoint,
     streaming_response_iterator,
 )
 
@@ -216,7 +217,7 @@ class RESTfulRerankModelHandle(RESTfulModelHandle):
         response = self.session.post(url, json=request_body, headers=self.auth_headers)
         if response.status_code != 200:
             raise RuntimeError(
-                f"Failed to rerank documents, detail: {response.json()['detail']}"
+                f"Failed to rerank documents, detail: {_get_error_string(response)}"
             )
         response_data = response.json()
         return response_data
@@ -1170,7 +1171,7 @@ class RESTfulFlexibleModelHandle(RESTfulModelHandle):
 
 class Client:
     def __init__(self, base_url, api_key: Optional[str] = None):
-        self.base_url = base_url
+        self.base_url = normalize_endpoint(base_url)
         self._headers: Dict[str, str] = {}
         self._cluster_authed = False
         self.session = requests.Session()
@@ -1221,7 +1222,7 @@ class Client:
         response = self.session.get(url, headers=self._headers)
         if response.status_code != 200:
             raise RuntimeError(
-                f"Failed to fetch VLLM models. detail: {response.json()['detail']}"
+                f"Failed to fetch VLLM models. detail: {_get_error_string(response)}"
             )
 
         try:
@@ -1238,7 +1239,9 @@ class Client:
 
         response = self.session.post(url, json=payload)
         if response.status_code != 200:
-            raise RuntimeError(f"Failed to login, detail: {response.json()['detail']}")
+            raise RuntimeError(
+                f"Failed to login, detail: {_get_error_string(response)}"
+            )
 
         response_data = response.json()
         # Only bearer token for now
@@ -1455,7 +1458,8 @@ class Client:
     ) -> Dict[str, Any]:
         """Start an asynchronous parameter reload with the same model UID.
 
-        Engine changes require launch-time ``enable_weight_cache=True``;
+        Engine changes require weight retention enabled at launch (automatic
+        on supported configurations, or ``enable_weight_cache=True``);
         a standalone ``reasoning_content`` update does not. Use
         ``get_model_reload_status`` to wait for ready/error after HTTP 202.
         """

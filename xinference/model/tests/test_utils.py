@@ -1343,3 +1343,85 @@ def test_tqdm_patch_accepts_default_update_increment():
             bar.update()
             assert bar.n == 2
             assert downloader.get_progress() == 1.0
+
+
+def _symlink_error(winerror):
+    error = OSError(1, "A required privilege is not held by the client")
+    error.winerror = winerror
+    return error
+
+
+@pytest.mark.parametrize("is_dir", [True, False])
+def test_link_model_uri_falls_back_without_windows_symlink_privilege(
+    tmp_path, monkeypatch, is_dir
+):
+    from .. import utils
+
+    src = tmp_path / ("model" if is_dir else "model.gguf")
+    if is_dir:
+        src.mkdir()
+    else:
+        src.write_bytes(b"GGUF")
+    cache_dir = str(tmp_path / "cache" / "model")
+
+    def fake_symlink(*args, **kwargs):
+        raise _symlink_error(1314)
+
+    monkeypatch.setattr(utils.os, "name", "nt")
+    monkeypatch.setattr(utils.os, "symlink", fake_symlink)
+    assert utils.link_model_uri(str(src), cache_dir) == str(src)
+
+
+def test_link_model_uri_reraises_other_symlink_errors(tmp_path, monkeypatch):
+    from .. import utils
+
+    def fake_symlink(*args, **kwargs):
+        raise _symlink_error(5)
+
+    monkeypatch.setattr(utils.os, "name", "nt")
+    monkeypatch.setattr(utils.os, "symlink", fake_symlink)
+    with pytest.raises(OSError):
+        utils.link_model_uri(str(tmp_path), str(tmp_path / "cache"))
+
+
+def test_link_model_uri_links_file_as_file(tmp_path, monkeypatch):
+    from .. import utils
+
+    calls = []
+    monkeypatch.setattr(
+        utils.os, "symlink", lambda *args, **kwargs: calls.append(kwargs)
+    )
+    src = tmp_path / "model.gguf"
+    src.write_bytes(b"GGUF")
+    cache_dir = str(tmp_path / "cache")
+    assert utils.link_model_uri(str(src), cache_dir) == cache_dir
+    assert calls == [{"target_is_directory": False}]
+
+
+def test_cache_manager_relinks_a_dangling_model_uri_link(tmp_path, monkeypatch):
+    from ... import constants
+    from ..cache_manager import CacheManager
+
+    old_path = tmp_path / "old" / "model"
+    old_path.mkdir(parents=True)
+    try:
+        (tmp_path / "probe").symlink_to(old_path, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"Symbolic links are unavailable: {exc}")
+    monkeypatch.setattr(constants, "XINFERENCE_CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setattr(constants, "XINFERENCE_MODEL_DIR", str(tmp_path / "custom"))
+    monkeypatch.setattr(CacheManager, "is_initialized", False)
+    family = SimpleNamespace(
+        model_name="my-image", cache_name=None, model_uri=str(old_path)
+    )
+    cache_dir = CacheManager(family).cache()
+    assert os.path.islink(cache_dir)
+
+    # Moving the weights leaves the cache entry as a dangling symlink.
+    new_path = tmp_path / "new" / "model"
+    new_path.parent.mkdir()
+    old_path.rename(new_path)
+    family.model_uri = str(new_path)
+
+    assert CacheManager(family).cache() == cache_dir
+    assert os.path.realpath(cache_dir) == os.path.realpath(new_path)

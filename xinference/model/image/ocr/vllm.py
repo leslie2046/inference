@@ -25,13 +25,16 @@ from ...utils import allow_trust_remote_code
 from .deepseek_ocr import DeepSeekOCRModel
 from .got_ocr2 import GotOCR2Model
 from .hunyuan_ocr import HunyuanOCRModel
+from .minicpm_ocr import MiniCPMOCRModel
 from .navidc_ocr import NaviDCOCRModel
 from .ovisocr2 import OvisOCR2Model
+from .ovisocr3 import ThreadedOvisOCR3Model
 from .paddleocr_vl import PaddleOCRVLModel
 from .teleocr import TeleOCRModel
 
 logger = logging.getLogger(__name__)
 _navidc_vllm_executor_lock = threading.Lock()
+_minicpm_vllm_executor_lock = threading.Lock()
 
 
 def _load_vllm_model(model_path: str, model_kwargs: Dict[str, Any]):
@@ -509,5 +512,146 @@ class VLLMOvisOCR2Model(OvisOCR2Model):
         return self._postprocess_output(texts[0], filter_imgtags) if texts else ""
 
 
+class VLLMOvisOCR3Model(ThreadedOvisOCR3Model):
+    required_libs = ("vllm",)
+
+    def load(self) -> None:
+        vllm_kwargs = _sanitize_vllm_kwargs(self._kwargs)
+        # These are processor arguments rather than EngineArgs.
+        vllm_kwargs.pop("min_pixels", None)
+        vllm_kwargs.pop("max_pixels", None)
+        vllm_kwargs.setdefault("gpu_memory_utilization", 0.8)
+        vllm_kwargs.setdefault("gdn_prefill_backend", "triton")
+        vllm_kwargs.setdefault("limit_mm_per_prompt", {"image": 1})
+        self._model = self._run_on_engine_thread(
+            _load_vllm_model, self._model_path, vllm_kwargs
+        )
+        try:
+            self._processor = self._run_on_engine_thread(self._model.get_tokenizer)
+        except Exception:
+            self.stop()
+            raise
+
+    def _shutdown_model(self) -> None:
+        _shutdown_vllm_model(self._model)
+
+    def ocr(
+        self,
+        image: PIL.Image.Image,
+        prompt: Optional[str] = None,
+        filter_imgtags: bool = True,
+        **kwargs: Any,
+    ) -> str:
+        if not isinstance(image, PIL.Image.Image):
+            raise ValueError("Input must be a PIL Image")
+        from vllm import SamplingParams
+
+        if self._model is None or self._processor is None:
+            self.load()
+        assert self._model is not None
+        assert self._processor is not None
+        normalized_prompt = self._normalize_prompt(prompt)
+        text = self._processor.apply_chat_template(
+            self._messages(normalized_prompt),
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=False,
+        )
+        inputs = [
+            {
+                "prompt": text,
+                "multi_modal_data": {"image": [image.convert("RGB")]},
+                "mm_processor_kwargs": {
+                    "images_kwargs": {
+                        "min_pixels": self._kwargs.get("min_pixels", self.MIN_PIXELS),
+                        "max_pixels": self._kwargs.get("max_pixels", self.MAX_PIXELS),
+                    }
+                },
+            }
+        ]
+        sampling_kwargs = self._generation_kwargs(kwargs)
+        sampling_kwargs.pop("use_cache", None)
+        do_sample = sampling_kwargs.pop("do_sample", False)
+        sampling_kwargs["max_tokens"] = sampling_kwargs.pop("max_new_tokens")
+        sampling_kwargs.setdefault("temperature", 1.0 if do_sample else 0.0)
+        outputs = self._run_on_engine_thread(
+            self._model.generate, inputs, SamplingParams(**sampling_kwargs)
+        )
+        text = outputs[0].outputs[0].text if outputs and outputs[0].outputs else ""
+        return self._process_output(text, normalized_prompt, filter_imgtags)
+
+
 class VLLMPaddleOCRVLModel(PaddleOCRVLModel):
     required_libs = ("vllm",)
+
+
+class VLLMMiniCPMOCRModel(MiniCPMOCRModel):
+    required_libs = ("vllm",)
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
+
+    def _run_on_vllm_thread(self, fn, *args, **kwargs):
+        # vLLM's offline client must be created and used on the same thread.
+        with _minicpm_vllm_executor_lock:
+            if self._executor is None:
+                self._executor = concurrent.futures.ThreadPoolExecutor(
+                    max_workers=1, thread_name_prefix=f"minicpm-ocr-{self._model_uid}"
+                )
+            executor = self._executor
+        return executor.submit(fn, *args, **kwargs).result()
+
+    def load(self) -> None:
+        config = _sanitize_vllm_kwargs(self._kwargs)
+        config.setdefault(
+            "trust_remote_code", allow_trust_remote_code(self.model_family)
+        )
+        config.setdefault("max_model_len", 40960)
+        config.setdefault("limit_mm_per_prompt", {"image": 1, "video": 0})
+        config.setdefault("mm_processor_kwargs", {"downsample_mode": "4x"})
+        try:
+            self._model = self._run_on_vllm_thread(
+                _load_vllm_model, self._model_path, config
+            )
+            self._tokenizer = self._run_on_vllm_thread(self._model.get_tokenizer)
+        except Exception:
+            self.stop()
+            raise
+
+    def stop(self) -> None:
+        try:
+            if self._model is not None:
+                self._run_on_vllm_thread(_shutdown_vllm_model, self._model)
+        finally:
+            self._model = None
+            self._tokenizer = None
+            with _minicpm_vllm_executor_lock:
+                executor, self._executor = self._executor, None
+            if executor is not None:
+                executor.shutdown(wait=False)
+
+    def ocr(
+        self, image: PIL.Image.Image, prompt: Optional[str] = None, **kwargs: Any
+    ) -> str:
+        image = self._prepare_image(image)
+        if self._model is None or self._tokenizer is None:
+            self.load()
+        assert self._model is not None
+        assert self._tokenizer is not None
+        text = self._tokenizer.apply_chat_template(
+            self._messages(image, prompt),
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=False,
+        )
+        for key in self.NON_GENERATION_KWARGS + ("use_cache",):
+            kwargs.pop(key, None)
+        kwargs.setdefault("max_new_tokens", 4096)
+        inputs = [{"prompt": text, "multi_modal_data": {"image": image}}]
+        sampling_params = _build_sampling_params(kwargs)
+        outputs = self._run_on_vllm_thread(
+            self._model.generate, inputs, sampling_params
+        )
+        texts = _extract_text(outputs)
+        return texts[0] if texts else ""

@@ -812,6 +812,7 @@ class MLXBatchModel:
 
 
 class MLXModelConfig(TypedDict, total=False):
+    _xinference_auto_yarn: Dict[str, Any]
     _xavier_cache_config: dict
     revision: Optional[str]
     max_gpu_memory: str
@@ -911,6 +912,9 @@ class MLXModel(LLM, ChatModelMixin):
         ChatModelMixin.__init__(self)
         self._use_fast_tokenizer = True
         self._model_config: MLXModelConfig = self._sanitize_model_config(model_config)
+        self._auto_yarn_parameters = self._model_config.pop(
+            "_xinference_auto_yarn", None
+        )
         self._context_length_limit = self._model_config.get("context_length")
         self._context_length: Optional[int] = None
         # for distributed
@@ -1023,7 +1027,7 @@ class MLXModel(LLM, ChatModelMixin):
         ):
             if getattr(self, "_xavier", None) is not None:
                 raise NotImplementedError(
-                    "MLX P/D models do not support constrained output"
+                    "MLX Xavier models do not support constrained output or thinking budgets"
                 )
             from .structured import JSONLogitsProcessor, json_schema
 
@@ -1402,6 +1406,10 @@ class MLXModel(LLM, ChatModelMixin):
             tokenizer_config=tokenizer_config,
             model_config=self._model_config,
         )
+        if self._auto_yarn_parameters:
+            from .yarn import apply_auto_yarn
+
+            apply_auto_yarn(model, self._auto_yarn_parameters)
         if stop_token_ids := self.model_family.stop_token_ids:
             for stop_token_id in stop_token_ids:
                 # mlx_lm's TokenizerWrapper used to expose ``add_eos_token``
@@ -1489,6 +1497,10 @@ class MLXModel(LLM, ChatModelMixin):
             lazy=True,
             get_model_classes=self._get_classes,
         )
+        if self._auto_yarn_parameters:
+            from .yarn import apply_auto_yarn
+
+            apply_auto_yarn(self._model, self._auto_yarn_parameters)
         model = self._model.model
         model.rank = self._shard
         model.world_size = self._n_worker
@@ -1604,7 +1616,10 @@ class MLXModel(LLM, ChatModelMixin):
         self._context_length = get_context_length_from_config(
             config, context_length=self._model_config.get("context_length")
         )
-        if self._xavier_config and self._xavier_config.get("heterogeneous"):
+        if self._xavier_config and (
+            self._xavier_config.get("heterogeneous")
+            or self._xavier_config.get("shared_prefix")
+        ):
             self._context_length = (
                 self._model_config.get("context_length") or self._context_length
             )
@@ -2085,7 +2100,7 @@ class MLXModel(LLM, ChatModelMixin):
                 or generate_config.get("_mlx_thinking_budget") is not None
             ):
                 raise NotImplementedError(
-                    "MLX P/D models do not support constrained output"
+                    "MLX Xavier models do not support constrained output or thinking budgets"
                 )
             if xavier.role == "prefill":
                 if (
@@ -2740,7 +2755,19 @@ class MLXVisionModel(MLXModel, ChatModelMixin):
 
         self._prompt_cache = PromptCache()
 
-        return load(self.model_path)
+        model, processor = load(self.model_path)
+        from .yarn import apply_auto_yarn, configured_yarn_parameters
+
+        parameters = self._auto_yarn_parameters
+        if parameters is None and self.model_family.has_architecture(
+            "Qwen3_5ForConditionalGeneration", "Qwen3_5MoeForConditionalGeneration"
+        ):
+            parameters = configured_yarn_parameters(
+                self.model_path, self._model_config, self.model_family.context_length
+            )
+        if parameters:
+            apply_auto_yarn(model, parameters)
+        return model, processor
 
     def _load_draft_model(self, draft_model_path: str) -> Tuple[Any, str]:
         """Load the speculative drafter, e.g. a Gemma 4 ``*-it-assistant``

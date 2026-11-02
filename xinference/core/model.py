@@ -340,9 +340,15 @@ class ModelActor(ModelGenerationMixin, xo.StatelessActor, CancelMixin):
         driver_info: Optional[dict] = None,  # for model across workers
         model_engine: Optional[str] = None,
         model_python_executable: Optional[str] = None,
+        worker_status_token: Optional[str] = None,
     ):
         super().__init__()
         self._generation_python_executable = model_python_executable
+
+        context_env = getattr(model, "_auto_yarn_env", None)
+        if context_env:
+            # Sharded launches may spawn their pool before the download resolves.
+            os.environ.setdefault(context_env, "1")
 
         from ..model.llm.vllm.core import VLLMModel
 
@@ -361,6 +367,7 @@ class ModelActor(ModelGenerationMixin, xo.StatelessActor, CancelMixin):
         )
         self._worker_ref = None
         self._worker_generation = 0
+        self._worker_status_token = worker_status_token
         self._progress_tracker_ref = None
         self._serve_count = 0
         self._realtime_runtime = None
@@ -597,6 +604,34 @@ class ModelActor(ModelGenerationMixin, xo.StatelessActor, CancelMixin):
             return None
         return self._model.get_limit_mm_per_prompt()
 
+    def get_explicit_limit_mm_per_prompt(self) -> Optional[Dict[str, int]]:
+        from ..model.llm.vllm.core import VLLMModel
+
+        if not isinstance(self._model, VLLMModel):
+            return None
+        return self._model.get_explicit_limit_mm_per_prompt()
+
+    @request_limit
+    @log_async(logger=logger)
+    async def preflight_multimodal_request(
+        self, messages: List[Dict], generate_config: Optional[Dict] = None
+    ) -> Union[Dict[str, Any], bytes]:
+        from ..model.llm.vllm.core import VLLMModel
+
+        self._require_ready()
+        try:
+            if not isinstance(self._model, VLLMModel):
+                raise NotImplementedError(
+                    "Multimodal request preflight is only available for vLLM models"
+                )
+            return await self._call_wrapper_json(
+                self._model.async_preflight_multimodal_request,
+                messages,
+                generate_config,
+            )
+        except Exception as exc:
+            return self._safe_model_operation_error(exc, "multimodal_preflight")
+
     def get_sglang_pd_bootstrap(self) -> dict:
         from ..model.llm.sglang.core import SGLANGModel
 
@@ -740,6 +775,7 @@ class ModelActor(ModelGenerationMixin, xo.StatelessActor, CancelMixin):
 
         config = self._get_weight_cached_model().get_reload_config()
         config["python_executable"] = sys.executable
+        config["supports_reload_operation_id"] = True
         try:
             config["engine_version"] = version(config["engine"])
         except PackageNotFoundError:
@@ -751,20 +787,29 @@ class ModelActor(ModelGenerationMixin, xo.StatelessActor, CancelMixin):
         config = await asyncio.to_thread(
             self._get_weight_cached_model().validate_reload, model_config
         )
-        self._reload_status: Dict[str, Any] = {}
         return {key: config[key] for key in model_config}
 
     def get_reload_status(self) -> Dict[str, Any]:
         return dict(getattr(self, "_reload_status", {}))
 
-    async def reload(self, model_config: Dict[str, Any], drain_timeout: float) -> bool:
+    async def reload(
+        self,
+        model_config: Dict[str, Any],
+        drain_timeout: float,
+        operation_id: Optional[str] = None,
+    ) -> bool:
         from ..model.llm.weight_cache import ModelReloadError
 
         await self.validate_reload(model_config)
         model = self._get_weight_cached_model()
         self._model_state = "reloading"
         self._reload_admission = asyncio.Event()
-        self._reload_status = {"stage": "draining"}
+        self._reload_status = {
+            "status": "reloading",
+            "stage": "draining",
+            "started_at": time.time(),
+            "operation_id": operation_id,
+        }
         try:
             deadline = time.monotonic() + drain_timeout
             while self._serve_count:
@@ -781,16 +826,20 @@ class ModelActor(ModelGenerationMixin, xo.StatelessActor, CancelMixin):
             )
         except ModelReloadError as exc:
             self._model_state = "ready" if exc.restored else "error"
-            self._reload_status.update(stage="error", restored=exc.restored)
+            self._reload_status.update(
+                status="error", stage="error", restored=exc.restored, error=str(exc)
+            )
             raise
-        except Exception:
+        except Exception as exc:
             # Validation inside reload happens before engine teardown.
             self._model_state = "ready"
-            self._reload_status.update(stage="error", restored=True)
+            self._reload_status.update(
+                status="error", stage="error", restored=True, error=str(exc)
+            )
             raise
         else:
             self._model_state = "ready"
-            self._reload_status.update(stage="ready")
+            self._reload_status.update(status="ready", stage="ready")
             return not model._is_hot_patch(model_config)
         finally:
             self._reload_admission.set()
@@ -874,9 +923,15 @@ class ModelActor(ModelGenerationMixin, xo.StatelessActor, CancelMixin):
 
         async def _report_oom_status():
             worker_ref = await self._get_worker_ref()
-            await worker_ref.update_model_status(
-                self._replica_model_uid, last_error=error_message
-            )
+            token = self.__dict__.get("_worker_status_token")
+            if token is None:
+                await worker_ref.update_model_status(
+                    self._replica_model_uid, last_error=error_message
+                )
+            else:
+                await worker_ref.report_model_oom(
+                    self._replica_model_uid, token, error_message
+                )
 
         try:
             await xo.wait_for(_report_oom_status(), timeout=5)
@@ -1140,6 +1195,33 @@ class ModelActor(ModelGenerationMixin, xo.StatelessActor, CancelMixin):
 
     async def _call_wrapper_json(self, fn: Callable, *args, **kwargs):
         return await self._call_wrapper("json", fn, *args, **kwargs)
+
+    @staticmethod
+    def _safe_model_operation_error(exc: Exception, operation: str) -> bytes:
+        from ..model.llm.context_length import (
+            MODEL_OPERATION_ERROR_KEY,
+            MODEL_OPERATION_ERROR_VERSION,
+            build_model_operation_error,
+        )
+
+        logger.warning(
+            "Model operation %s failed; returning a safe actor response.",
+            operation,
+            exc_info=(type(exc), exc, exc.__traceback__),
+        )
+        try:
+            payload = build_model_operation_error(exc, operation)
+        except Exception:
+            logger.exception("Failed to classify the model operation error safely")
+            payload = {
+                MODEL_OPERATION_ERROR_KEY: {
+                    "version": MODEL_OPERATION_ERROR_VERSION,
+                    "operation": operation,
+                    "kind": "internal_error",
+                    "message": "The requested model operation failed.",
+                }
+            }
+        return json_dumps(payload)
 
     async def _call_wrapper_binary(self, fn: Callable, *args, **kwargs):
         return await self._call_wrapper("binary", fn, *args, **kwargs)
@@ -1496,11 +1578,14 @@ class ModelActor(ModelGenerationMixin, xo.StatelessActor, CancelMixin):
         self, messages: List[Dict], generate_config: Optional[Dict] = None
     ):
         self._require_ready()
-        return await self._call_wrapper_json(
-            getattr(self._model, "async_count_tokens", self._model.count_tokens),
-            messages,
-            generate_config,
-        )
+        try:
+            return await self._call_wrapper_json(
+                getattr(self._model, "async_count_tokens", self._model.count_tokens),
+                messages,
+                generate_config,
+            )
+        except Exception as exc:
+            return self._safe_model_operation_error(exc, "token_count")
 
     @request_limit
     @log_async(logger=logger)
@@ -1508,15 +1593,18 @@ class ModelActor(ModelGenerationMixin, xo.StatelessActor, CancelMixin):
         self, messages: List[Dict], generate_config: Dict
     ):
         self._require_ready()
-        return await self._call_wrapper_json(
-            getattr(
-                self._model,
-                "async_prepare_anthropic_request",
-                self._model.prepare_anthropic_request,
-            ),
-            messages,
-            generate_config,
-        )
+        try:
+            return await self._call_wrapper_json(
+                getattr(
+                    self._model,
+                    "async_prepare_anthropic_request",
+                    self._model.prepare_anthropic_request,
+                ),
+                messages,
+                generate_config,
+            )
+        except Exception as exc:
+            return self._safe_model_operation_error(exc, "anthropic_prepare")
 
     @log_async(logger=logger)
     async def get_anthropic_capabilities(self):

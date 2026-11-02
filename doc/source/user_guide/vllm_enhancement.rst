@@ -13,8 +13,8 @@ Choose a deployment mode
 ------------------------
 
 Use ordinary replicas to share compatible prefixes while each replica handles
-complete requests. Shared prefix caching currently stays within the same
-engine. For separate prefill and decode roles, including cross-engine and
+complete requests. By default, shared prefix caching uses replicas of the same
+engine. To mix engines in ordinary replicas, see :ref:`xavier-cross-engine-sharing`. For separate prefill and decode roles, including cross-engine and
 CUDA/Metal deployments, use :ref:`user_guide_pd_separation`. P/D transport and
 ordinary cache storage have separate configuration and compatibility limits.
 
@@ -100,7 +100,7 @@ SGLang >= ``0.5.21`` can share prefix KV cache through Xavier's HiCache storage 
 
 Xavier loads BF16 checkpoints as FP16 and emits a warning. Both weights and KV caches use FP16.
 
-``xavier_cache_bytes`` sets the deployment's shared CPU cache budget (default: ``536870912``, 512 MiB). Each SGLang replica also allocates its own GPU and HiCache host pools. Eviction or unavailable storage becomes a cache miss for ordinary replicas. Cache namespaces include the actual weights, tokenizer, model configuration, KV geometry and engine format; caches cannot yet be exchanged between vLLM and SGLang.
+``xavier_cache_bytes`` sets the deployment's shared CPU cache budget (default: ``536870912``, 512 MiB). Each SGLang replica also allocates its own GPU and HiCache host pools. Eviction or unavailable storage becomes a cache miss for ordinary replicas. Cache namespaces include the actual weights, tokenizer, model configuration, KV geometry and engine format; for cross-engine reuse, use :ref:`xavier-cross-engine-sharing`.
 
 Ordinary SGLang replicas share CPU HiCache pages. Explicit prefill/decode roles use Xavier GPU-to-GPU transfer instead. For same-engine or cross-engine P/D and per-replica engine settings, see :ref:`user_guide_pd_separation`.
 
@@ -131,7 +131,56 @@ MLX replicas
 
 MLX Xavier requires Apple silicon and ``mlx-lm>=0.31.2``. It supports unquantized, full-attention Qwen2, Qwen3 and Llama text models with one worker per replica. Weights and KV cache use FP16. Quantized weights or KV cache, rotating caches, hybrid attention, multimodal inputs, LoRA and speculative decoding are unsupported.
 
-``xavier_cache_bytes`` bounds the shared CPU cache (default: 512 MiB). Each replica also owns its model and Metal KV cache. Ordinary replicas compute locally on a miss or unavailable storage; incompatible deployments cannot share pages. Returned usage reports reused tokens in ``prompt_tokens_details.cached_tokens``. Explicit prefill/decode roles enable MLX Xavier P/D automatically. Cross-engine cache sharing is not yet supported.
+``xavier_cache_bytes`` bounds the shared CPU cache (default: 512 MiB). Each replica also owns its model and Metal KV cache. Ordinary replicas compute locally on a miss or unavailable storage; incompatible deployments cannot share pages. Returned usage reports reused tokens in ``prompt_tokens_details.cached_tokens``. Explicit prefill/decode roles enable MLX Xavier P/D automatically. For cross-engine reuse, use :ref:`xavier-cross-engine-sharing`.
+
+.. _xavier-cross-engine-sharing:
+
+Cross-engine prefix sharing
+---------------------------
+
+.. versionadded:: v4.2.0
+
+Ordinary replicas can share cached prefixes across vLLM, SGLang, TRT-LLM and MLX. Each replica still handles complete requests: a later request on SGLang can reuse a prefix computed by vLLM, and vice versa. Enable Xavier and select an engine for each replica; no prefill/decode roles are needed.
+
+.. code-block:: python
+
+   model_uid = client.launch_model(
+       model_uid="shared-prefix",
+       model_name="qwen3",
+       model_size_in_billions="0_6",
+       model_engine="vLLM",
+       model_format="pytorch",
+       quantization="none",
+       replica=2,
+       enable_xavier=True,
+       xavier_cache_bytes=536870912,
+       replica_config=[
+           {
+               "model_engine": "vLLM",
+               "engine_config": {"max_model_len": 4096},
+               "devices": [{"worker_ip": "CUDA_WORKER_ADDRESS", "n_gpu": 1,
+                            "gpu_idx": [0]}],
+           },
+           {
+               "model_engine": "SGLang",
+               "engine_config": {"context_length": 4096},
+               "devices": [{"worker_ip": "CUDA_WORKER_ADDRESS", "n_gpu": 1,
+                            "gpu_idx": [1]}],
+           },
+       ],
+   )
+
+All replicas must use identical local checkpoint and tokenizer files, effective context limits and unquantized full-attention models. vLLM/SGLang/MLX combinations support FP16 Qwen2, Qwen3 and Llama text models. A topology containing TRT-LLM requires BF16 dense Qwen3 on every replica. Use one worker and one device per replica; existing engine version requirements apply.
+
+For MLX, set its replica's ``engine_config`` to include ``model_format="mlx"`` and its local ``model_path``. Use the original unconverted checkpoint on the Mac. Engine-specific options belong in ``engine_config``; worker-local paths may also be set there for CUDA replicas. Configure the same effective context limit for every engine.
+
+Xavier stores immutable, complete 64-token pages in a supervisor-owned CPU cache and transfers them through actor RPC. ``xavier_cache_bytes`` bounds this shared pool (default: 512 MiB), excluding model weights, engine caches and in-flight copies. Partial tails and the final prompt token are computed locally. Misses, eviction and unavailable storage fall back to local prefill. Incompatible models fail configuration before sharing pages.
+
+This mode uses the native backend. LMCache/Mooncake storage and retained GPU history are not supported for cross-engine sharing. Quantization, sharded KV, LoRA, speculation, multimodal input and hybrid attention remain unsupported. TRT-LLM retains its existing ``cache_salt`` restriction; vLLM, SGLang and MLX preserve request-scoped isolation.
+
+Requests must use options supported by every engine in the deployment. TRT-LLM rejects tools, ``response_format``, log probabilities, ``echo`` and ``n>1``. MLX Xavier rejects structured ``response_format``, forced tool choice and thinking budgets. Otherwise, success can depend on which replica receives the request.
+
+Measure repeated-prefix TTFT against local prefill on the receiving engine. CPU copies and network transfer can exceed prefill cost for short prefixes. Use cached-token usage to confirm reuse on every engine. The ``imported_pages`` counter reports completed imports only for vLLM and TRT-LLM receivers; SGLang and MLX receivers use cached-token usage instead. Response correctness alone does not prove a cache hit.
 
 Storage backends
 ----------------
@@ -152,7 +201,7 @@ LMCache
 
 LMCache storage for ordinary vLLM V1, SGLang and TRT-LLM replicas.
 
-``xavier_cache_backend="native"`` is the default and keeps the existing CPU and GPU cache behavior. The optional ``lmcache`` backend adds disk-backed prefix reuse for ordinary vLLM V1, SGLang and TRT-LLM replicas. Install ``xinference[xavier-lmcache]`` in the Linux environment hosting storage: each vLLM transfer actor's environment, or the supervisor environment for SGLang and TRT-LLM. Model environments can remain separate. This adapter targets LMCache >= ``0.5.6`` and < ``0.6`` with its native FS extension, and Python 3.10 through 3.13.
+``xavier_cache_backend="native"`` is the default and keeps the existing CPU and GPU cache behavior. The optional ``lmcache`` backend adds external prefix-cache storage for ordinary vLLM V1, SGLang and TRT-LLM replicas. Install ``xinference[xavier-lmcache]`` in the Linux environment hosting storage: each vLLM transfer actor's environment, or the supervisor environment for SGLang and TRT-LLM. Model environments can remain separate. This adapter targets LMCache >= ``0.5.6`` and < ``0.6`` with the native extension for the selected L2 backend, and Python 3.10 through 3.13.
 
 Select the backend when launching the model:
 
@@ -179,7 +228,56 @@ Select the backend when launching the model:
 
 ``read_timeout`` bounds a cache lookup's wait in seconds (default: 30). Missing, unavailable or timed-out cache reads fall back to local prefill. At most one LMCache prefetch job runs per storage instance; a timed-out or cancelled job still releases its LMCache read locks. Reads exceeding the transient capacity return a bounded prefix or fall back to local prefill. Compare TTFT and read latency against prefill cost for your workload.
 
-The LMCache backend requires multiple ordinary replicas of the same engine and preserves that engine's existing Xavier model, dtype and parallelism limits. P/D roles, legacy vLLM V0 and MLX are unsupported; P/D KV handoff remains a separate transport concern. Use backend ``cpu_bytes`` instead of the native ``xavier_cache_bytes`` or ``xavier_gpu_cache_bytes`` budgets. Backend selection does not enable cross-engine cache sharing or change existing cache-salt behavior. Each deployment and storage instance owns a separate namespace and directory; relaunching does not recover old entries. Graceful shutdown removes that directory; after a process crash, remove abandoned deployment directories when they are no longer in use.
+For ordinary replicas, the LMCache backend requires multiple replicas of the same engine and preserves that engine's existing Xavier model, dtype and parallelism limits; legacy vLLM V0 and ordinary MLX replicas are unsupported. For P/D roles, see :ref:`xavier-pd-lmcache`. Use backend ``cpu_bytes`` instead of the native ``xavier_cache_bytes`` or ``xavier_gpu_cache_bytes`` budgets. Backend selection does not change cache-salt behavior. Each deployment and storage instance owns a separate namespace and directory; relaunching does not recover old entries. Graceful shutdown removes that directory; after a process crash, remove abandoned deployment directories when they are no longer in use.
+
+.. _xavier-pd-lmcache:
+
+LMCache history for P/D
+^^^^^^^^^^^^^^^^^^^^^^^^
+
+.. versionadded:: v4.2.0
+
+Select ``xavier_cache_backend="lmcache"`` and pass the backend configuration above when launching Xavier P/D roles. Prefill can run on vLLM, SGLang, TRT-LLM or MLX, including cross-engine deployments. Decode keeps the existing Xavier handoff and does not access LMCache. Native NIXL deployments cannot use this option.
+
+P restores compatible historical prefix pages before computing the remaining prompt. Owned CPU snapshots enter a worker-local write queue bounded by ``cpu_bytes`` per P replica; LMCache writes run in the background. A full queue or failed write drops optional history. Missing or failed reads compute locally, while live P/D transfer failures still raise errors. CPU snapshot packing and local enqueueing remain part of prefill latency; asynchronous writes do not remove those costs.
+
+One shared LMCache history store runs on the first CUDA worker; install ``xinference[xavier-lmcache]`` in that worker's environment. All-MLX groups require a Linux model-service host for the store. Each P replica adds a bounded CPU write queue and owned read buffers; SGLang also allocates its native HiCache host pool. Include these allocations in addition to the LMCache memory budgets above. Disk paths belong to the storage host.
+
+For MLX prefill, ``xavier_cache_bytes`` still bounds live host handoff pages independently of LMCache. CUDA P/D may omit ``xavier_gpu_cache_bytes`` or set it to ``0``; retained Xavier GPU history is disabled with this backend.
+
+This option uses the canonical P/D model contract and its model, dtype, single-device and 64-token page restrictions, even for same-engine CUDA groups. CUDA P/D also uses the canonical request path, which rejects logprobs and structured outputs (``guided_*``, ``structured_outputs``, ``json_schema`` and JSON ``response_format``). See :ref:`user_guide_pd_separation`. Engine-local prefix reuse remains available on vLLM, SGLang and MLX P. TRT-LLM isolates native prefix reuse per request and uses LMCache for historical reuse. Different cache salts remain isolated; TRT-LLM's existing rejection of ``cache_salt`` is unchanged. Historical entries are scoped to the deployment and are not recovered after relaunch.
+
+On vLLM P, each scheduler-side history RPC has a one-second deadline; ``read_timeout`` bounds the proxy's storage work.
+
+Mooncake Store
+^^^^^^^^^^^^^^
+
+.. versionadded:: v4.2.0
+
+Set ``l2_backend="mooncake"`` in ``xavier_cache_backend_config`` to use LMCache's Mooncake Store adapter. The default ``l2_backend="filesystem"`` preserves the disk configuration above. This selects storage for ordinary prefix-cache reuse or P-side history; P/D transport and supported engine/model combinations remain the same.
+
+The storage environment needs LMCache built with ``BUILD_MOONCAKE=1`` and compatible Mooncake SDK headers and libraries. Start the Mooncake master, metadata service and storage pool first. Use a reachable ``local_hostname`` without a port; Mooncake allocates a distinct port for each storage actor. Replace the endpoints in this TCP example with reachable service addresses, and pass the object as ``xavier_cache_backend_config``:
+
+.. code-block:: json
+
+   {
+     "l2_backend": "mooncake",
+     "cpu_bytes": 536870912,
+     "storage_bytes": 10737418240,
+     "read_timeout": 30,
+     "mooncake_config": {
+       "local_hostname": "storage-node",
+       "metadata_server": "http://store-host:18080/metadata",
+       "master_server_addr": "store-host:15051",
+       "protocol": "tcp",
+       "global_segment_size": 0,
+       "local_buffer_size": 67108864
+     }
+   }
+
+``storage_bytes`` bounds this actor's tracked remote cache capacity, together with ``cpu_bytes``; it is not a Mooncake cluster quota. At capacity, a new page is skipped and one least-recently-used owned object is scheduled for deletion. Only one deletion runs at a time, after outstanding LMCache writes drain; sustained traffic with new prefixes can therefore skip many new pages. Mooncake manages actual storage capacity and eviction; ``global_segment_size`` is the memory this client contributes. ``disk_path`` and ``disk_bytes`` apply only to filesystem storage and are rejected with Mooncake. ``protocol="rdma"`` additionally requires working RDMA hardware and drivers; LMCache registers the eagerly allocated L1 buffer.
+
+Deployment, schema and cache-salt isolation still apply. vLLM uses a distinct storage namespace per replica rank; SGLang and TRT-LLM replicas share one supervisor-owned storage actor. Other deployments' objects are not discovered, and relaunching does not recover old entries. Cache misses, unavailable reads and timeouts fall back to local prefill. Graceful shutdown drains writes and deletes only this actor's tracked namespaced objects before closing its client. If cleanup fails or the process crashes, remaining objects are subject to Mooncake's eviction policy. Cleanup never explicitly deletes other clients' keys or stops the shared service. A client contributing memory withdraws that segment on close; use ``global_segment_size=0`` with a separate storage pool to avoid this.
 
 .. _xavier-cache-isolation:
 

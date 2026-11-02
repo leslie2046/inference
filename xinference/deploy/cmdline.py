@@ -28,6 +28,7 @@ from xoscar.utils import get_next_port
 
 from .. import __version__
 from ..client import RESTfulClient
+from ..client.common import normalize_endpoint
 from ..client.restful.restful_client import (
     RESTfulChatModelHandle,
     RESTfulGenerateModelHandle,
@@ -76,7 +77,7 @@ def get_hash_endpoint(endpoint: str) -> str:
     import hashlib
 
     m = hashlib.sha256()
-    m.update(bytes(endpoint, "utf-8"))
+    m.update(bytes(normalize_endpoint(endpoint), "utf-8"))
     return m.hexdigest()
 
 
@@ -1041,7 +1042,12 @@ def model_launch(
 
         try:
             configs = [ReplicaConfig.parse_obj(item) for item in _replica_config]
-            validate_pd_replica_configs(configs, model_engine, model_type)
+            validate_pd_replica_configs(
+                configs,
+                model_engine,
+                model_type,
+                allow_shared_cache=bool(kwargs.get("enable_xavier")),
+            )
         except ValueError as e:
             raise click.BadParameter(str(e), param_hint="--replica-config") from e
 
@@ -1854,6 +1860,11 @@ def query_engine_by_model_name(
     engines = [model_engine] if model_engine is not None else list(llm_engines.keys())
     for engine in engines:
         params = llm_engines[engine]
+        if isinstance(params, str):
+            if model_engine is not None:
+                print(params, file=sys.stderr)
+                return
+            continue
         for param in params:
             if (model_format is None or model_format == param["model_format"]) and (
                 model_size_in_billions is None

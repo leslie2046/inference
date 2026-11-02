@@ -20,8 +20,8 @@ msgstr ""
 "Generated-By: Babel 2.18.0\n"
 
 #: ../../source/models/model_abilities/video.rst:5
-msgid "Video (Experimental)"
-msgstr "Vidéo (expérimental)"
+msgid "Video"
+msgstr "Vidéo"
 
 #: ../../source/models/model_abilities/video.rst:7
 msgid "Learn how to generate videos with Xinference."
@@ -303,17 +303,8 @@ msgstr "Cet exemple nécessitera 20 Go de mémoire vidéo."
 #~ msgid "API"
 #~ msgstr ""
 
-#~ msgid "Endpoint"
-#~ msgstr "point de terminaison"
-
-#~ msgid "Text-to-Video API"
-#~ msgstr "API de génération vidéo à partir de texte"
-
 #~ msgid "/v1/video/generations"
 #~ msgstr ""
-
-#~ msgid "Image-to-Video API"
-#~ msgstr "API de génération de vidéo à partir d'image"
 
 #~ msgid "/v1/video/generations/image"
 #~ msgstr ""
@@ -321,3 +312,406 @@ msgstr "Cet exemple nécessitera 20 Go de mémoire vidéo."
 #: ../../source/models/model_abilities/video.rst
 msgid "On Linux with CUDA, ``Wan2.1-1.3B``, ``Wan2.1-14B`` and ``Wan2.2-A14B`` also support text-to-video with ``SGLang`` (0.5.20 or newer) and ``vLLM`` (vLLM-Omni and vLLM 0.28). Concurrent requests are submitted to the native engine scheduler. Use ``batching_max_size`` and ``batching_delay_ms`` for SGLang, or ``max_num_seqs`` for vLLM. These engine variants do not expose image-to-video or Lightning/GGUF adapters. Diffusers remains the default."
 msgstr "Sous Linux avec CUDA, ``Wan2.1-1.3B``, ``Wan2.1-14B`` et ``Wan2.2-A14B`` prennent aussi en charge la génération texte-vers-vidéo avec ``SGLang`` (0.5.20 ou ultérieur) et ``vLLM`` (vLLM-Omni et vLLM 0.28). Les requêtes simultanées sont transmises au planificateur natif du moteur. Utilisez ``batching_max_size`` et ``batching_delay_ms`` pour SGLang, ou ``max_num_seqs`` pour vLLM. Ces variantes ne proposent ni image-vers-vidéo ni adaptateurs Lightning/GGUF. Diffusers reste le moteur par défaut."
+
+
+#: ../../source/models/model_abilities/video.rst:27
+msgid "Endpoint"
+msgstr "Point de terminaison"
+
+#: ../../source/models/model_abilities/video.rst:29
+msgid "Text-to-Video API"
+msgstr "API de génération vidéo à partir de texte"
+
+#: ../../source/models/model_abilities/video.rst:32
+msgid "Image-to-Video API"
+msgstr "API de génération vidéo à partir d’une image"
+
+#: ../../source/models/model_abilities/video.rst:35
+msgid "FirstLastFrame-to-Video API"
+msgstr "API de génération vidéo à partir des première et dernière images"
+
+#: ../../source/models/model_abilities/video.rst:80
+msgid "Video engines"
+msgstr "Moteurs vidéo"
+
+#: ../../source/models/model_abilities/video.rst:82
+msgid ""
+"Video runtimes are selected with ``--model-engine``. The ``diffusers`` "
+"engine remains the default for models that expose both runtimes. For "
+"example, launch Wan2.2-A14B with either engine explicitly:"
+msgstr ""
+"Le moteur vidéo se sélectionne avec ``--model-engine``. Pour les modèles "
+"proposant les deux moteurs, ``diffusers`` reste le moteur par défaut. Par"
+" exemple, démarrez Wan2.2-A14B en sélectionnant explicitement l’un ou "
+"l’autre moteur :"
+
+#: ../../source/models/model_abilities/video.rst:98
+msgid ""
+"The ``MLX`` engine uses `Blaizzy/mlx-video <https://github.com/Blaizzy"
+"/mlx-video>`_ and is available on Apple Silicon with Python 3.11 or "
+"newer. It supports Wan2.1 T2V, Wan2.2 T2V/I2V/TI2V, and the LTX-2/LTX-2.3"
+" distilled and dev models listed above. The LTX models are MLX-only in "
+"Xinference."
+msgstr ""
+"Le moteur ``MLX`` utilise `Blaizzy/mlx-video <https://github.com/Blaizzy"
+"/mlx-video>`_ et fonctionne sur Apple Silicon avec Python 3.11 ou une "
+"version ultérieure. Il prend en charge Wan2.1 T2V, Wan2.2 T2V/I2V/TI2V, "
+"ainsi que les modèles distilled et dev de LTX-2/LTX-2.3 listés ci-dessus."
+" Dans Xinference, les modèles LTX ne fonctionnent qu’avec MLX."
+
+#: ../../source/models/model_abilities/video.rst:104
+msgid ""
+"Wan2.1's official checkpoints are converted to the native MLX layout on "
+"first load and the converted copy is reused by later launches. This first"
+" launch therefore needs additional time and disk space. Wan2.2 and LTX "
+"use pre-converted checkpoints."
+msgstr ""
+"Les checkpoints officiels de Wan2.1 sont convertis au format natif MLX "
+"lors du premier chargement. La copie convertie est réutilisée lors des "
+"démarrages suivants. Le premier démarrage demande donc davantage de temps"
+" et d’espace disque. Wan2.2 et LTX utilisent des checkpoints déjà "
+"convertis."
+
+#: ../../source/models/model_abilities/video.rst:109
+msgid ""
+"The Web UI obtains the engines supported by each model from the engine "
+"query API and presents them in the launch dialog. Additional video "
+"runtimes can be registered independently without changing the Video API."
+msgstr ""
+"L’interface Web récupère les moteurs pris en charge par chaque modèle via"
+" l’API de consultation des moteurs, puis les affiche dans la boîte de "
+"dialogue de démarrage. D’autres moteurs vidéo peuvent être enregistrés "
+"indépendamment, sans modifier l’API Video."
+
+#: ../../source/models/model_abilities/video.rst:202
+msgid "Lightning LoRA acceleration"
+msgstr "Accélération avec Lightning LoRA"
+
+#: ../../source/models/model_abilities/video.rst:204
+msgid ""
+"Lightning LoRA checkpoints distill a video model into fewer denoising "
+"steps. Select a supported version with ``--lightning_version`` when "
+"launching the model; Xinference downloads the LoRA, applies its training "
+"alpha and scheduler shifts, and uses the version's recommended inference-"
+"step count when the request does not override ``num_inference_steps``. "
+"Lightning reduces denoising time, but does not reduce model size or peak "
+"memory; MiniMax-H3's default INT4 quantization and group offload remain "
+"enabled."
+msgstr ""
+"Les checkpoints Lightning LoRA distillent un modèle vidéo afin de réduire"
+" le nombre d’étapes de débruitage. Sélectionnez une version compatible "
+"avec ``--lightning_version`` au démarrage du modèle. Xinference "
+"télécharge la LoRA, applique son alpha d’entraînement et les décalages de"
+" son ordonnanceur, puis utilise le nombre d’étapes recommandé pour cette "
+"version si la requête ne remplace pas ``num_inference_steps``. Lightning "
+"réduit le temps de débruitage, mais pas la taille du modèle ni le pic de "
+"mémoire. La quantification INT4 et le déchargement par groupes par défaut"
+" de MiniMax-H3 restent activés."
+
+#: ../../source/models/model_abilities/video.rst:216
+msgid "Model"
+msgstr "Modèle"
+
+#: ../../source/models/model_abilities/video.rst:217
+msgid "Lightning version"
+msgstr "Version de Lightning"
+
+#: ../../source/models/model_abilities/video.rst:218
+msgid "Evaluations"
+msgstr "Évaluations du modèle"
+
+#: ../../source/models/model_abilities/video.rst:219
+msgid "Video shift"
+msgstr "Décalage vidéo"
+
+#: ../../source/models/model_abilities/video.rst:220
+msgid "Recommended canvas"
+msgstr "Dimensions recommandées"
+
+#: ../../source/models/model_abilities/video.rst:225
+msgid "544p mixed aspect ratios"
+msgstr "544p avec plusieurs rapports d’aspect"
+
+#: ../../source/models/model_abilities/video.rst:237
+msgid ""
+"In the Web UI, open the MiniMax-H3 launch dialog, expand **Advanced "
+"Configuration**, and select a value under **Lightning Versions**. Leave "
+"**Lightning Model Path** empty to download the selected checkpoint "
+"automatically. After the model starts, set **Inference Steps** on the "
+"video generation page to the evaluation count in the table. The "
+"generation page currently starts with 25 steps, which overrides the "
+"Lightning default if left unchanged."
+msgstr ""
+"Dans l’interface Web, ouvrez la boîte de dialogue de démarrage de "
+"MiniMax-H3, développez **Advanced Configuration**, puis sélectionnez une "
+"valeur dans **Lightning Versions**. Laissez **Lightning Model Path** vide"
+" pour télécharger automatiquement le checkpoint sélectionné. Après le "
+"démarrage du modèle, réglez **Inference steps** sur la page de génération"
+" vidéo au nombre d’évaluations du tableau. Cette page utilise "
+"actuellement 25 étapes au départ ; si vous conservez cette valeur, elle "
+"remplace la valeur par défaut de Lightning."
+
+#: ../../source/models/model_abilities/video.rst:245
+msgid "For example, launch the 768p four-step version from the command line::"
+msgstr ""
+"Par exemple, démarrez la version 768p en quatre étapes depuis la ligne de"
+" commande::"
+
+#: ../../source/models/model_abilities/video.rst:250
+msgid ""
+"Then generate with four inference steps. MiniMax-H3 outputs at a fixed 24"
+" FPS; 124 frames produce a video of about five seconds::"
+msgstr ""
+"Générez ensuite avec quatre étapes d’inférence. MiniMax-H3 produit des "
+"vidéos à 24 FPS fixes ; 124 images donnent une vidéo d’environ cinq "
+"secondes::"
+
+#: ../../source/models/model_abilities/video.rst:266
+msgid ""
+"Xinference downloads the Lightning checkpoint from the same hub selected "
+"for the base model. Both Hugging Face and ModelScope are supported. To "
+"use an already downloaded checkpoint, pass both its path and version::"
+msgstr ""
+"Xinference télécharge le checkpoint Lightning depuis la même plateforme "
+"que celle sélectionnée pour le modèle de base. Hugging Face et ModelScope"
+" sont pris en charge. Pour utiliser un checkpoint déjà téléchargé, "
+"indiquez à la fois son chemin et sa version::"
+
+#: ../../source/models/model_abilities/video.rst:274
+msgid ""
+"``num_inference_steps`` represents actual transformer evaluations and "
+"remains a per-request override. Match it to the selected Lightning "
+"version: use 4 for a ``4step`` checkpoint and 8 for an ``8step`` "
+"checkpoint. MiniMax-H3's scheduler internally adds the terminal sigma "
+"grid point required to run that number of evaluations."
+msgstr ""
+"``num_inference_steps`` désigne le nombre réel d’évaluations du "
+"Transformer et reste modifiable pour chaque requête. Adaptez-le à la "
+"version Lightning sélectionnée : 4 pour un checkpoint ``4step`` et 8 pour"
+" un checkpoint ``8step``. L’ordonnanceur de MiniMax-H3 ajoute en interne "
+"le point sigma terminal de la grille nécessaire pour effectuer ce nombre "
+"d’évaluations."
+
+#: ../../source/models/model_abilities/video.rst:282
+msgid ""
+"The evaluation-count semantics apply to MiniMax-H3 with or without "
+"Lightning. A request for N evaluations now passes N + 1 scheduler grid "
+"points so the terminal sigma does not consume one of the requested "
+"evaluations. Therefore, non-Lightning output may differ from earlier "
+"Xinference versions for the same ``num_inference_steps`` value."
+msgstr ""
+"Cette définition du nombre d’évaluations s’applique à MiniMax-H3 avec ou "
+"sans Lightning. Une requête de N évaluations transmet désormais N + 1 "
+"points de grille à l’ordonnanceur afin que le sigma terminal ne consomme "
+"pas l’une des évaluations demandées. Ainsi, sans Lightning, la sortie "
+"peut différer de celle des versions antérieures de Xinference pour la "
+"même valeur de ``num_inference_steps``."
+
+#: ../../source/models/model_abilities/video.rst:299
+msgid "Weight quantization."
+msgstr "Quantification des poids."
+
+#: ../../source/models/model_abilities/video.rst:343
+msgid "Weight quantization"
+msgstr "Quantification des poids"
+
+#: ../../source/models/model_abilities/video.rst:345
+msgid ""
+"Some video models support weight-only quantization through the "
+"``--quantization`` option. Quantization lowers both GPU and host memory "
+"usage, with a possible quality and performance trade-off."
+msgstr ""
+"Certains modèles vidéo prennent en charge la quantification des poids "
+"seuls via ``--quantization``. Celle-ci réduit l’utilisation de la mémoire"
+" GPU et de la mémoire hôte, avec des compromis possibles sur la qualité "
+"et les performances."
+
+#: ../../source/models/model_abilities/video.rst:349
+msgid "MiniMax-H3 supports the following values for ``quantization``:"
+msgstr "MiniMax-H3 prend en charge les valeurs suivantes pour ``quantization`` :"
+
+#: ../../source/models/model_abilities/video.rst:351
+msgid ""
+"``int4``: the default. Most large linear weights use TorchAO INT4, while "
+"a few BF16 blocks remain on the CPU during loading. Together with block-"
+"level group offloading, this allows the model to load on a 24GB consumer "
+"GPU without additional launch options. CUDA streams are disabled on this "
+"path to avoid an extra pinned host-memory copy."
+msgstr ""
+"``int4`` : valeur par défaut. La plupart des poids des grandes couches "
+"linéaires utilisent TorchAO INT4, tandis que quelques blocs BF16 restent "
+"sur le CPU pendant le chargement. Avec le déchargement par groupes de "
+"blocs, le modèle peut être chargé sur un GPU grand public de 24 Go sans "
+"option de démarrage supplémentaire. Les flux CUDA sont désactivés sur ce "
+"chemin pour éviter une copie supplémentaire en mémoire hôte verrouillée."
+
+#: ../../source/models/model_abilities/video.rst:356
+msgid ""
+"``int8``: use TorchAO INT8 weight-only quantization for higher weight "
+"precision. This requires at least 75GB of available host RAM."
+msgstr ""
+"``int8`` : utilise TorchAO INT8 pour quantifier uniquement les poids avec"
+" une précision supérieure. Cela nécessite au moins 75 Go de RAM hôte "
+"disponible."
+
+#: ../../source/models/model_abilities/video.rst:358
+msgid ""
+"``none`` or ``bf16``: disable weight quantization. With the default "
+"``torch_dtype``, weights are loaded in BF16 and require substantially "
+"more GPU and host memory."
+msgstr ""
+"``none`` ou ``bf16`` : désactive la quantification des poids. Avec la "
+"valeur par défaut de ``torch_dtype``, les poids sont chargés en BF16 et "
+"nécessitent nettement plus de mémoire GPU et hôte."
+
+#: ../../source/models/model_abilities/video.rst:361
+msgid ""
+"``torchao``: a compatibility alias for ``int8``. Use ``int8`` in new "
+"launch configurations."
+msgstr ""
+"``torchao`` : alias de compatibilité pour ``int8``. Utilisez ``int8`` "
+"dans les nouvelles configurations de démarrage."
+
+#: ../../source/models/model_abilities/video.rst:364
+msgid "For example, select INT8 with::"
+msgstr "Par exemple, sélectionnez INT8::"
+
+#: ../../source/models/model_abilities/video.rst:113
+msgid ""
+"MiniMax-H3 also supports ``SGLang`` (0.5.22 or newer, below 0.6) and "
+"``vLLM`` (matching vLLM-Omni and vLLM 0.32.x) on Linux with CUDA. Both "
+"engines implement text-to-video, image-to-video and first/last-frame "
+"generation through the FL2VA checkpoint, retaining the synchronized stereo "
+"soundtrack at 24 fps. Ref2VA is not exposed through these Xinference Video "
+"API endpoints."
+msgstr ""
+"MiniMax-H3 prend aussi en charge ``SGLang`` (à partir de 0.5.22, avant 0.6) "
+"et ``vLLM`` (versions compatibles de vLLM-Omni et vLLM 0.32.x) sous Linux "
+"avec CUDA. Les deux moteurs génèrent des vidéos à partir de texte, d’images "
+"ou de premières et dernières images via le checkpoint FL2VA, en conservant "
+"la piste stéréo synchronisée à 24 fps. Ces points d’accès de l’API vidéo "
+"Xinference n’exposent pas Ref2VA."
+
+#: ../../source/models/model_abilities/video.rst:119
+msgid ""
+"Both native H3 engines accept the LightX2V ``lightning_version`` values "
+"listed below. Xinference loads the adapter and selects its step count and "
+"video/audio flow shifts automatically. Conflicting per-request step counts "
+"or flow shifts are rejected. For vLLM, keep the published Diffusers "
+"checkpoint filename; ComfyUI exports are incompatible."
+msgstr ""
+"Les deux moteurs H3 natifs acceptent les valeurs LightX2V de "
+"``lightning_version`` ci-dessous. Xinference charge l’adaptateur et "
+"sélectionne automatiquement son nombre de pas et ses flow shifts vidéo et "
+"audio. Les valeurs de requête incompatibles avec l’adaptateur sont rejetées."
+" Pour vLLM, conservez le nom publié du fichier Diffusers ; les exports "
+"ComfyUI sont incompatibles."
+
+#: ../../source/models/model_abilities/video.rst:125
+msgid ""
+"Configure GPU parallelism and memory options for your hardware. For example,"
+" on four suitable CUDA GPUs, launch H3 with Lightning using::"
+msgstr ""
+"Adaptez le parallélisme GPU et les options mémoire à votre matériel. Par "
+"exemple, sur quatre GPU CUDA adaptés, lancez H3 avec Lightning ainsi::"
+
+#: ../../source/models/model_abilities/video.rst:119
+msgid ""
+"MiniMax-H3 downloads only the files needed by the selected engine. Diffusers"
+" uses the root FL2VA components; SGLang and vLLM share the native ``FL2VA/``"
+" checkpoint. Each layout is about 134 GiB in BF16 before runtime "
+"quantization. Lightning weights are downloaded separately."
+msgstr ""
+"MiniMax-H3 ne télécharge que les fichiers nécessaires au moteur sélectionné."
+" Diffusers utilise les composants FL2VA à la racine ; SGLang et vLLM "
+"partagent le checkpoint natif ``FL2VA/``. Chaque format représente environ "
+"134 GiB en BF16 avant la quantification à l’exécution. Les poids Lightning "
+"sont téléchargés séparément."
+
+#: ../../source/models/model_abilities/video.rst:130
+msgid ""
+"Native H3 requests require a duration of 4–15 seconds at 24 fps. For a first"
+" test, use ``width=960``, ``height=544`` and ``num_frames=124`` (about 5 "
+"seconds). Omit ``num_inference_steps`` to use the selected Lightning "
+"schedule, or set it to 4 for either 4-step adapter and 8 for the 8-step "
+"adapter. The Web UI's generic video defaults must be adjusted to these "
+"values."
+msgstr ""
+"Les requêtes H3 natives nécessitent une durée de 4–15 secondes à 24 fps. "
+"Pour un premier test, utilisez ``width=960``, ``height=544`` et "
+"``num_frames=124`` (environ 5 secondes). Omettez ``num_inference_steps`` "
+"pour utiliser les pas du Lightning sélectionné, ou définissez 4 pour chacun "
+"des deux adaptateurs à 4 pas et 8 pour celui à 8 pas. Les valeurs vidéo "
+"génériques de l’interface web doivent être ajustées à ces valeurs."
+
+#: ../../source/models/model_abilities/video.rst:136
+msgid ""
+"For SGLang, install the system ``ffmpeg`` package before launching H3 and "
+"ensure both ``ffmpeg`` and ``ffprobe`` are on ``PATH``. The Python packages "
+"``av`` and ``imageio-ffmpeg`` do not satisfy this requirement."
+msgstr ""
+"Pour SGLang, installez le paquet système ``ffmpeg`` avant de lancer H3 et "
+"vérifiez que ``ffmpeg`` et ``ffprobe`` sont dans ``PATH``. Les paquets "
+"Python ``av`` et ``imageio-ffmpeg`` ne satisfont pas cette exigence."
+
+#: ../../source/models/model_abilities/video.rst:140
+msgid ""
+"With vLLM, the Web UI reports denoising progress for native H3. The request "
+"completes after audio/video decoding and encoding."
+msgstr ""
+"Avec vLLM, l’interface web affiche la progression du débruitage de H3 natif."
+" La requête se termine après le décodage et l’encodage audio et vidéo."
+
+#: ../../source/models/model_abilities/video.rst:125
+msgid ""
+"For online FP8 quantization of H3, pass ``quantization_config=\"fp8\"`` to "
+"Diffusers or vLLM. For SGLang, pass "
+"``component_quantizations={\"transformer\": \"fp8\", \"text_encoder\": "
+"\"fp8\"}``. This selects FP8 weights with dynamically quantized FP8 "
+"activations for supported DiT and text encoder linear layers, while leaving "
+"the VAEs unquantized. FP8 requires compatible GPU hardware and kernels."
+msgstr ""
+"Pour la quantification FP8 de H3 lors du chargement, transmettez "
+"``quantization_config=\"fp8\"`` à Diffusers ou vLLM. Pour SGLang, "
+"transmettez ``component_quantizations={\"transformer\": \"fp8\", "
+"\"text_encoder\": \"fp8\"}``. Les couches linéaires compatibles du DiT et de"
+" l’encodeur de texte utilisent alors des poids FP8 et des activations FP8 "
+"quantifiées dynamiquement, tandis que les VAE ne sont pas quantifiés. FP8 "
+"nécessite un GPU et des noyaux compatibles."
+
+#: ../../source/models/model_abilities/video.rst:132
+msgid ""
+"For an unquantized H3 Diffusers baseline, set "
+"``quantization_config=\"bf16\"``. The ``group_offload`` option applies to "
+"both quantized and unquantized H3 models. With streaming offload, "
+"``low_cpu_mem_usage=True`` pins CPU weights on demand."
+msgstr ""
+"Pour une configuration de référence H3 Diffusers sans quantification, "
+"définissez ``quantization_config=\"bf16\"``. L’option ``group_offload`` "
+"s’applique aux modèles H3 quantifiés comme aux modèles non quantifiés. Avec "
+"le déchargement en streaming, ``low_cpu_mem_usage=True`` épingle les poids "
+"en mémoire CPU à la demande."
+
+#: ../../source/models/model_abilities/video.rst:124
+msgid ""
+"The H3 launch dialog offers a shared runtime precision selector, also "
+"available as ``runtime_precision`` in launch requests: ``bf16`` and ``fp8`` "
+"on all three engines, plus ``int8`` and ``int4`` on Diffusers. An explicit "
+"choice overrides engine-specific precision parameters for the DiT and text "
+"encoder; VAEs retain their native precision. FP8 uses each engine's native "
+"scaling implementation and is not an identical quantization scheme across "
+"engines. Omitting this option or selecting ``auto`` preserves advanced "
+"parameters and engine defaults (INT4 on Diffusers, BF16 on SGLang and vLLM)."
+" Switching engines retains an explicit precision choice and rejects "
+"unsupported values."
+msgstr ""
+"La boîte de lancement H3 propose un sélecteur commun de précision, également"
+" disponible via ``runtime_precision`` dans les requêtes : ``bf16`` et "
+"``fp8`` pour les trois moteurs, ainsi que ``int8`` et ``int4`` pour "
+"Diffusers. Un choix explicite remplace les paramètres de précision propres "
+"au moteur pour le DiT et l’encodeur de texte ; les VAE conservent leur "
+"précision native. FP8 utilise la mise à l’échelle native de chaque moteur : "
+"le schéma de quantification diffère donc entre moteurs. Omettre cette option"
+" ou choisir ``auto`` conserve les paramètres avancés et les valeurs par "
+"défaut (INT4 pour Diffusers, BF16 pour SGLang et vLLM). Changer de moteur "
+"conserve la précision choisie et refuse les valeurs non prises en charge."

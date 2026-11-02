@@ -16,6 +16,30 @@ By default, a replacement uses the component's current Python environment. No Py
 
 In local mode, startup still uses an API parent and one shared Supervisor/Worker process. A component moves into a separate process only on its first upgrade; use the same commands and Web UI actions below. The original parent and shared process stay alive as service hosts, so stopping the original local service stops its replacement processes too. If a migrated Worker exits unexpectedly, the API and Supervisor stay available; attach a Worker to restore serving capacity.
 
+.. note::
+
+   An extension can optionally require controller sessions for Worker management RPCs. Callers must attach the versioned session and an operation ID; normal Supervisors do not add them automatically. A newer session is acknowledged only after management work drains, and failed drain keeps old sessions fenced. The provider must validate current authority on every check. Election and endpoint discovery are separate responsibilities. Worker replacement and model reload are rejected in this mode until session/resource transfer is supported. Without a provider, normal upgrade behavior is unchanged.
+
+   Session metadata is also required through same-process ActorRefs. Startup recovery records are retained until an active session is installed. If installation happens during fencing or reconciliation, retry ``install_controller_session`` after activation to resume recovery. Recovery interrupted by a newer session preserves unfinished records.
+
+   Worker-owned crash recovery and pending cache inventory publication acquire active-session admission for new events; already admitted operations keep their original session. Model OOM reports update only diagnostics for the current model incarnation and do not authorize management commands. Admitted termination finishes cleanup of its original model registration before drain completes. Interrupted native faults retain their intent and retry under active-session admission during installation or a later status report. This mechanism covers public management methods; private Python helpers remain internal. Lightweight heartbeats continue before session installation, during draining and after a drain timeout; they never register the Worker or resume recovery. Full status reports and their registration/recovery work still require active-session admission.
+
+   A Supervisor authority provider can implement ``create_supervisor_control_authority(context)`` with a fixed process session, ``validate`` and ``close``. ``context.runtime`` supplies process-local ``pause(timeout)``, ``restore_worker(ref, replicas, incarnation)`` and ``resume()`` primitives. Optional async ``execute(operation, payload)`` and ``worker_registered(ref)`` hooks delegate extension-owned behavior. The runtime does not select Workers, probe models, confirm membership or orchestrate replacement. Old processes retain their original session. Fixed-session mode rejects native component replacement until session transfer is supported. These mechanisms add no failover command or HA service. Without a provider, normal upgrade behavior is unchanged. The port also provides a settings snapshot. Async provider callbacks execute on the actor loop and may overlap; providers synchronize their own services. A busy pause is rejected before management admission closes. Inference reads are unavailable before the first successful ``resume()``; afterwards, existing routes remain readable through later management pauses. Session-protected startup recovery retries outside the registration lock and retains persisted intent while access is fenced.
+
+   Admitted calls can use optional asynchronous provider callbacks: ``around_supervisor_call(invocation, call)``, ``around_worker_call(invocation, call)`` and ``around_control_call(invocation, call)``. The immutable invocation describes the target, method, original control context and arguments. Await ``call()`` to execute; argument overrides preserve that context. The runtime supplies no receipts or replay policy. Worker callbacks also retain their original session when the Supervisor reference changes. Read-only ``controller_resource_state``, ``controller_catalog`` and ``control_operation_receipt`` expose observations or provider evidence; unavailable receipts raise. The local port can capture or replace catalogs and settings, list Worker references and invoke a public Supervisor method. Catalog replacement validates definitions first and does not rewrite registration files.
+
+   Providers can opt in to ``controller_inventory(include_services=True)`` for ready specialized replicas, shard identities and coordinator observations. Setting the authority attribute ``include_model_services=True`` includes these replicas in ordinary registration reports as well. The local port supplies ``with_service_address(address, call)``, ``model_services(model_uid)`` and ``restore_model_services(model_uid, services)`` for scoped support-actor placement and reference restoration. An optional async ``model_services_changed(model_uid)`` callback can persist completed routing changes. Default placement and registration behavior are unchanged; these primitives do not select a host or perform recovery.
+
+   The optional async ``model_service_address(model_uid)`` callback selects a support-actor address for both internal and public launches.
+
+   Optional ``create_model_service(actor_class, args, kwargs, address, uid)`` and ``destroy_model_service(ref)`` callbacks can delegate actor lifetime to Worker ``create_runtime_actor`` and ``destroy_runtime_actor`` management calls, which participate in session admission and draining. Without callbacks, ordinary actor creation and destruction remain unchanged.
+
+   Interceptors describe admitted method calls, not a single overall operation. Child-task cleanup and Worker recovery helpers may produce additional calls with the original command; distinguish them by target and method. Use ``call(args=..., kwargs=...)`` for explicit argument overrides. The top-level keyword mapping is copied; nested payloads are not deep copies. Actor lifetime callbacks preserve native lifetimes and original exceptions. Cleanup notification failures are logged without aborting termination.
+
+   ``restore_worker(..., coordinators=...)`` accepts a list or tuple of ``-rank0`` UIDs, validated before registry mutation. Async ``filter_worker_inventory(ref, replicas)`` may only narrow observations; errors or its ten-second timeout reject registration before publication. Worker catalog replacement participates in management admission and draining; providers serialize snapshot selection with catalog writes. API extensions may set async ``app.state.system_settings_provider(operation, data)`` for ``get``, ``save`` and ``reset``. It owns persistence and token masking; ``ValueError`` from ``save`` returns HTTP 422.
+
+   Providers must await ``call()`` directly in the callback task; task-spawning wrappers such as ``asyncio.wait_for`` and ``asyncio.shield`` are unsupported. Local port restore methods require provider-owned ordering while management is paused. Explicit coordinator UIDs are selected by the caller separately from replica filtering, because a Worker may host only a coordinator.
+
 Check and install updates
 -------------------------
 
@@ -207,7 +231,11 @@ For Docker, use the same host command as the container command. Install or mount
 Model and engine
 ----------------
 
-Open a running model's detail view and choose **Reconfigure / upgrade model**. Engine replacement requires **Keep GPU weights for reload** (``enable_weight_cache=true``) at launch, vLLM 0.31.0+ or SGLang 0.5.21+, Linux with CUDA or ROCm, one Worker, one replica and fixed tensor parallelism.
+.. versionchanged:: v4.2.0
+
+   The default for ``enable_weight_cache`` changed from ``False`` to automatic selection (``None``). Retained-weight models now support multiple replicas, scale-out and sequential reload.
+
+Open a running model's detail view and choose **Reconfigure / upgrade model**. Engine replacement requires GPU weight retention enabled at launch, either automatically on a supported configuration or explicitly with ``enable_weight_cache=True``. See :ref:`launch_weight_cache_reload` for prerequisites and the **Auto**, **Enabled** and **Disabled** settings. Multiple replicas are supported: each keeps its own weight cache, and model reload updates them sequentially. See the linked guide for partial failures, retries and scale-out.
 
 .. figure:: /_static/reconfigure_in_running.png
    :alt: Open model reconfiguration from Running Models.

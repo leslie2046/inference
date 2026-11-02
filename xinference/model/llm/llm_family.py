@@ -29,7 +29,7 @@ from ..._compat import (
     load_str_bytes,
     validator,
 )
-from ...constants import XINFERENCE_CACHE_DIR
+from ...constants import XINFERENCE_CACHE_DIR, XINFERENCE_ENV_MODEL_SRC
 from ..core import VirtualEnvSettings
 from ..utils import (
     ModelInstanceInfoMixin,
@@ -39,6 +39,7 @@ from ..utils import (
     retry_snapshot_download,
 )
 from . import LLM
+from .context_length import ContextLengthExtension
 from .model_metadata import ModelMetadata
 
 logger = logging.getLogger(__name__)
@@ -184,6 +185,7 @@ class MLXLLMSpecV2(BaseModel):
 class LLMFamilyV2(BaseModel, ModelInstanceInfoMixin):
     version: Literal[2]
     context_length: Optional[int] = DEFAULT_CONTEXT_LENGTH
+    context_length_extension: Optional[ContextLengthExtension] = None
     model_name: str
     model_lang: List[str]
     model_ability: List[
@@ -219,12 +221,26 @@ class LLMFamilyV2(BaseModel, ModelInstanceInfoMixin):
     class Config:
         extra = "allow"
 
+    @validator("context_length_extension")
+    def validate_context_extension(cls, extension, values):
+        if extension is not None:
+            native = values.get("context_length")
+            if native is None or extension.max_context_length <= native:
+                raise ValueError("max_context_length must exceed context_length")
+        return extension
+
     def _resolve_architectures(self) -> Optional[List[str]]:
         if self.architectures:
             return self.architectures
         if not self.model_family:
             return None
         for family in BUILTIN_LLM_FAMILIES:
+            if family.model_name == self.model_family:
+                return family.architectures
+
+        from .custom import get_user_defined_llm_families
+
+        for family in get_user_defined_llm_families():
             if family.model_name == self.model_family:
                 return family.architectures
         return None
@@ -575,6 +591,7 @@ def match_llm(
     download_hub: Optional[
         Literal["huggingface", "modelscope", "openmind_hub", "csghub"]
     ] = None,
+    model_path: Optional[str] = None,
 ) -> Optional[LLMFamilyV2]:
     """
     Find an LLM family, spec, and quantization that satisfy given criteria.
@@ -619,6 +636,24 @@ def match_llm(
                 model_specs = _get_model_specs(
                     family.model_specs, download_hub
                 ) + _get_model_specs(family.model_specs, "huggingface")
+        elif model_path:
+            # Preserve source preference without probing for local weights.
+            preferred_hub = "huggingface"
+            if os.environ.get(XINFERENCE_ENV_MODEL_SRC) != "auto":
+                if download_from_modelscope():
+                    preferred_hub = "modelscope"
+                elif download_from_openmind_hub():
+                    preferred_hub = "openmind_hub"
+                elif download_from_csghub():
+                    preferred_hub = "csghub"
+            model_specs = _get_model_specs(family.model_specs, preferred_hub)
+            if preferred_hub != "huggingface":
+                model_specs += _get_model_specs(family.model_specs, "huggingface")
+            model_specs += [
+                spec
+                for spec in family.model_specs
+                if spec.model_hub not in (preferred_hub, "huggingface")
+            ]
         else:
             if download_from_modelscope():
                 model_specs = _get_model_specs(

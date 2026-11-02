@@ -22,6 +22,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from xinference.core.launch_strategy import IdleFirstLaunchStrategy
+from xinference.core.model_reload import ModelReloadMixin
 from xinference.core.utils import assign_replica_gpu, build_replica_model_uid
 
 
@@ -92,13 +93,17 @@ class DummyStatusGuard:
         return self.replica_counts[model_uid]
 
 
-class DummySupervisor:
+class DummySupervisor(ModelReloadMixin):
     def __init__(self, workers):
         from xinference.core.supervisor import SupervisorActor
 
         self._worker_address_to_worker = workers
         self._model_uid_to_replica_info = {}
+        self._model_reload_tasks = {}
         self._replica_model_uid_to_worker = {}
+        self._replica_model_uid_to_worker_shards = {}
+        self._initial_model_launches = {}
+        self._async_launch_tasks = set()
         self._status_guard_ref = DummyStatusGuard()
         self._unexpected_down_replicas = {}
         self._worker_status = {}
@@ -120,6 +125,9 @@ class DummySupervisor:
         )
         self.launch_builtin_model = SupervisorActor.launch_builtin_model.__get__(self)
         self._launch_builtin_model = SupervisorActor._launch_builtin_model.__get__(self)
+        self._run_initial_model_launch = (
+            SupervisorActor._run_initial_model_launch.__get__(self)
+        )
         self._get_worker_host = SupervisorActor._get_worker_host
         self._get_worker_refs_by_ip = SupervisorActor._get_worker_refs_by_ip.__get__(
             self
@@ -178,6 +186,7 @@ def _shard_lifecycle_supervisor(n_worker):
     for name in (
         "terminate_model",
         "_terminate_model",
+        "_clear_model_routing",
         "_get_model_replica_lock",
         "_iter_active_replica_model_uids",
     ):
@@ -216,7 +225,11 @@ async def test_sharded_launch_failure_rolls_back(
 
     with pytest.raises(error_type) as exc:
         await _launch_shard_lifecycle(supervisor, workers, replica)
-    assert exc.value is failing_worker.error
+    # Python 3.10 may recreate cancellation exceptions across a Task boundary.
+    # Cancellation propagation and rollback, rather than object identity, are
+    # the contract; ordinary launch failures still preserve their exception.
+    if error_type is not asyncio.CancelledError:
+        assert exc.value is failing_worker.error
     for i, worker in enumerate(workers):
         expected = [build_replica_model_uid("sharded", r) for r in range(replica - 1)]
         if i < fail_shard:
@@ -756,7 +769,7 @@ async def test_terminate_model_replica_updates_active_replica_set():
         async def terminate_model(self, model_uid: str):
             self.terminated.append(model_uid)
 
-    class DummySupervisor:
+    class DummySupervisor(ModelReloadMixin):
         terminate_model_replica = SupervisorActor.terminate_model_replica
         _terminate_model_replica = SupervisorActor._terminate_model_replica
         _get_model_replica_lock = SupervisorActor._get_model_replica_lock
@@ -771,6 +784,7 @@ async def test_terminate_model_replica_updates_active_replica_set():
         )
 
         def __init__(self):
+            self._model_reload_tasks = {}
             self._model_replica_locks = {}
             self._model_uid_to_replica_info = {
                 "demo-model": ReplicaInfo(
@@ -831,216 +845,75 @@ async def test_terminate_model_replica_updates_active_replica_set():
     )
 
 
-class DynamicReplicaStatusGuard:
-    def __init__(self, replica_ids):
-        self.replica_ids = set(replica_ids)
-        self.statuses = {}
-        self.updates = []
-
-    async def update_replica_status(
-        self, model_uid: str, replica_id: int, updates: dict
-    ):
-        self.replica_ids.add(replica_id)
-        self.statuses.setdefault(replica_id, {}).update(updates)
-
-    async def remove_replica_status(self, model_uid: str, replica_id: int):
-        self.replica_ids.discard(replica_id)
-        self.statuses.pop(replica_id, None)
-        return len(self.replica_ids)
-
-    async def update_instance_info(self, model_uid: str, updates: dict):
-        self.updates.append((model_uid, updates))
-
-
-class DynamicReplicaWorker:
-    def __init__(self, fail_uid=None):
-        self.address = "worker-1:1000"
-        self.fail_uid = fail_uid
-        self.launch_args = {
-            "model_uid": "demo-model-rep0",
-            "model_name": "demo",
-            "model_size_in_billions": None,
-            "model_format": None,
-            "quantization": None,
-            "model_engine": None,
-            "model_type": "embedding",
-            "n_gpu": None,
-            "n_worker": 1,
-            "gpu_idx": [7],
-            "launch_ts": 123,
-        }
-        self.launched = []
-        self.terminated = []
-
-    async def get_model_launch_args(self, model_uid: str):
-        return dict(self.launch_args)
-
-    async def launch_builtin_model(self, **kwargs):
-        self.launched.append(kwargs)
-        if kwargs["model_uid"] == self.fail_uid:
-            raise RuntimeError("launch failed")
-        return "subpool"
-
-    async def wait_for_load(self, model_uid: str):
-        return None
-
-    async def terminate_model(self, model_uid: str):
-        self.terminated.append(model_uid)
-
-
-def make_dynamic_replica_supervisor(worker, active_ids):
-    from xinference.core.supervisor import ReplicaInfo, SupervisorActor
-
-    class DynamicReplicaSupervisor:
-        add_model_replicas = SupervisorActor.add_model_replicas
-        _refresh_replica_scheduler = staticmethod(
-            SupervisorActor._refresh_replica_scheduler
-        )
-
-        def __init__(self):
-            self._model_uid_to_replica_info = {
-                "demo-model": ReplicaInfo(
-                    replica=len(active_ids),
-                    scheduler=itertools.cycle(active_ids),
-                    active_replica_ids=list(active_ids),
-                )
-            }
-            info = self._model_uid_to_replica_info["demo-model"]
-            for replica_id in active_ids:
-                info.replica_to_worker_refs[replica_id].append(worker)
-            self._replica_model_uid_to_worker = {
-                build_replica_model_uid("demo-model", replica_id): worker
-                for replica_id in active_ids
-            }
-            self._status_guard_ref = DynamicReplicaStatusGuard(active_ids)
-            self._unexpected_down_replicas = {}
-            self._list_models_cache_version = 0
-            self.placement_requests = []
-
-        async def _choose_worker_for_new_replica(self, n_gpu, worker_ip=None):
-            self.placement_requests.append((n_gpu, worker_ip))
-            return worker, None
-
-        def _invalidate_list_models_debounce_cache(self):
-            self._list_models_cache_version += 1
-
-    return DynamicReplicaSupervisor()
-
-
 @pytest.mark.asyncio
-async def test_add_model_replicas_uses_new_ids_and_keeps_source_spec_immutable():
-    worker = DynamicReplicaWorker()
-    supervisor = make_dynamic_replica_supervisor(worker, [0, 2])
-
-    total, replica_ids = await supervisor.add_model_replicas("demo-model", 1)
-
-    assert (total, replica_ids) == (3, [3])
-    assert worker.launched[0]["model_uid"] == "demo-model-rep3"
-    assert worker.launched[0]["gpu_idx"] is None
-    assert "launch_ts" not in worker.launched[0]
-    assert worker.launch_args["model_uid"] == "demo-model-rep0"
-    assert worker.launch_args["gpu_idx"] == [7]
-    info = supervisor._model_uid_to_replica_info["demo-model"]
-    assert info.active_replica_ids == [0, 2, 3]
-    assert next(info.scheduler) == 0
-    assert next(info.scheduler) == 2
-    assert next(info.scheduler) == 3
-    assert supervisor._status_guard_ref.statuses[3]["status"] == "READY"
-
-
-@pytest.mark.asyncio
-async def test_add_model_replicas_applies_resource_overrides_to_new_replicas():
-    worker = DynamicReplicaWorker()
-    worker.launch_args["n_gpu"] = "auto"
-    supervisor = make_dynamic_replica_supervisor(worker, [0, 2])
-
-    total, replica_ids = await supervisor.add_model_replicas(
-        "demo-model",
-        2,
+@pytest.mark.parametrize("engine", ["vLLM", "SGLang"])
+@pytest.mark.parametrize("replica,n_worker", [(1, 1), (2, 1), (1, 2)])
+@pytest.mark.parametrize("local", [False, True])
+async def test_auto_weight_cache_respects_launch_topology(
+    engine, replica, n_worker, local
+):
+    workers = [
+        DummyWorkerRef(f"w{i}:1000", model_count=0, launched=[]) for i in range(2)
+    ]
+    supervisor = DummySupervisor({w.address: w for w in workers})
+    supervisor.is_local_deployment = lambda: local
+    await supervisor.launch_builtin_model(
+        model_uid="demo-model",
+        model_name="demo",
+        model_size_in_billions=None,
+        model_format="pytorch",
+        quantization=None,
+        model_engine=engine,
+        model_type="LLM",
         n_gpu=1,
-        worker_ip="worker-1",
-        gpu_idx=[2, 3],
+        replica=replica,
+        n_worker=n_worker,
+        wait_ready=True,
+        worker_ip=[w.address for w in workers],
     )
-
-    assert (total, replica_ids) == (4, [3, 4])
-    assert [item["model_uid"] for item in worker.launched] == [
-        "demo-model-rep3",
-        "demo-model-rep4",
-    ]
-    assert [item["n_gpu"] for item in worker.launched] == [1, 1]
-    assert [item["gpu_idx"] for item in worker.launched] == [[2], [3]]
-    assert supervisor.placement_requests == [
-        (None, "worker-1"),
-        (None, "worker-1"),
-    ]
-    assert worker.launch_args["n_gpu"] == "auto"
-    assert worker.launch_args["gpu_idx"] == [7]
+    launches = [call for worker in workers for call in worker.launch_kwargs]
+    assert launches
+    expected = None if local or n_worker == 1 else False
+    assert all(call.get("enable_weight_cache") is expected for call in launches)
 
 
 @pytest.mark.asyncio
-async def test_add_model_replicas_can_override_gpu_launch_with_cpu():
-    worker = DynamicReplicaWorker()
-    worker.launch_args["n_gpu"] = "auto"
-    supervisor = make_dynamic_replica_supervisor(worker, [0])
-
-    await supervisor.add_model_replicas("demo-model", n_gpu=None)
-
-    assert worker.launched[0]["n_gpu"] is None
-    assert worker.launched[0]["gpu_idx"] is None
-    assert supervisor.placement_requests == [(None, None)]
-
-
-@pytest.mark.asyncio
-async def test_new_replica_worker_selection_respects_worker_filter():
-    from xinference.core.supervisor import SupervisorActor
-
-    class PlacementWorker:
-        def __init__(self, address: str, model_count: int):
-            self.address = address
-            self.model_count = model_count
-
-        async def get_model_count(self):
-            return self.model_count
-
-        async def get_gpu_allocation_status(self):
-            return None
-
-    class PlacementSupervisor:
-        _choose_worker_for_new_replica = SupervisorActor._choose_worker_for_new_replica
-        _get_worker_refs_by_ip = SupervisorActor._get_worker_refs_by_ip
-
-        def __init__(self):
-            self._worker_address_to_worker = {
-                "w1:1000": PlacementWorker("w1:1000", 0),
-                "w2:1000": PlacementWorker("w2:1000", 5),
-            }
-
-        @staticmethod
-        def is_local_deployment():
-            return False
-
-    supervisor = PlacementSupervisor()
-    worker, gpu_idx = await supervisor._choose_worker_for_new_replica(None, "w2")
-
-    assert worker.address == "w2:1000"
-    assert gpu_idx is None
-
-    with pytest.raises(ValueError, match="Worker ip address missing"):
-        await supervisor._choose_worker_for_new_replica(None, "missing")
+@pytest.mark.parametrize("model_type", ["embedding", "rerank"])
+@pytest.mark.parametrize("cache_kwargs", [{}, {"enable_weight_cache": None}])
+async def test_auto_cache_option_is_not_forwarded_to_non_llm(model_type, cache_kwargs):
+    worker = DummyWorkerRef("worker:9978", model_count=0, launched=[])
+    supervisor = DummySupervisor({worker.address: worker})
+    await supervisor.launch_builtin_model(
+        model_uid="demo-model",
+        model_name="demo",
+        model_type=model_type,
+        model_engine="vLLM",
+        model_size_in_billions=None,
+        model_format="pytorch",
+        quantization=None,
+        n_gpu=1,
+        **cache_kwargs,
+    )
+    assert len(worker.launch_kwargs) == 1
+    assert "enable_weight_cache" not in worker.launch_kwargs[0]
 
 
 @pytest.mark.asyncio
-async def test_add_model_replicas_rolls_back_only_new_replicas_on_failure():
-    worker = DynamicReplicaWorker(fail_uid="demo-model-rep4")
-    supervisor = make_dynamic_replica_supervisor(worker, [0, 2])
-
-    with pytest.raises(RuntimeError, match="launch failed"):
-        await supervisor.add_model_replicas("demo-model", 2)
-
-    info = supervisor._model_uid_to_replica_info["demo-model"]
-    assert info.active_replica_ids == [0, 2]
-    assert info.replica == 2
-    assert worker.terminated == ["demo-model-rep3", "demo-model-rep4"]
-    assert supervisor._status_guard_ref.replica_ids == {0, 2}
-    assert "demo-model-rep3" not in supervisor._replica_model_uid_to_worker
-    assert "demo-model-rep4" not in supervisor._replica_model_uid_to_worker
+@pytest.mark.parametrize("policy", [True, False, None])
+async def test_multiple_replicas_preserve_explicit_cache_policy(policy):
+    worker = DummyWorkerRef("worker:9978", model_count=0, launched=[])
+    supervisor = DummySupervisor({worker.address: worker})
+    await supervisor.launch_builtin_model(
+        model_uid="demo-model",
+        model_name="demo",
+        model_type="LLM",
+        model_engine="vLLM",
+        model_size_in_billions=None,
+        model_format="pytorch",
+        quantization=None,
+        n_gpu=1,
+        replica=2,
+        enable_weight_cache=policy,
+    )
+    assert len(worker.launch_kwargs) == 2
+    assert all(args["enable_weight_cache"] is policy for args in worker.launch_kwargs)

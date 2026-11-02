@@ -14,6 +14,7 @@
 
 import asyncio
 import functools
+import inspect
 import itertools
 import os
 import signal
@@ -28,6 +29,7 @@ from typing import (
     TYPE_CHECKING,
     Any,
     Callable,
+    Coroutine,
     DefaultDict,
     Dict,
     Iterator,
@@ -43,6 +45,7 @@ from typing import (
 import xoscar as xo
 
 from ..constants import (
+    XINFERENCE_CANCEL_LAUNCH_TIMEOUT,
     XINFERENCE_DEFAULT_CANCEL_BLOCK_DURATION,
     XINFERENCE_DISABLE_HEALTH_CHECK,
     XINFERENCE_DOWNLOAD_TASK_DB_PATH,
@@ -79,6 +82,7 @@ from .download_task_store import (
 from .exceptions import ModelNotReadyError
 from .launch_strategy import IdleFirstLaunchStrategy
 from .metrics import record_metrics
+from .model_reload import ModelReloadMixin
 from .replica_config import (
     ReplicaConfig,
     normalize_replica_configs,
@@ -245,7 +249,66 @@ class ReplicaInfo:
     )
 
 
-class SupervisorActor(SupervisorHandoffMixin, xo.StatelessActor):
+@dataclass
+class InitialModelLaunch:
+    task: asyncio.Task
+    workers: Dict[str, List[xo.ActorRefType["WorkerActor"]]] = field(
+        default_factory=dict
+    )
+    cancelling: bool = False
+
+
+def model_service_address(owner):
+    from .supervisor_control import model_service_address as selected_address
+
+    return selected_address(owner)
+
+
+class SupervisorActor(ModelReloadMixin, SupervisorHandoffMixin, xo.StatelessActor):
+    def __getattribute__(self, name):
+        value = super().__getattribute__(name)
+        if not name.startswith("_") and callable(value):
+            control = getattr(self, "_controller_control", None)
+            if control is not None:
+                from .supervisor_control import (
+                    READS,
+                    SERVICE_CALLS,
+                    bind_supervisor_control,
+                )
+                from .supervisor_upgrade import INFERENCE_READS
+
+                if name not in SERVICE_CALLS and (
+                    name not in READS
+                    or (name in INFERENCE_READS and not control.has_served)
+                ):
+                    return bind_supervisor_control(self, name, value)
+        return value
+
+    async def __on_receive__(self, message):
+        if getattr(self, "_controller_control", None) is not None and message[1] != 0:
+            from .control_session import ControlSessionRejected
+
+            raise ControlSessionRejected("unsupported_batch")
+        from .control_session import (
+            CONTROL_CONTEXT_KEY,
+            ControlContext,
+            ControlSessionRejected,
+        )
+
+        method, call_method, args, kwargs = message
+        if kwargs and CONTROL_CONTEXT_KEY in kwargs:
+            control = getattr(self, "_controller_control", None)
+            if control is None:
+                raise ControlSessionRejected("authority_not_configured")
+            kwargs = dict(kwargs)
+            try:
+                command = ControlContext.from_dict(kwargs.pop(CONTROL_CONTEXT_KEY))
+            except (TypeError, ValueError):
+                raise ControlSessionRejected("invalid_context") from None
+            async with control.fence.command(command):
+                return await super().__on_receive__((method, call_method, args, kwargs))
+        return await super().__on_receive__(message)
+
     def __init__(
         self,
         service_address=None,
@@ -267,8 +330,10 @@ class SupervisorActor(SupervisorHandoffMixin, xo.StatelessActor):
         self._pd_model_mapping: Dict[str, Any] = {}
         self._xavier_cache_mapping: Dict[str, xo.ActorRefType] = {}
         self._xavier_source_mapping: Dict[str, List[xo.ActorRefType]] = {}
+        self._xavier_history_mapping: Dict[str, List[xo.ActorRefType]] = {}
         self._pd_roles: Dict[str, Dict[int, str]] = {}
         super().__init__()
+        self._controller_control = None
         self._worker_address_to_worker: Dict[str, xo.ActorRefType["WorkerActor"]] = {}  # type: ignore
         self._worker_status: Dict[str, WorkerStatus] = {}  # type: ignore
         self._extension_worker_resources: Dict[str, Dict[str, Any]] = {}
@@ -314,6 +379,7 @@ class SupervisorActor(SupervisorHandoffMixin, xo.StatelessActor):
         # long-running model downloads can starve the actor event loop.
         self._workers_launching: Dict[str, int] = {}  # address -> active launch count
         self._async_launch_tasks: Set[asyncio.Task] = set()
+        self._initial_model_launches: Dict[str, InitialModelLaunch] = {}
         # Active download-only operations, used only for dispatch cancellation.
         # Progress itself is retained by ProgressTrackerActor after completion.
         self._cache_uid_to_worker: Dict[str, xo.ActorRefType["WorkerActor"]] = {}
@@ -408,6 +474,37 @@ class SupervisorActor(SupervisorHandoffMixin, xo.StatelessActor):
             lock = asyncio.Lock()
             self._model_replica_locks[model_uid] = lock
         return lock
+
+    async def _run_initial_model_launch(
+        self, model_uid: str, launch: Coroutine[Any, Any, None], wait_ready: bool
+    ) -> None:
+        task = asyncio.create_task(launch)
+        operation = InitialModelLaunch(task)
+        self._initial_model_launches[model_uid] = operation
+
+        def done(completed: asyncio.Task) -> None:
+            if (
+                not operation.cancelling
+                and self._initial_model_launches.get(model_uid) is operation
+            ):
+                self._initial_model_launches.pop(model_uid)
+            self._invalidate_list_models_debounce_cache()
+
+        task.add_done_callback(done)
+        if wait_ready:
+            try:
+                await task
+            except asyncio.CancelledError:
+                if operation.cancelling:
+                    raise RuntimeError(f"Model launch cancelled: {model_uid}") from None
+                raise
+        else:
+            self._async_launch_tasks.add(task)
+            task.add_done_callback(
+                functools.partial(
+                    callback_for_async_launch, self._async_launch_tasks, model_uid
+                )
+            )
 
     def _iter_active_replica_model_uids(self, model_uid: str) -> List[str]:
         replica_info = self._model_uid_to_replica_info.get(model_uid, None)
@@ -938,7 +1035,6 @@ class SupervisorActor(SupervisorHandoffMixin, xo.StatelessActor):
 
         get_extensions()
         self._actor_loop = asyncio.get_running_loop()
-        self._initialize_worker_ownership()
         self._uptime = time.time()
         if XINFERENCE_ENABLE_OTEL:
             try:
@@ -950,6 +1046,31 @@ class SupervisorActor(SupervisorHandoffMixin, xo.StatelessActor):
                     "Failed to initialise supervisor OpenTelemetry worker metrics. Continuing without supervisor OTEL metrics."
                 )
         logger.info(f"Xinference supervisor {self.control_address} started")
+        from ..extensions import (
+            SupervisorControlAuthorityContext,
+            resolve_supervisor_control_authority,
+        )
+        from .supervisor_control import SupervisorControl, SupervisorControlPort
+
+        authority = resolve_supervisor_control_authority(
+            SupervisorControlAuthorityContext(
+                self.control_address, SupervisorControlPort(self)
+            )
+        )
+        if authority is not None:
+            self._controller_control = SupervisorControl(self, authority)
+            self._control_fence = self._controller_control.fence
+            self._standby = True
+        try:
+            self._initialize_worker_ownership()
+        except BaseException:
+            if self._controller_control is not None:
+                try:
+                    await self._controller_control.invoke("close")
+                except Exception:
+                    logger.error("Supervisor journal startup cleanup failed")
+            raise
+
         from .cache_tracker import CacheTrackerActor
         from .event import EventCollectorActor
         from .progress_tracker import ProgressTrackerActor
@@ -1071,6 +1192,23 @@ class SupervisorActor(SupervisorHandoffMixin, xo.StatelessActor):
     def control_address(self) -> str:
         return getattr(self, "_service_address", None) or self.address
 
+    def controller_session_status(self):
+        control = getattr(self, "_controller_control", None)
+        return (
+            {"configured": False}
+            if control is None
+            else {"configured": True, **control.fence.status()}
+        )
+
+    async def supervisor_extension_operation(self, operation, payload):
+        """Dispatch an optional provider operation without prescribing its workflow."""
+        control = getattr(self, "_controller_control", None)
+        if control is None:
+            from .control_session import ControlSessionRejected
+
+            raise ControlSessionRejected("authority_not_configured")
+        return await control.operation(operation, payload)
+
     def supervisor_upgrade_info(self):
         from .. import __version__
         from .supervisor_upgrade import PROTOCOL_VERSION
@@ -1110,6 +1248,12 @@ class SupervisorActor(SupervisorHandoffMixin, xo.StatelessActor):
         self._supervisor_activation_prepared = True
 
     async def activate_supervisor(self):
+        control = getattr(self, "_controller_control", None)
+        if control is not None and not control.ready:
+            return  # Service process can start; management stays fenced.
+        await self._activate_supervisor()
+
+    async def _activate_supervisor(self):
         if getattr(self, "_supervisor_tasks_started", False):
             return
         await self.prepare_supervisor_activation()
@@ -1147,6 +1291,9 @@ class SupervisorActor(SupervisorHandoffMixin, xo.StatelessActor):
             )
 
     def _schedule_autostart(self, delay: float = 0.0):
+        control = getattr(self, "_controller_control", None)
+        if control is not None and not control.ready:
+            return
         actor_loop = getattr(self, "_actor_loop", None)
         if actor_loop is not None and actor_loop is not asyncio.get_running_loop():
             actor_loop.call_soon_threadsafe(self._schedule_autostart, delay)
@@ -3140,19 +3287,16 @@ class SupervisorActor(SupervisorHandoffMixin, xo.StatelessActor):
         validate_context_length_launch(model_type or "LLM", model_engine, kwargs)
         from ..model.llm.weight_cache import parse_weight_cache_option
 
-        if parse_weight_cache_option(kwargs.get("enable_weight_cache", False)):
+        weight_cache_option = parse_weight_cache_option(
+            kwargs.get("enable_weight_cache")
+        )
+        if weight_cache_option is True:
             if (model_type or "LLM").lower() != "llm":
                 raise ValueError("enable_weight_cache requires an LLM model")
             if (model_engine or "").lower() not in ("vllm", "sglang"):
                 raise ValueError("enable_weight_cache requires vLLM or SGLang")
-            if (
-                n_worker != 1
-                or replica != 1
-                or (replica_config is not None and len(replica_config) != 1)
-            ):
-                raise ValueError(
-                    "enable_weight_cache currently requires one worker and one replica"
-                )
+            if n_worker != 1:
+                raise ValueError("enable_weight_cache requires one worker per replica")
         if (model_type or "").lower() == "audio":
             from ..model.audio.core import resolve_audio_model_name_and_engine
 
@@ -3168,6 +3312,17 @@ class SupervisorActor(SupervisorHandoffMixin, xo.StatelessActor):
             # ignore n_worker > 1 if local deployment
             logger.warning("Local deployment, ignore n_worker(%s)", n_worker)
             n_worker = 1
+
+        if weight_cache_option is None:
+            if (model_type or "LLM").lower() == "llm" and (
+                model_engine or ""
+            ).lower() in ("vllm", "sglang"):
+                # Engine/platform checks run in the actual model environment.
+                # Each replica owns an independent cache on its own worker.
+                if n_worker != 1:
+                    kwargs["enable_weight_cache"] = False
+            else:
+                kwargs.pop("enable_weight_cache", None)
 
         if replica_config is not None:
             # replica_config pins each replica to a single worker, so it is
@@ -3248,6 +3403,14 @@ class SupervisorActor(SupervisorHandoffMixin, xo.StatelessActor):
         if model_uid is None:
             model_uid = self._gen_model_uid(model_name)
 
+        if not is_valid_model_uid(model_uid):
+            raise ValueError(
+                "The model UID is invalid. Please specify the model UID by "
+                "0 < length <= 100, not ending with the reserved replica "
+                "suffix '-rep<number>'."
+            )
+        service_address = None
+
         # Resolve per-replica placement (replica_config) BEFORE any side effects
         # below (xavier actor creation, replica_info, instance_info) so that a
         # bad config fails cleanly with no leaked actors or partial state.
@@ -3268,7 +3431,10 @@ class SupervisorActor(SupervisorHandoffMixin, xo.StatelessActor):
             ) = await self._resolve_replica_config(model_uid, replica, replica_config)
 
         pd_enabled = validate_pd_replica_configs(
-            replica_config, model_engine, model_type
+            replica_config,
+            model_engine,
+            model_type,
+            allow_shared_cache=bool(kwargs.get("enable_xavier")),
         )
         transport_backend = kwargs.pop(
             "vllm_transfer_backend_type", kwargs.pop("transfer_backend_type", None)
@@ -3283,6 +3449,11 @@ class SupervisorActor(SupervisorHandoffMixin, xo.StatelessActor):
             for cfg in replica_config or []
         ]
         heterogeneous_pd = pd_enabled and len(set(replica_engines)) > 1
+        heterogeneous_cache = not pd_enabled and len(set(replica_engines)) > 1
+        if heterogeneous_cache and (n_worker != 1 or transport_backend != "xavier"):
+            raise ValueError(
+                "Cross-engine shared caching requires one worker per replica and Xavier"
+            )
         if (model_engine or "").lower() == "trt-llm" and n_worker != 1:
             raise ValueError("TRT-LLM currently requires one worker per replica")
         host_handoff = heterogeneous_pd and "mlx" in replica_engines
@@ -3308,22 +3479,37 @@ class SupervisorActor(SupervisorHandoffMixin, xo.StatelessActor):
             kwargs.pop("xavier_cache_backend_config", None),
         )
         requested_xavier = bool(kwargs.pop("enable_xavier", False))
+        pd_history = pd_enabled and cache_backend == "lmcache"
+        pd_mlx_prefill = pd_enabled and any(
+            cfg.role == "prefill" and engine == "mlx"
+            for cfg, engine in zip(replica_config or [], replica_engines)
+        )
         if cache_backend != "native" and (
-            not requested_xavier
+            not (requested_xavier or pd_enabled)
             or replica <= 1
-            or pd_enabled
-            or (model_engine or "").lower() not in {"vllm", "sglang", "trt-llm"}
+            or not pd_enabled
+            and (model_engine or "").lower() not in {"vllm", "sglang", "trt-llm"}
             or model_type not in (None, "LLM")
-            or any(engine != (model_engine or "").lower() for engine in replica_engines)
+            or not pd_enabled
+            and any(
+                engine != (model_engine or "").lower() for engine in replica_engines
+            )
             or transport_backend != "xavier"
             or kwargs.get("xavier_gpu_cache_bytes") is not None
+            and not (pd_history and kwargs["xavier_gpu_cache_bytes"] == 0)
             or kwargs.get("xavier_cache_bytes") is not None
+            and not pd_mlx_prefill
         ):
             raise ValueError(
                 "The LMCache backend requires enable_xavier with multiple ordinary "
-                "vLLM V1, SGLang or TRT-LLM replicas, no P/D roles, "
-                "and backend cpu_bytes instead of native cache budgets"
+                "vLLM V1, SGLang or TRT-LLM replicas, or Xavier P/D roles, "
+                "and backend cpu_bytes for history instead of native cache budgets"
             )
+        if pd_history and set(replica_engines) != {"mlx"}:
+            # The existing canonical GPU/host handoff works for homogeneous
+            # groups too, and lets P's independent history use portable pages.
+            heterogeneous_pd = True
+            host_handoff = "mlx" in replica_engines
         cache_namespace = gen_random_string(32) if cache_backend != "native" else None
         shared_cache_backend = (
             {
@@ -3347,11 +3533,13 @@ class SupervisorActor(SupervisorHandoffMixin, xo.StatelessActor):
             and transport_backend == "xavier"
             and (model_engine or "").lower() == "mlx"
             and not heterogeneous_pd
+            and not heterogeneous_cache
         )
         if (
             (requested_xavier or pd_enabled)
             and (model_engine or "").lower() == "mlx"
             and not heterogeneous_pd
+            and not heterogeneous_cache
         ):
             if transport_backend != "xavier":
                 raise ValueError("MLX Xavier requires the xavier transport")
@@ -3362,7 +3550,7 @@ class SupervisorActor(SupervisorHandoffMixin, xo.StatelessActor):
             ):
                 raise ValueError("MLX Xavier requires unquantized MLX text weights")
             kwargs["_xavier_cache_config"] = {
-                "address": self.control_address,
+                "address": (service_address or model_service_address(self)),
                 "uid": f"xavier-cache-{model_uid}",
             }
         sglang_xavier = (
@@ -3371,6 +3559,7 @@ class SupervisorActor(SupervisorHandoffMixin, xo.StatelessActor):
             and model_engine is not None
             and model_engine.lower() == "sglang"
             and not heterogeneous_pd
+            and not heterogeneous_cache
         )
         sglang_nixl = (
             pd_enabled
@@ -3384,6 +3573,7 @@ class SupervisorActor(SupervisorHandoffMixin, xo.StatelessActor):
             and trt_engine
             and transport_backend == "xavier"
             and not heterogeneous_pd
+            and not heterogeneous_cache
         )
         trt_nixl = pd_enabled and trt_engine and transport_backend == "nixl"
         if trt_xavier or trt_nixl:
@@ -3400,7 +3590,7 @@ class SupervisorActor(SupervisorHandoffMixin, xo.StatelessActor):
             raise ValueError("TRT-LLM native NIXL cannot also enable Xavier")
         if trt_xavier:
             kwargs["_xavier_cache_config"] = {
-                "address": self.control_address,
+                "address": (service_address or model_service_address(self)),
                 "uid": f"xavier-cache-{model_uid}",
             }
         if sglang_nixl and (requested_xavier or n_worker != 1):
@@ -3408,14 +3598,11 @@ class SupervisorActor(SupervisorHandoffMixin, xo.StatelessActor):
                 "SGLang native NIXL requires one worker per replica without enable_xavier"
             )
         cache_bytes = kwargs.pop("xavier_cache_bytes", None)
-        mlx_prefill = host_handoff and any(
-            cfg.role == "prefill"
-            and (cfg.model_engine or model_engine or "").lower() == "mlx"
-            for cfg in (replica_config or [])
-        )
+        mlx_prefill = host_handoff and pd_mlx_prefill
         if cache_bytes is not None and (
             not (
-                mlx_xavier
+                heterogeneous_cache
+                or mlx_xavier
                 or mlx_prefill
                 or trt_xavier
                 and not pd_enabled
@@ -3432,28 +3619,38 @@ class SupervisorActor(SupervisorHandoffMixin, xo.StatelessActor):
             raise ValueError(
                 "SGLang Xavier requires the xavier transport and one worker per replica"
             )
-        if sglang_xavier or heterogeneous_pd:
+        if sglang_xavier or heterogeneous_pd or heterogeneous_cache:
             if (
                 model_type not in (None, "LLM")
-                or (not host_handoff and model_format not in (None, "pytorch"))
+                or (
+                    not host_handoff
+                    and not heterogeneous_cache
+                    and model_format not in (None, "pytorch")
+                )
                 or quantization not in (None, "none")
             ):
                 raise ValueError(
-                    "Cross-engine Xavier PD requires unquantized PyTorch LLM weights"
-                    if heterogeneous_pd
-                    else "SGLang Xavier requires unquantized PyTorch LLM weights"
+                    "Cross-engine Xavier sharing requires unquantized LLM weights"
+                    if heterogeneous_cache
+                    else (
+                        "Cross-engine Xavier PD requires unquantized PyTorch LLM weights"
+                        if heterogeneous_pd
+                        else "SGLang Xavier requires unquantized PyTorch LLM weights"
+                    )
                 )
-            if host_handoff:
+            if host_handoff or heterogeneous_cache:
                 for cfg, engine in zip(replica_config or [], replica_engines):
                     replica_format = cfg.engine_config.get("model_format", model_format)
                     allowed_formats = ("mlx",) if engine == "mlx" else (None, "pytorch")
                     if replica_format not in allowed_formats:
                         raise ValueError(
-                            "NVIDIA/MLX PD requires PyTorch NVIDIA and MLX Metal weights"
+                            "Cross-engine sharing requires PyTorch CUDA and MLX Metal weights"
+                            if heterogeneous_cache
+                            else "NVIDIA/MLX PD requires PyTorch NVIDIA and MLX Metal weights"
                         )
         if sglang_xavier:
             kwargs["_xavier_cache_config"] = {
-                "address": self.control_address,
+                "address": (service_address or model_service_address(self)),
                 "uid": f"xavier-cache-{model_uid}",
             }
         if shared_cache_backend and (sglang_xavier or trt_xavier):
@@ -3466,6 +3663,7 @@ class SupervisorActor(SupervisorHandoffMixin, xo.StatelessActor):
             and model_engine is not None
             and model_engine.lower() == "vllm"
             and not heterogeneous_pd
+            and not heterogeneous_cache
         )
         from ..model.llm.xavier.transport import validate_gpu_cache_budget
 
@@ -3580,6 +3778,9 @@ class SupervisorActor(SupervisorHandoffMixin, xo.StatelessActor):
                 }
 
             if enable_xavier and rank == 0:
+                self._initial_model_launches[model_uid].workers[_replica_model_uid] = [
+                    worker_ref
+                ]
                 rank0_address, _port = await worker_ref.launch_rank0_model(
                     _replica_model_uid, xavier_config
                 )
@@ -3604,13 +3805,27 @@ class SupervisorActor(SupervisorHandoffMixin, xo.StatelessActor):
             replica_path = model_path
             replica_format = model_format
             replica_quantization = quantization
-            if pd_enabled:
+            if pd_enabled or heterogeneous_cache:
                 assert replica_config is not None
                 cfg = replica_config[rank - 1]
                 replica_engine = cfg.model_engine or model_engine
                 replica_kwargs.update(cfg.engine_config)
                 replica_path = replica_kwargs.pop("model_path", model_path)
                 replica_format = replica_kwargs.pop("model_format", model_format)
+            if heterogeneous_cache:
+                if (
+                    replica_engine or ""
+                ).lower() == "mlx" and "trt-llm" in replica_engines:
+                    replica_quantization = "bf16"
+                replica_kwargs["_xavier_cache_config"] = {
+                    "address": (service_address or model_service_address(self)),
+                    "uid": f"xavier-cache-{model_uid}",
+                    "shared_prefix": True,
+                    "logical_dtype": (
+                        "bfloat16" if "trt-llm" in replica_engines else "float16"
+                    ),
+                    "capacity_bytes": cache_bytes or 512 * 1024**2,
+                }
             if heterogeneous_pd:
                 if (
                     replica_engine or ""
@@ -3622,7 +3837,7 @@ class SupervisorActor(SupervisorHandoffMixin, xo.StatelessActor):
                 from ..model.llm.xavier.transport import get_transport_host
 
                 replica_kwargs["_xavier_cache_config"] = {
-                    "address": self.control_address,
+                    "address": (service_address or model_service_address(self)),
                     "uid": f"xavier-cache-{model_uid}",
                     "role": replica_config[rank - 1].role,
                     "rank": rank,
@@ -3662,6 +3877,28 @@ class SupervisorActor(SupervisorHandoffMixin, xo.StatelessActor):
                         worker_ref.address
                     )
             try:
+                if pd_history and cfg.role == "prefill":
+                    from ..model.llm.xavier.history import XavierHistoryProxy
+
+                    history = self._xavier_history_mapping[model_uid][0]
+                    proxy = await SupervisorActor._create_model_service_actor(
+                        self,
+                        XavierHistoryProxy,
+                        {"address": history.address, "uid": history.uid},
+                        cache_backend_config["cpu_bytes"],
+                        read_timeout=cache_backend_config["read_timeout"],
+                        address=worker_ref.address,
+                        uid=f"xavier-history-proxy-{model_uid}-{rank}",
+                    )
+                    self._xavier_history_mapping[model_uid].append(proxy)
+                    replica_kwargs["_xavier_cache_config"]["prefix_cache"] = {
+                        "address": proxy.address,
+                        "uid": f"xavier-history-proxy-{model_uid}-{rank}",
+                        "capacity_bytes": cache_backend_config["cpu_bytes"],
+                        "shared_prefix": True,
+                        "write_behind": True,
+                        "read_timeout": cache_backend_config["read_timeout"],
+                    }
                 if (
                     heterogeneous_pd
                     and (replica_engine or "").lower() == "mlx"
@@ -3670,7 +3907,8 @@ class SupervisorActor(SupervisorHandoffMixin, xo.StatelessActor):
                     from ..model.llm.xavier.backends.bytes.pd import XavierHostPDSource
 
                     source_uid = f"xavier-host-pd-{model_uid}-{rank}"
-                    source = await xo.create_actor(
+                    source = await SupervisorActor._create_model_service_actor(
+                        self,
                         XavierHostPDSource,
                         self._xavier_cache_mapping[model_uid],
                         rank,
@@ -3682,6 +3920,9 @@ class SupervisorActor(SupervisorHandoffMixin, xo.StatelessActor):
                     replica_kwargs["_xavier_cache_config"].update(
                         source_address=source.address, source_uid=source_uid
                     )
+                self._initial_model_launches[model_uid].workers[_replica_model_uid] = [
+                    worker_ref
+                ]
                 subpool_address = await worker_ref.launch_builtin_model(
                     model_uid=_replica_model_uid,
                     model_name=model_name,
@@ -3732,12 +3973,51 @@ class SupervisorActor(SupervisorHandoffMixin, xo.StatelessActor):
         async def _launch_model():
             nonlocal download_hub
             try:
+                if pd_history:
+                    from ..model.llm.xavier.backends.bytes.history import (
+                        XavierHistoryCacheActor,
+                    )
+
+                    history = await SupervisorActor._create_model_service_actor(
+                        self,
+                        XavierHistoryCacheActor,
+                        shared_cache_backend,
+                        # CUDA workers host LMCache on Linux, including when the
+                        # supervisor/P replica runs on a Mac. All-MLX groups
+                        # require a Linux model-service host for LMCache.
+                        address=next(
+                            (
+                                target[0].address
+                                for target, engine in zip(
+                                    resolved_targets or [], replica_engines
+                                )
+                                if engine != "mlx"
+                            ),
+                            service_address or model_service_address(self),
+                        ),
+                        uid=f"xavier-history-{model_uid}",
+                    )
+                    self._xavier_history_mapping[model_uid] = [history]
+                if heterogeneous_cache:
+                    from ..model.llm.xavier.backends.bytes.storage import (
+                        XavierBytesCacheActor,
+                    )
+
+                    cache_ref = await SupervisorActor._create_model_service_actor(
+                        self,
+                        XavierBytesCacheActor,
+                        capacity_bytes=cache_bytes or 512 * 1024**2,
+                        address=(service_address or model_service_address(self)),
+                        uid=f"xavier-cache-{model_uid}",
+                    )
+                    self._xavier_cache_mapping[model_uid] = cache_ref
                 if heterogeneous_pd:
                     from ..model.llm.sglang.xavier.directory import XavierPDDirectory
 
-                    cache_ref = await xo.create_actor(
+                    cache_ref = await SupervisorActor._create_model_service_actor(
+                        self,
                         XavierPDDirectory,
-                        address=self.control_address,
+                        address=(service_address or model_service_address(self)),
                         uid=f"xavier-cache-{model_uid}",
                     )
                     if not hasattr(self, "_xavier_cache_mapping"):
@@ -3749,10 +4029,11 @@ class SupervisorActor(SupervisorHandoffMixin, xo.StatelessActor):
                             XavierBytesCacheActor,
                         )
 
-                        cache_ref = await xo.create_actor(
+                        cache_ref = await SupervisorActor._create_model_service_actor(
+                            self,
                             XavierBytesCacheActor,
                             capacity_bytes=cache_bytes or 512 * 1024 * 1024,
-                            address=self.control_address,
+                            address=(service_address or model_service_address(self)),
                             uid=kwargs["_xavier_cache_config"]["uid"],
                         )
                     elif pd_enabled:
@@ -3760,9 +4041,10 @@ class SupervisorActor(SupervisorHandoffMixin, xo.StatelessActor):
                             XavierPDDirectory,
                         )
 
-                        cache_ref = await xo.create_actor(
+                        cache_ref = await SupervisorActor._create_model_service_actor(
+                            self,
                             XavierPDDirectory,
-                            address=self.control_address,
+                            address=(service_address or model_service_address(self)),
                             uid=kwargs["_xavier_cache_config"]["uid"],
                         )
                     else:
@@ -3770,7 +4052,8 @@ class SupervisorActor(SupervisorHandoffMixin, xo.StatelessActor):
                             XavierCacheActor,
                         )
 
-                        cache_ref = await xo.create_actor(
+                        cache_ref = await SupervisorActor._create_model_service_actor(
+                            self,
                             XavierCacheActor,
                             capacity_bytes=(
                                 cache_backend_config["cpu_bytes"]
@@ -3782,7 +4065,7 @@ class SupervisorActor(SupervisorHandoffMixin, xo.StatelessActor):
                                 if shared_cache_backend
                                 else {}
                             ),
-                            address=self.control_address,
+                            address=(service_address or model_service_address(self)),
                             uid=kwargs["_xavier_cache_config"]["uid"],
                         )
                     self._xavier_cache_mapping[model_uid] = cache_ref
@@ -3790,16 +4073,22 @@ class SupervisorActor(SupervisorHandoffMixin, xo.StatelessActor):
                     from ..model.llm.xavier.block_tracker import BlockTracker
                     from ..model.llm.xavier.collective_manager import CollectiveManager
 
-                    self._block_tracker_mapping[model_uid] = await xo.create_actor(
-                        BlockTracker,
-                        address=self.control_address,
-                        uid=f"{BlockTracker.default_uid()}-{model_uid}",
+                    self._block_tracker_mapping[model_uid] = (
+                        await SupervisorActor._create_model_service_actor(
+                            self,
+                            BlockTracker,
+                            address=(service_address or model_service_address(self)),
+                            uid=f"{BlockTracker.default_uid()}-{model_uid}",
+                        )
                     )
-                    self._collective_manager_mapping[model_uid] = await xo.create_actor(
-                        CollectiveManager,
-                        address=self.control_address,
-                        model_uid=model_uid,
-                        uid=f"{CollectiveManager.default_uid()}-{model_uid}",
+                    self._collective_manager_mapping[model_uid] = (
+                        await SupervisorActor._create_model_service_actor(
+                            self,
+                            CollectiveManager,
+                            address=(service_address or model_service_address(self)),
+                            model_uid=model_uid,
+                            uid=f"{CollectiveManager.default_uid()}-{model_uid}",
+                        )
                     )
                 strategy = None
                 use_gpu = not (n_gpu is None or (isinstance(n_gpu, int) and n_gpu <= 0))
@@ -4045,7 +4334,8 @@ class SupervisorActor(SupervisorHandoffMixin, xo.StatelessActor):
                 if pd_enabled:
                     from .pd_model import PDModelActor
 
-                    pd_ref = await xo.create_actor(
+                    pd_ref = await SupervisorActor._create_model_service_actor(
+                        self,
                         PDModelActor,
                         model_uid,
                         transport_backend=transport_backend,
@@ -4054,7 +4344,7 @@ class SupervisorActor(SupervisorHandoffMixin, xo.StatelessActor):
                         ),
                         handoff_mode="host" if host_handoff else "gpu",
                         mlx_prefill=mlx_prefill,
-                        address=self.control_address,
+                        address=(service_address or model_service_address(self)),
                         uid=f"{model_uid}-{PDModelActor.default_uid()}",
                     )
                     # Track the actor before registration so rollback can destroy it.
@@ -4073,7 +4363,12 @@ class SupervisorActor(SupervisorHandoffMixin, xo.StatelessActor):
                     self._pd_roles[model_uid] = {
                         idx: cfg.role for idx, cfg in enumerate(replica_config)
                     }
+                await SupervisorActor._notify_model_services_changed(self, model_uid)
             except (Exception, asyncio.CancelledError):
+                if self._initial_model_launches[model_uid].cancelling:
+                    # The cancellation coordinator owns rollback until every
+                    # launch RPC has settled and every initial replica is gone.
+                    raise
                 # terminate_model will remove the replica info.
                 await self.terminate_model(model_uid, suppress_exception=True)
                 await self._status_guard_ref.update_instance_info(
@@ -4081,22 +4376,33 @@ class SupervisorActor(SupervisorHandoffMixin, xo.StatelessActor):
                 )
                 raise
 
-        if not is_valid_model_uid(model_uid):
-            raise ValueError(
-                "The model UID is invalid. Please specify the model UID by "
-                "0 < length <= 100, not ending with the reserved replica "
-                "suffix '-rep<number>'."
-            )
-
         if request_limits is not None and request_limits < 0:
             raise ValueError(
                 "The `request_limits` parameter must be greater or equal than 0."
             )
 
-        if model_uid in self._model_uid_to_replica_info:
+        if (
+            model_uid in self._model_uid_to_replica_info
+            or model_uid in self._initial_model_launches
+        ):
             raise ValueError(f"Model is already in the model list, uid: {model_uid}")
         # Set replica info first for exception handler to terminate model.
-        self._model_uid_to_replica_info[model_uid] = self._build_replica_info(replica)
+        replica_info = self._build_replica_info(replica)
+        self._model_uid_to_replica_info[model_uid] = replica_info
+        try:
+            service_address = await SupervisorActor._resolve_model_service_address(
+                self, model_uid
+            )
+        except BaseException:
+            if self._model_uid_to_replica_info.get(model_uid) is replica_info:
+                self._model_uid_to_replica_info.pop(model_uid)
+            raise
+        if self._model_uid_to_replica_info.get(model_uid) is not replica_info:
+            raise ValueError(f"Model launch reservation was removed, uid: {model_uid}")
+        if "_xavier_cache_config" in kwargs:
+            kwargs["_xavier_cache_config"]["address"] = (
+                service_address or model_service_address(self)
+            )
         if pd_enabled:
             self._pd_model_mapping[model_uid] = None
         # Redeploy clears any stale unexpected-termination markers for this uid.
@@ -4111,22 +4417,7 @@ class SupervisorActor(SupervisorHandoffMixin, xo.StatelessActor):
             instance_created_ts=int(time.time()),
         )
         await self._status_guard_ref.set_instance_info(model_uid, instance_info)
-        if wait_ready:
-            await _launch_model()
-            self._invalidate_list_models_debounce_cache()
-        else:
-            task = asyncio.create_task(_launch_model())
-            self._async_launch_tasks.add(task)
-            task.add_done_callback(
-                functools.partial(
-                    callback_for_async_launch, self._async_launch_tasks, model_uid
-                )
-            )
-            # Invalidate the debounce cache once the background launch
-            # completes so the newly-ready model appears immediately.
-            task.add_done_callback(
-                lambda _: self._invalidate_list_models_debounce_cache()
-            )
+        await self._run_initial_model_launch(model_uid, _launch_model(), wait_ready)
         return model_uid
 
     @functools.wraps(_launch_builtin_model)
@@ -4257,6 +4548,9 @@ class SupervisorActor(SupervisorHandoffMixin, xo.StatelessActor):
                 model_type = model_type or "LLM"
 
                 for _, rep_model_uid, replica_gpu_idx, worker_refs in shard_placements:
+                    self._initial_model_launches[model_uid].workers[
+                        rep_model_uid
+                    ] = worker_refs
                     driver_info = None
                     for i_worker, worker_ref in enumerate(worker_refs):
                         if i_worker > 1:
@@ -4301,6 +4595,8 @@ class SupervisorActor(SupervisorHandoffMixin, xo.StatelessActor):
                     for worker_ref in worker_refs:
                         await worker_ref.wait_for_load(rep_model_uid)
             except (Exception, asyncio.CancelledError):
+                if self._initial_model_launches[model_uid].cancelling:
+                    raise
                 self._replica_model_uid_to_worker.update(pending_shards)
                 # terminate_model will remove the replica info.
                 await self.terminate_model(model_uid, suppress_exception=True)
@@ -4324,7 +4620,10 @@ class SupervisorActor(SupervisorHandoffMixin, xo.StatelessActor):
                 "The `request_limits` parameter must be greater or equal than 0."
             )
 
-        if model_uid in self._model_uid_to_replica_info:
+        if (
+            model_uid in self._model_uid_to_replica_info
+            or model_uid in self._initial_model_launches
+        ):
             raise ValueError(f"Model is already in the model list, uid: {model_uid}")
 
         # Set replica info first for exception handler to terminate model.
@@ -4342,20 +4641,7 @@ class SupervisorActor(SupervisorHandoffMixin, xo.StatelessActor):
             instance_created_ts=int(time.time()),
         )
         await self._status_guard_ref.set_instance_info(model_uid, instance_info)
-        if wait_ready:
-            await _launch_model()
-            self._invalidate_list_models_debounce_cache()
-        else:
-            task = asyncio.create_task(_launch_model())
-            self._async_launch_tasks.add(task)
-            task.add_done_callback(
-                functools.partial(
-                    callback_for_async_launch, self._async_launch_tasks, model_uid
-                )
-            )
-            task.add_done_callback(
-                lambda _: self._invalidate_list_models_debounce_cache()
-            )
+        await self._run_initial_model_launch(model_uid, _launch_model(), wait_ready)
         return model_uid
 
     async def get_launch_builtin_model_progress(self, model_uid: str) -> float:
@@ -4830,26 +5116,74 @@ class SupervisorActor(SupervisorHandoffMixin, xo.StatelessActor):
         )
 
     async def cancel_launch_builtin_model(self, model_uid: str):
-        try:
-            info = self._model_uid_to_replica_info[model_uid]
-        except KeyError:
-            raise RuntimeError(f"Model {model_uid} has not been launched yet")
+        operation = self._initial_model_launches.get(model_uid)
+        if operation is None:
+            raise ValueError(f"No initial launch in progress for model {model_uid}")
+        async with self._get_model_replica_lock(model_uid):
+            if self._initial_model_launches.get(model_uid) is not operation or (
+                operation.task.done() and not operation.cancelling
+            ):
+                raise ValueError(f"No initial launch in progress for model {model_uid}")
 
-        coros = []
-        for replica_id in info.active_replica_ids:
-            rep_model_uid = build_replica_model_uid(model_uid, replica_id)
-            worker_refs = self._model_uid_to_replica_info[
-                model_uid
-            ].replica_to_worker_refs[replica_id]
-            for worker_ref in worker_refs:
-                coros.append(worker_ref.cancel_launch_model(rep_model_uid))
-        try:
-            await asyncio.gather(*coros)
-        except RuntimeError:
-            # some may have finished
-            pass
-        # remove replica info
-        self._model_uid_to_replica_info.pop(model_uid, None)
+            async def stop(
+                replica_uid: str, worker: xo.ActorRefType["WorkerActor"]
+            ) -> None:
+                try:
+                    await worker.cancel_launch_model(replica_uid)
+                except RuntimeError:
+                    # Ready replicas and asynchronously loading engines no
+                    # longer have a worker launch guard; terminate them too.
+                    pass
+                await worker.terminate_model(model_uid=replica_uid)
+
+            if not operation.cancelling:
+                operation.cancelling = True
+                # Stop dispatch before asking workers to abort. Worker RPC
+                # cancellation may wait for native loads, so explicitly stop
+                # their pools in parallel to unblock those RPCs.
+                operation.task.cancel()
+            try:
+                await asyncio.gather(
+                    *(
+                        stop(uid, worker)
+                        for uid, workers in operation.workers.items()
+                        for worker in workers
+                    ),
+                    return_exceptions=True,
+                )
+                _, pending = await asyncio.wait(
+                    [operation.task], timeout=XINFERENCE_CANCEL_LAUNCH_TIMEOUT
+                )
+                if pending:
+                    raise RuntimeError(f"Initial launch is still stopping: {model_uid}")
+                await asyncio.gather(operation.task, return_exceptions=True)
+                # A launch RPC can publish its model while cancellation is
+                # being acknowledged. Sweep again after dispatch has drained.
+                results = await asyncio.gather(
+                    *(
+                        worker.terminate_model(model_uid=uid)
+                        for uid, workers in operation.workers.items()
+                        for worker in workers
+                    ),
+                    return_exceptions=True,
+                )
+                for result in results:
+                    if isinstance(result, BaseException):
+                        raise result
+                replica_uids = [
+                    uid for uid in operation.workers if not uid.endswith("-rank0")
+                ]
+                # Rank 0 was stopped above, so distributed actor cleanup must
+                # not try its worker again.
+                self._replica_model_uid_to_worker.pop(model_uid + "-rank0", None)
+                await self._clear_model_routing(model_uid, replica_uids)
+            finally:
+                # Preserve the existing cancelled-launch ERROR record. Keep
+                # ownership on failure so a retry cannot target a new model.
+                await self._status_guard_ref.update_instance_info(
+                    model_uid, {"status": LaunchStatus.ERROR.name}
+                )
+            self._initial_model_launches.pop(model_uid, None)
 
     async def get_instance_info(
         self, model_name: Optional[str], model_uid: Optional[str]
@@ -4857,7 +5191,19 @@ class SupervisorActor(SupervisorHandoffMixin, xo.StatelessActor):
         infos = await self._status_guard_ref.get_instance_info(
             model_name=model_name, model_uid=model_uid
         )
-        return [info.dict() for info in sorted(infos, key=lambda info: info.model_uid)]
+        result = []
+        for info in sorted(infos, key=lambda info: info.model_uid):
+            operation = self._initial_model_launches.get(info.model_uid)
+            result.append(
+                {
+                    **info.dict(),
+                    "can_cancel_launch": bool(
+                        operation
+                        and (operation.cancelling or not operation.task.done())
+                    ),
+                }
+            )
+        return result
 
     async def _get_replica_runtime_info(
         self, replica_model_uids: Set[str]
@@ -5224,10 +5570,37 @@ class SupervisorActor(SupervisorHandoffMixin, xo.StatelessActor):
     async def get_instance_count(self, model_name: str) -> int:
         return await self._status_guard_ref.get_instance_count(model_name)
 
+    async def _control_available(self):
+        control = getattr(self, "_controller_control", None)
+        if control is None:
+            return True
+
+        async def check():
+            from .control_session import ControlSessionRejected
+
+            try:
+                await control.check()
+                return True
+            except ControlSessionRejected:
+                return False
+
+        loop = self._actor_loop
+        if asyncio.get_running_loop() is loop:
+            return await check()
+        future = asyncio.run_coroutine_threadsafe(check(), loop)
+        try:
+            return await asyncio.wrap_future(future)
+        except asyncio.CancelledError:
+            future.cancel()
+            raise
+
     async def _check_dead_nodes(self):
         state = getattr(self, "_upgrade_state", None)
         maintenance = state.maintenance if state is not None else None
         while True:
+            if not await SupervisorActor._control_available(self):
+                await asyncio.sleep(XINFERENCE_HEALTH_CHECK_INTERVAL)
+                continue
             if maintenance is not None and not maintenance.begin():
                 await asyncio.sleep(0.1)
                 continue
@@ -5387,6 +5760,9 @@ class SupervisorActor(SupervisorHandoffMixin, xo.StatelessActor):
         state = getattr(self, "_upgrade_state", None)
         maintenance = state.maintenance if state is not None else None
         while True:
+            if not await SupervisorActor._control_available(self):
+                await asyncio.sleep(XINFERENCE_HEALTH_CHECK_INTERVAL)
+                continue
             if maintenance is not None and not maintenance.begin():
                 await asyncio.sleep(0.1)
                 continue
@@ -5410,162 +5786,14 @@ class SupervisorActor(SupervisorHandoffMixin, xo.StatelessActor):
                     maintenance.end()
             await asyncio.sleep(XINFERENCE_TOKEN_ROUTER_AGENT_MONITOR_SECONDS)
 
-    def _get_reload_target(self, model_uid: str):
-        if model_uid not in self._model_uid_to_replica_info:
-            raise ValueError(f"Model not found: {model_uid}")
-        replicas = list(self._iter_active_replica_model_uids(model_uid))
-        if len(replicas) != 1:
-            raise ValueError("Parameter reload currently requires one replica")
-        replica_uid = replicas[0]
-        workers = self._replica_model_uid_to_worker.get(replica_uid)
-        if not isinstance(workers, (list, tuple)):
-            workers = [workers]
-        if len(workers) != 1 or workers[0] is None:
-            raise ValueError("Parameter reload currently requires one worker")
-        return replica_uid, workers[0]
-
-    async def get_model_reload_config(self, model_uid: str) -> Dict[str, Any]:
-        replica_uid, worker = self._get_reload_target(model_uid)
-        return await worker.get_model_reload_config(replica_uid)
-
-    async def get_model_reload_status(self, model_uid: str) -> Dict[str, Any]:
-        replica_uid, worker = self._get_reload_target(model_uid)
-        status = dict(self._model_reload_status.get(model_uid, {"status": "idle"}))
-        try:
-            observed = await worker.get_model_reload_status(replica_uid)
-        except Exception:
-            if status["status"] == "reloading":
-                raise
-        else:
-            if observed and (
-                status["status"] == "idle"
-                or observed.get("operation_id") in (None, status.get("operation_id"))
-            ):
-                status.update(observed)
-        return status
-
-    async def restore_model_reload_config(
-        self, replica_uid: str, config: Dict[str, Any], observed: Dict[str, Any]
-    ) -> None:
-        model_uid, _ = parse_replica_model_uid(replica_uid)
-        status = self._model_reload_status.get(model_uid, {})
-        if status.get("operation_id") not in (None, observed.get("operation_id")):
-            return
-        async with self._autostart_store_lock:
-            if self._model_reload_status.get(model_uid, {}).get("operation_id") not in (
-                None,
-                observed.get("operation_id"),
-            ):
-                return
-            await asyncio.to_thread(
-                self._launch_history_store.update_autostart_launch_config,
-                model_uid,
-                config,
-            )
-            status.update(observed)
-
-    async def reload_model(
-        self,
-        model_uid: str,
-        config: Dict[str, Any],
-        drain_timeout: float = 300,
-        python_executable: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        import uuid
-
-        if model_uid in self._model_reload_tasks:
-            raise RuntimeError("This model already has a reload in progress")
-        async with self._get_model_replica_lock(model_uid):
-            if model_uid in self._model_reload_tasks:
-                raise RuntimeError("This model already has a reload in progress")
-            replica_uid, worker = self._get_reload_target(model_uid)
-            # Preflight runs before scheduling any operation that stops serving.
-            normalized = (
-                await worker.validate_model_reload(replica_uid, config)
-                if config
-                else {}
-            )
-            if normalized is not None:
-                config = normalized
-            status = {
-                "operation_id": str(uuid.uuid4()),
-                "model_uid": model_uid,
-                "status": "reloading",
-                "stage": "queued",
-                "started_at": time.time(),
-                "weights_reused": False,
-            }
-            self._model_reload_status[model_uid] = status
-
-            async def run() -> None:
-                try:
-                    if self._get_reload_target(model_uid) != (replica_uid, worker):
-                        raise ValueError("Model placement changed before reload")
-                    from ..model.llm.weight_cache import HOT_RELOAD_FIELDS
-
-                    status["stage"] = (
-                        "draining"
-                        if python_executable is None
-                        and set(config) <= HOT_RELOAD_FIELDS.keys()
-                        else "loading"
-                    )
-                    status["weights_reused"] = (
-                        await worker.reload_model(
-                            replica_uid,
-                            config,
-                            drain_timeout,
-                            python_executable=python_executable,
-                            operation_id=status["operation_id"],
-                        )
-                    ) is True
-                    async with self._autostart_store_lock:
-                        if not status.get("restored"):
-                            await asyncio.to_thread(
-                                self._launch_history_store.update_autostart_launch_config,
-                                model_uid,
-                                {
-                                    **config,
-                                    **(
-                                        {"model_python_executable": python_executable}
-                                        if python_executable is not None
-                                        else {}
-                                    ),
-                                },
-                            )
-                except asyncio.CancelledError:
-                    status.update(status="cancelled", stage="cancelled")
-                    raise
-                except Exception as exc:
-                    status.update(status="error", stage="error", error=str(exc))
-                    try:
-                        observed = await worker.get_model_reload_status(replica_uid)
-                        if observed.get("operation_id") in (
-                            None,
-                            status["operation_id"],
-                        ):
-                            if "restored" in observed:
-                                status["restored"] = observed["restored"]
-                    except Exception:
-                        pass
-                    logger.exception("Reload of %s failed", model_uid)
-                else:
-                    if not status.get("restored"):
-                        status.update(status="ready", stage="ready")
-                finally:
-                    status["finished_at"] = time.time()
-                    if (
-                        self._model_reload_tasks.get(model_uid)
-                        is asyncio.current_task()
-                    ):
-                        self._model_reload_tasks.pop(model_uid, None)
-                    self._invalidate_list_models_debounce_cache()
-
-            self._model_reload_tasks[model_uid] = asyncio.create_task(run())
-            return dict(status)
-
     @log_async(logger=logger)
     async def terminate_model(self, model_uid: str, suppress_exception=False):
         async with self._get_model_replica_lock(model_uid):
+            operation = self._initial_model_launches.get(model_uid)
+            if operation is not None and operation.task is not asyncio.current_task():
+                raise ValueError(
+                    "Initial launch is in progress; cancel the launch instead"
+                )
             task = self._model_reload_tasks.pop(model_uid, None)
             if task is not None:
                 # Do not await an actor RPC cancellation: a hung engine cannot
@@ -5593,6 +5821,11 @@ class SupervisorActor(SupervisorHandoffMixin, xo.StatelessActor):
         if replica_info is None:
             if suppress_exception:
                 return
+            # Launch rollback removes routing but retains the failure details.
+            # Check and remove in one actor call so a new CREATING instance
+            # reusing the UID cannot be removed by a stale failure lookup.
+            if await self._status_guard_ref.remove_failed_instance_info(model_uid):
+                return
             raise ValueError(f"Model not found in the model list, uid: {model_uid}")
 
         rep_model_uids = list(self._iter_active_replica_model_uids(model_uid))
@@ -5603,10 +5836,17 @@ class SupervisorActor(SupervisorHandoffMixin, xo.StatelessActor):
         errors = [r for r in results if isinstance(r, Exception)]
         if errors and not suppress_exception:
             raise errors[0]
+        await self._clear_model_routing(model_uid, rep_model_uids)
+
+    async def _clear_model_routing(
+        self, model_uid: str, rep_model_uids: List[str]
+    ) -> None:
         self._model_uid_to_replica_info.pop(model_uid, None)
         self._model_reload_status.pop(model_uid, None)
         self._clear_unexpected_down_replicas(model_uid)
         for replica_model_uid in rep_model_uids:
+            self._replica_model_uid_to_worker.pop(replica_model_uid, None)
+            self._replica_model_uid_to_worker_shards.pop(replica_model_uid, None)
             self._clear_replica_model_gpu_memory(replica_model_uid)
         self._invalidate_list_models_debounce_cache()
 
@@ -5797,7 +6037,10 @@ class SupervisorActor(SupervisorHandoffMixin, xo.StatelessActor):
         Returns a dict with ``replica_id``, ``replica_model_uid``, and
         ``worker_address`` for the caller.
         """
+        self._check_model_reload_idle(model_uid)
         # ---- 1. Look up the model ------------------------------------------------
+        if model_uid in self._initial_model_launches:
+            raise ValueError("Initial launch must finish before adding replicas")
         if model_uid in self._pd_model_mapping:
             raise ValueError(
                 "PD topology cannot be resized in place; terminate and relaunch the model"
@@ -5841,12 +6084,6 @@ class SupervisorActor(SupervisorHandoffMixin, xo.StatelessActor):
             )
 
         # ---- 5. Check scale-up eligibility ---------------------------------------
-        from ..model.llm.weight_cache import parse_weight_cache_option
-
-        if parse_weight_cache_option(launch_args.get("enable_weight_cache", False)):
-            raise ValueError(
-                "Adding replicas to weight-cached models is not supported."
-            )
         if launch_args.get("xavier_config"):
             raise ValueError(
                 "Adding replicas to Xavier-distributed models is not supported."
@@ -5918,6 +6155,14 @@ class SupervisorActor(SupervisorHandoffMixin, xo.StatelessActor):
         modified_args["n_gpu"] = target_n_gpu
         if model_engine is not None:
             modified_args["model_engine"] = model_engine
+        if (modified_args.get("model_type") or "LLM").lower() == "llm" and (
+            modified_args.get("model_engine") or ""
+        ).lower() in ("vllm", "sglang"):
+            # Retention is local to a replica. Preserve an explicit choice;
+            # otherwise the destination resolves Auto in its own environment.
+            modified_args.setdefault("enable_weight_cache", None)
+        else:
+            modified_args.pop("enable_weight_cache", None)
         # Always overwrite gpu_idx so a placement config without explicit GPUs
         # does not inherit an old replica's pinned indexes.
         modified_args["gpu_idx"] = target_gpu_idx
@@ -6053,6 +6298,7 @@ class SupervisorActor(SupervisorHandoffMixin, xo.StatelessActor):
     async def _terminate_model_replica(
         self, model_uid: str, replica_id: int, suppress_exception: bool = False
     ) -> int:
+        self._check_model_reload_idle(model_uid)
         if model_uid in self._pd_model_mapping:
             raise ValueError(
                 "PD topology cannot be resized in place; terminate and relaunch the model"
@@ -6147,6 +6393,55 @@ class SupervisorActor(SupervisorHandoffMixin, xo.StatelessActor):
 
         return 0
 
+    async def _create_model_service_actor(
+        self, actor_class, *args, address, uid, **kwargs
+    ):
+        control = getattr(self, "_controller_control", None)
+        if control is not None and callable(
+            getattr(control.authority, "create_model_service", None)
+        ):
+            return await control.invoke(
+                "create_model_service",
+                actor_class,
+                args,
+                kwargs,
+                address,
+                uid,
+                timeout=None,
+                preserve_errors=True,
+            )
+        return await xo.create_actor(
+            actor_class, *args, **kwargs, address=address, uid=uid
+        )
+
+    async def _destroy_model_service_actor(self, ref):
+        control = getattr(self, "_controller_control", None)
+        if control is not None and callable(
+            getattr(control.authority, "destroy_model_service", None)
+        ):
+            return await control.invoke(
+                "destroy_model_service", ref, timeout=None, preserve_errors=True
+            )
+        return await xo.destroy_actor(ref)
+
+    async def _resolve_model_service_address(self, model_uid):
+        control = getattr(self, "_controller_control", None)
+        if control is None or not callable(
+            getattr(control.authority, "model_service_address", None)
+        ):
+            return None
+        address = await control.invoke("model_service_address", model_uid)
+        if not isinstance(address, str) or not address:
+            raise ValueError("Expected a model service actor address")
+        return address
+
+    async def _notify_model_services_changed(self, model_uid):
+        control = getattr(self, "_controller_control", None)
+        if control is not None and callable(
+            getattr(control.authority, "model_services_changed", None)
+        ):
+            await control.invoke("model_services_changed", model_uid)
+
     async def _cleanup_distributed_actors(
         self, model_uid: str, terminate_rank0_on_worker: bool = True
     ) -> None:
@@ -6180,21 +6475,33 @@ class SupervisorActor(SupervisorHandoffMixin, xo.StatelessActor):
         self._pd_roles.pop(model_uid, None)
         if pd_ref is not None:
             try:
-                await xo.destroy_actor(pd_ref)
+                await SupervisorActor._destroy_model_service_actor(self, pd_ref)
             except Exception:
                 logger.debug(
                     "Failed to destroy PD router for %s", model_uid, exc_info=True
                 )
         for source in self._xavier_source_mapping.pop(model_uid, []):
             try:
-                await xo.wait_for(xo.destroy_actor(source), timeout=5)
+                await xo.wait_for(
+                    SupervisorActor._destroy_model_service_actor(self, source),
+                    timeout=5,
+                )
             except Exception:
                 logger.warning(
                     "Destroy Xavier host source failed for %s", model_uid, exc_info=True
                 )
+        # Proxies own immutable CPU copies only. Drain them before closing the
+        # optional L2 store; live PD sources have their own completion protocol.
+        for history in reversed(self._xavier_history_mapping.pop(model_uid, [])):
+            try:
+                await SupervisorActor._destroy_model_service_actor(self, history)
+            except Exception:
+                logger.warning(
+                    "Destroy Xavier history failed for %s", model_uid, exc_info=True
+                )
         if cache_ref is not None:
             try:
-                await xo.destroy_actor(cache_ref)
+                await SupervisorActor._destroy_model_service_actor(self, cache_ref)
             except Exception:
                 logger.warning(
                     "Destroy Xavier cache failed for %s", model_uid, exc_info=True
@@ -6221,7 +6528,9 @@ class SupervisorActor(SupervisorHandoffMixin, xo.StatelessActor):
         collective_manager_ref = self._collective_manager_mapping.pop(model_uid, None)
         if collective_manager_ref is not None:
             try:
-                await xo.destroy_actor(collective_manager_ref)
+                await SupervisorActor._destroy_model_service_actor(
+                    self, collective_manager_ref
+                )
             except Exception as e:
                 logger.debug(
                     "Destroy collective_manager_ref failed, model uid: %s, error: %s",
@@ -6232,13 +6541,24 @@ class SupervisorActor(SupervisorHandoffMixin, xo.StatelessActor):
         block_tracker_ref = self._block_tracker_mapping.pop(model_uid, None)
         if block_tracker_ref is not None:
             try:
-                await xo.destroy_actor(block_tracker_ref)
+                await SupervisorActor._destroy_model_service_actor(
+                    self, block_tracker_ref
+                )
             except Exception as e:
                 logger.debug(
                     "Destroy block_tracker_ref failed, model uid: %s, error: %s",
                     model_uid,
                     e,
                 )
+
+        try:
+            await SupervisorActor._notify_model_services_changed(self, model_uid)
+        except Exception:
+            logger.warning(
+                "Failed to report model service cleanup for %s",
+                model_uid,
+                exc_info=True,
+            )
 
     async def mark_replica_dead(self, replica_model_uid: str) -> None:
         """Called back by worker after its local recover_sub_pool exhausts
@@ -6402,8 +6722,17 @@ class SupervisorActor(SupervisorHandoffMixin, xo.StatelessActor):
         return await worker_ref.get_model_status(replica_model_uid)
 
     @log_async(logger=logger)
-    async def describe_model(self, model_uid: str) -> Dict[str, Any]:
+    async def describe_model(
+        self, model_uid: str, for_recovery: bool = False
+    ) -> Dict[str, Any]:
         replica_info = self._model_uid_to_replica_info.get(model_uid, None)
+        if for_recovery and (
+            replica_info is None or not replica_info.active_replica_ids
+        ):
+            for (known_uid, _), model_name in self._unexpected_down_replicas.items():
+                if known_uid == model_uid:
+                    return {"model_name": model_name}
+
         if replica_info is None:
             raise ValueError(f"Model not found in the model list, uid: {model_uid}")
         if not replica_info.active_replica_ids:
@@ -6798,27 +7127,34 @@ class SupervisorActor(SupervisorHandoffMixin, xo.StatelessActor):
         return res
 
     async def __pre_destroy__(self) -> None:
-        isolation = getattr(self, "_isolation", None)
-        if isolation is not None:
-            self._isolation = None
-            await asyncio.to_thread(isolation.stop)
-            isolation.loop.close()
-        manager = getattr(self, "_worker_relaunch_manager", None)
-        if manager is not None:
-            await manager.close()
-        # Finish retained-weight operations before tearing down actor state.
-        if self._model_reload_tasks:
-            await asyncio.gather(
-                *list(self._model_reload_tasks.values()), return_exceptions=True
-            )
-        tasks = list(self._worker_metadata_refresh_tasks.values())
-        self._worker_metadata_refresh_tasks.clear()
-        self._worker_metadata_generation.clear()
-        for task in tasks:
-            if not task.done():
-                task.cancel()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+        control = getattr(self, "_controller_control", None)
+        if control is not None:
+            control.fence.ready = False
+        try:
+            isolation = getattr(self, "_isolation", None)
+            if isolation is not None:
+                self._isolation = None
+                await asyncio.to_thread(isolation.stop)
+                isolation.loop.close()
+            manager = getattr(self, "_worker_relaunch_manager", None)
+            if manager is not None:
+                await manager.close()
+            # Finish retained-weight operations before tearing down actor state.
+            if self._model_reload_tasks:
+                await asyncio.gather(
+                    *list(self._model_reload_tasks.values()), return_exceptions=True
+                )
+            tasks = list(self._worker_metadata_refresh_tasks.values())
+            self._worker_metadata_refresh_tasks.clear()
+            self._worker_metadata_generation.clear()
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+        finally:
+            if control is not None:
+                await control.invoke("close")
 
     def _discard_worker_metadata(self, worker_address: str) -> None:
         self._worker_metadata.pop(worker_address, None)
@@ -6966,7 +7302,23 @@ class SupervisorActor(SupervisorHandoffMixin, xo.StatelessActor):
         worker_address: str,
         replica_states: Optional[List[Dict[str, Any]]] = None,
         replica_model_uids: Optional[List[str]] = None,
+        _xinference_control_context=None,
     ):
+        if _xinference_control_context is not None:
+            from .control_session import ControlContext, ControlSessionRejected
+
+            try:
+                command = ControlContext.from_dict(_xinference_control_context)
+            except (TypeError, ValueError):
+                raise ControlSessionRejected("invalid_context") from None
+            control = getattr(self, "_controller_control", None)
+            if control is None or command.session != control.session:
+                raise ControlSessionRejected("stale_session")
+            async with control.fence.command(command):
+                # worker_message already holds the per-Worker registration lock.
+                return await inspect.unwrap(SupervisorActor.add_worker)(
+                    self, worker_address, replica_states, replica_model_uids
+                )
         from .worker import WorkerActor
 
         worker_ref = await xo.actor_ref(
@@ -6991,6 +7343,15 @@ class SupervisorActor(SupervisorHandoffMixin, xo.StatelessActor):
                 resources = None
             if set((resources or {}).get("extensions", {})) != expected:
                 raise RuntimeError("Worker and supervisor extensions must match")
+            control = getattr(self, "_controller_control", None)
+            if control is not None:
+                worker_ref = await control.register(worker_ref)
+            replica_states = self._normalize_replica_states(
+                replica_states=replica_states, replica_model_uids=replica_model_uids
+            )
+            replica_states = await SupervisorActor._filter_worker_inventory(
+                self, worker_ref, replica_states
+            )
         except Exception:
             # Rejected re-registration must not retain the old process's
             # registration or extension inventory at this address.
@@ -7038,10 +7399,53 @@ class SupervisorActor(SupervisorHandoffMixin, xo.StatelessActor):
                 exc_info=True,
             )
 
-        normalized = self._normalize_replica_states(
-            replica_states=replica_states,
-            replica_model_uids=replica_model_uids,
+        await SupervisorActor._restore_worker_inventory(
+            self, worker_ref, replica_states=replica_states, apply_filter=False
         )
+        logger.debug("Worker %s has been added successfully", worker_address)
+        if metadata_retry_required and self._is_current_worker_metadata_generation(
+            worker_address, worker_ref, metadata_generation
+        ):
+            self._schedule_worker_metadata_retry(
+                worker_address, worker_ref, metadata_generation
+            )
+        self._schedule_autostart()
+
+    async def _filter_worker_inventory(self, worker_ref, normalized):
+        control = getattr(self, "_controller_control", None)
+        provider = (
+            getattr(control.authority, "filter_worker_inventory", None)
+            if control
+            else None
+        )
+        if provider is not None:
+            filtered = await control.invoke(
+                "filter_worker_inventory", worker_ref, normalized
+            )
+            if not isinstance(filtered, list) or any(
+                row not in normalized for row in filtered
+            ):
+                raise ValueError("Inventory provider may only narrow observations")
+            normalized = filtered
+        return normalized
+
+    async def _restore_worker_inventory(
+        self,
+        worker_ref,
+        replica_states=None,
+        replica_model_uids=None,
+        *,
+        apply_filter=True,
+    ):
+        """Apply one reported Worker snapshot through normal registration cleanup."""
+        worker_address = worker_ref.address
+        normalized = self._normalize_replica_states(
+            replica_states=replica_states, replica_model_uids=replica_model_uids
+        )
+        if apply_filter:
+            normalized = await SupervisorActor._filter_worker_inventory(
+                self, worker_ref, normalized
+            )
 
         # Re-registration reconciliation: a worker restarting and reusing the
         # same address never trips dead-node detection (its fresh heartbeat
@@ -7067,14 +7471,6 @@ class SupervisorActor(SupervisorHandoffMixin, xo.StatelessActor):
         self._rebuild_worker_replica_state(worker_ref, normalized)
         await self._rebuild_worker_status_guard_state(worker_address, normalized)
         await self._reconcile_affected_model_statuses(base_uids_affected)
-        logger.debug("Worker %s has been added successfully", worker_address)
-        if metadata_retry_required and self._is_current_worker_metadata_generation(
-            worker_address, worker_ref, metadata_generation
-        ):
-            self._schedule_worker_metadata_retry(
-                worker_address, worker_ref, metadata_generation
-            )
-        self._schedule_autostart()
 
     def get_worker_resource_policy(self, worker_address: str) -> List[int]:
         from ..extensions import filter_worker_resources

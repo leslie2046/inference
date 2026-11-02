@@ -21,6 +21,8 @@ import sys
 import threading
 import time
 import uuid
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as package_version
 from typing import (
     Any,
     AsyncGenerator,
@@ -33,6 +35,7 @@ from typing import (
     cast,
 )
 
+from packaging.version import InvalidVersion, Version
 from xoscar.utils import get_next_port
 
 from ....cache_isolation import redact_cache_salt, validate_cache_salt
@@ -76,6 +79,9 @@ logger = logging.getLogger(__name__)
 
 
 class SGLANGModelConfig(TypedDict, total=False):
+    page_size: int
+    mamba_scheduler_strategy: str
+    mamba_track_interval: int
     tokenizer_mode: str
     trust_remote_code: bool
     tp_size: int
@@ -180,6 +186,7 @@ SGLANG_SUPPORTED_CHAT_MODELS = [
     "BailingMoeV3ForCausalLM",
 ]
 SGLANG_SUPPORTED_VISION_MODEL_LIST = [
+    "Qwen4ExpForConditionalGeneration",
     "Qwen2_5_VLForConditionalGeneration",
     "Qwen3VLForConditionalGeneration",
     "Qwen3VLMoeForConditionalGeneration",
@@ -193,6 +200,14 @@ SGLANG_SUPPORTED_VISION_MODEL_LIST = [
 ]
 
 LING3_FLASH_SGLANG_LAUNCH_TIMEOUT = 900.0
+
+
+def _get_sglang_version() -> Optional[Version]:
+    try:
+        runtime = getattr(sys.modules.get("sglang"), "__version__", None)
+        return Version(runtime or package_version("sglang"))
+    except (PackageNotFoundError, InvalidVersion):
+        return None
 
 
 class SGLANGModel(WeightCachedModel, LLM, ChatModelMixin):
@@ -513,6 +528,12 @@ class SGLANGModel(WeightCachedModel, LLM, ChatModelMixin):
 
         cuda_count = self._get_cuda_count()
         model_config.setdefault("tokenizer_mode", "auto")
+        if self.model_family.has_architecture("Qwen4ExpForConditionalGeneration"):
+            # QSA compressed addressing requires 64-token pages with the GDN
+            # cache strategy used by SGLang's Flash-Next deployment recipe.
+            model_config.setdefault("page_size", 64)
+            model_config.setdefault("mamba_scheduler_strategy", "extra_buffer")
+            model_config.setdefault("mamba_track_interval", 64)
         # Respect the XINFERENCE_TRUST_REMOTE_CODE setting.
         model_config["trust_remote_code"] = (
             bool(model_config.get("trust_remote_code", XINFERENCE_TRUST_REMOTE_CODE))
@@ -1596,17 +1617,13 @@ class SGLANGChatModel(SGLANGModel):
     ) -> Union[bool, Tuple[bool, str]]:
         is_ling3 = llm_family.has_architecture("BailingMoeV3ForCausalLM")
         supported_formats = ["pytorch", "gptq", "awq", "fp8", "bnb"]
-        if is_ling3:
+        # Offline ModelOpt checkpoints carry their own quantization config.
+        if is_ling3 or llm_family.has_architecture("Qwen3_5MoeForCausalLM"):
             supported_formats.append("fp4")
         if llm_spec.model_format not in supported_formats:
             return (
                 False,
                 f"SGLang chat engine supports {'/'.join(supported_formats)} formats only",
-            )
-        if llm_spec.model_format == "fp4" and not is_ling3:
-            return (
-                False,
-                "SGLang chat engine does not support fp4 online quantization; use offline fp4 weights with a compatible SGLang version",
             )
         if llm_spec.model_format == "pytorch":
             offline_ling_int4 = is_ling3 and quantization == "Int4"
@@ -1705,15 +1722,27 @@ class SGLANGVisionModel(SGLANGModel):
             return False, "SGLang vision engine requires CUDA GPUs"
         if not cls._is_linux():
             return False, "SGLang vision engine is only supported on Linux"
-        if llm_spec.model_format not in ["pytorch", "gptq", "awq", "fp8", "bnb"]:
+        if (
+            llm_family.has_architecture("Qwen4ExpForConditionalGeneration")
+            and not _virtual_env_allows_missing_sglang()
+        ):
+            installed = _get_sglang_version()
+            if installed is None or installed < Version("0.5.22"):
+                return (
+                    False,
+                    f"Qwen3.8-Flash-Next requires SGLang >= 0.5.22; found {installed or 'not installed'}",
+                )
+        supported_formats = ["pytorch", "gptq", "awq", "fp8", "bnb"]
+        if llm_family.has_architecture(
+            "Qwen3_5ForConditionalGeneration",
+            "Qwen3_5MoeForConditionalGeneration",
+            "Qwen4ExpForConditionalGeneration",
+        ):
+            supported_formats.append("fp4")
+        if llm_spec.model_format not in supported_formats:
             return (
                 False,
-                "SGLang vision engine supports pytorch/gptq/awq/fp8/bnb formats only",
-            )
-        if llm_spec.model_format == "fp4":
-            return (
-                False,
-                "SGLang vision engine does not support fp4 online quantization; use offline fp4 weights with a compatible SGLang version",
+                f"SGLang vision engine supports {'/'.join(supported_formats)} formats only",
             )
         if llm_spec.model_format == "pytorch":
             if quantization not in (None, "none"):

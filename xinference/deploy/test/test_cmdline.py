@@ -36,6 +36,45 @@ from ..cmdline import (
 )
 
 
+@pytest.mark.parametrize(
+    "endpoint", ["http://localhost:9997", "http://localhost:9997/proxy/path"]
+)
+@pytest.mark.parametrize("login_suffix", ["", "/"])
+def test_login_token_uses_normalized_endpoint(
+    monkeypatch, tmp_path, endpoint, login_suffix
+):
+    import hashlib
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    client = SimpleNamespace(
+        _cluster_authed=True,
+        login=MagicMock(),
+        _get_token=lambda: "stored-token",
+    )
+    monkeypatch.setattr(cmdline_module, "RESTfulClient", lambda base_url: client)
+    monkeypatch.setattr(cmdline_module, "XINFERENCE_AUTH_DIR", str(tmp_path))
+
+    result = CliRunner().invoke(
+        cmdline_module.cluster_login,
+        [
+            "--endpoint",
+            endpoint + login_suffix,
+            "--username",
+            "user",
+            "--password",
+            "pw",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output + repr(result.exception)
+    client.login.assert_called_once_with("user", "pw")
+    token_path = tmp_path / hashlib.sha256(endpoint.encode("utf-8")).hexdigest()
+    assert token_path.read_text() == "stored-token"
+    for lookup_endpoint in (endpoint, endpoint + "/"):
+        assert cmdline_module.get_stored_token(lookup_endpoint) == "stored-token"
+
+
 @pytest.mark.parametrize("stream", [True, False])
 @pytest.mark.parametrize("model_uid", [None, "my_model_uid"])
 @pytest.mark.platform_slow
@@ -827,3 +866,77 @@ def test_engine_matches_parameters_like_launch(
         "0_5",
         expected_quantization,
     ] in rows
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        [],
+        ["--model-engine", "llama.cpp"],
+        ["--model-engine", "vllm"],
+    ],
+)
+def test_engine_handles_unavailable_entries(monkeypatch, extra):
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    engines = {
+        "llama.cpp": [
+            {
+                "model_name": "qwen2.5-instruct",
+                "model_format": "ggufv2",
+                "model_size_in_billions": "0_5",
+                "quantizations": ["Q4_K_M"],
+            }
+        ],
+        "vLLM": "Failed to import vLLM: No module named 'vllm'",
+    }
+    client = SimpleNamespace(
+        query_engine_by_model_name=MagicMock(return_value=engines),
+        _set_token=MagicMock(),
+    )
+    monkeypatch.setattr(cmdline_module, "RESTfulClient", lambda **kwargs: client)
+
+    result = CliRunner().invoke(
+        query_engine_by_model_name,
+        [
+            "--endpoint",
+            "http://127.0.0.1:9997",
+            "--api-key",
+            "test-key",
+            "--model-name",
+            "qwen2.5-instruct",
+            *extra,
+        ],
+    )
+
+    assert result.exit_code == 0, result.output + repr(result.exception)
+    if extra == ["--model-engine", "vllm"]:
+        assert engines["vLLM"] in result.output
+    else:
+        assert "llama.cpp" in result.output
+        assert "Q4_K_M" in result.output
+
+
+def test_launch_cross_engine_prefix_sharing_requires_xavier(monkeypatch):
+    config = [
+        {"model_engine": engine, "devices": [{"worker_ip": f"worker-{i}:9978"}]}
+        for i, engine in enumerate(("vLLM", "SGLang"))
+    ]
+    result, calls = _invoke_launch_with_replica_config(
+        monkeypatch,
+        json.dumps(config),
+        "--model-engine",
+        "vLLM",
+        "--enable_xavier",
+        "true",
+        "--replica-config",
+    )
+    assert result.exit_code == 0, result.output
+    assert calls["launch_kwargs"]["enable_xavier"] is True
+    assert calls["launch_kwargs"]["replica_config"] == config
+    result, calls = _invoke_launch_with_replica_config(
+        monkeypatch, json.dumps(config), "--model-engine", "vLLM", "--replica-config"
+    )
+    assert result.exit_code != 0
+    assert "launch_kwargs" not in calls

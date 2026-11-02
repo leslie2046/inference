@@ -5,15 +5,15 @@ from ..cache_manager import CacheManager
 
 
 class VideoCacheManager(CacheManager):
-    def cache_lightning(self, lightning_version: Optional[str] = None):
-        from ..utils import IS_NEW_HUGGINGFACE_HUB, retry_download, symlink_local_file
+    def check_lightning(self, lightning_version: str) -> str:
+        """Return the lightning file name for a supported version, else raise.
+
+        Nothing is downloaded, so callers can reject a bad version before
+        caching anything.
+        """
         from .core import VideoModelFamilyV2
 
-        if not lightning_version:
-            return None
-
         assert isinstance(self._model_family, VideoModelFamilyV2)
-        cache_dir = self.get_cache_dir()
         filename_template = self._model_family.lightning_model_file_name_template
         if not filename_template or not self._model_family.lightning_model_id:
             raise NotImplementedError(
@@ -24,8 +24,18 @@ class VideoCacheManager(CacheManager):
                 f"Cannot support lightning version {lightning_version}, "
                 f"available lightning versions: {self._model_family.lightning_versions}"
             )
+        return filename_template.format(lightning_version=lightning_version)
 
-        filename = filename_template.format(lightning_version=lightning_version)
+    def cache_lightning(self, lightning_version: Optional[str] = None):
+        from ..utils import IS_NEW_HUGGINGFACE_HUB, retry_download, symlink_local_file
+        from .core import VideoModelFamilyV2
+
+        if not lightning_version:
+            return None
+
+        assert isinstance(self._model_family, VideoModelFamilyV2)
+        cache_dir = self.get_cache_dir()
+        filename = self.check_lightning(lightning_version)
         full_path = os.path.join(cache_dir, filename)
         lightning_revision = self._model_family.lightning_model_revision
 
@@ -65,6 +75,23 @@ class VideoCacheManager(CacheManager):
 
         return full_path
 
+    def check_gguf(self, quantization: str) -> str:
+        """Return the GGUF file name for a supported quantization, else raise."""
+        from .core import VideoModelFamilyV2
+
+        assert isinstance(self._model_family, VideoModelFamilyV2)
+        filename_template = self._model_family.gguf_model_file_name_template
+        if not filename_template:
+            raise NotImplementedError(
+                f"{self._model_family.model_name} does not support GGUF quantization"
+            )
+        if quantization not in (self._model_family.gguf_quantizations or []):
+            raise ValueError(
+                f"Cannot support quantization {quantization}, "
+                f"available quantizations: {self._model_family.gguf_quantizations}"
+            )
+        return filename_template.format(quantization=quantization)
+
     def cache_gguf(self, quantization: Optional[str] = None):
         from ..utils import IS_NEW_HUGGINGFACE_HUB, retry_download, symlink_local_file
         from .core import VideoModelFamilyV2
@@ -75,19 +102,7 @@ class VideoCacheManager(CacheManager):
         assert isinstance(self._model_family, VideoModelFamilyV2)
         cache_dir = self.get_cache_dir()
 
-        if not self._model_family.gguf_model_file_name_template:
-            raise NotImplementedError(
-                f"{self._model_family.model_name} does not support GGUF quantization"
-            )
-        if quantization not in (self._model_family.gguf_quantizations or []):
-            raise ValueError(
-                f"Cannot support quantization {quantization}, "
-                f"available quantizations: {self._model_family.gguf_quantizations}"
-            )
-
-        filename = self._model_family.gguf_model_file_name_template.format(
-            quantization=quantization
-        )
+        filename = self.check_gguf(quantization)
         full_path = os.path.join(cache_dir, filename)
 
         if self._model_family.model_hub == "huggingface":

@@ -2,6 +2,7 @@
 # Licensed under the Apache License, Version 2.0.
 # CI: linux
 import asyncio
+from copy import deepcopy
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -40,6 +41,9 @@ async def launch_runtime(monkeypatch):
     async def create_actor(cls, *args, **kwargs):
         ref = AsyncMock(address=kwargs["address"], uid=kwargs["uid"])
         ref.constructor_kwargs = kwargs
+        ref.constructor_args = args
+        if cls.__name__ in ("XavierHistoryCacheActor", "XavierHistoryProxy"):
+            ref.uid = kwargs["uid"].encode()
         actors[cls.__name__] = ref
         return ref
 
@@ -66,6 +70,277 @@ def launch_kwargs():
             for i, role in enumerate(["prefill", "decode"])
         ],
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "operation", ["terminate", "rollback", "dead_replica", "dead_worker"]
+)
+@pytest.mark.parametrize("timeout", [False, True])
+async def test_failed_service_notification_does_not_abort_cleanup(
+    launch_runtime, operation, timeout, caplog
+):
+    from types import SimpleNamespace
+
+    from ..supervisor_control import SupervisorControl
+    from .test_control_session import session
+    from .test_supervisor_control import short_provider_deadline
+
+    supervisor, workers, _, _ = launch_runtime
+    if operation != "rollback":
+        await supervisor.launch_builtin_model(**launch_kwargs())
+    else:
+        workers[1].wait_for_load.side_effect = RuntimeError("original launch failed")
+
+    async def notify(uid):
+        if timeout:
+            await asyncio.Event().wait()
+        raise RuntimeError("provider failure")
+
+    authority = SimpleNamespace(
+        session=session(), validate=AsyncMock(), model_services_changed=notify
+    )
+    control = SupervisorControl(supervisor, authority)
+    control.fence.ready = control.has_served = True
+    supervisor._controller_control = control
+    short_provider_deadline(control)
+    if operation == "rollback":
+        with pytest.raises(RuntimeError, match="original launch failed"):
+            await supervisor.launch_builtin_model(**launch_kwargs())
+        expected = "ERROR"
+    elif operation == "terminate":
+        await supervisor.terminate_model("pd", suppress_exception=True)
+        expected = None
+    elif operation == "dead_replica":
+        await supervisor.mark_replica_dead("pd-rep0")
+        await supervisor.mark_replica_dead("pd-rep1")
+        expected = "TERMINATED"
+    else:
+        for worker in workers:
+            await supervisor.remove_worker(worker.address)
+            assert worker.address not in supervisor._worker_address_to_worker
+        expected = "TERMINATED"
+    assert not supervisor._model_uid_to_replica_info
+    if expected is not None:
+        assert any(
+            call.args[1].get("status") == expected
+            for call in supervisor._status_guard_ref.update_instance_info.await_args_list
+        )
+    assert "Failed to report model service cleanup" in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "uid,collision", [("chosen", False), (None, False), (None, True)]
+)
+async def test_service_placement_receives_final_model_uid(
+    launch_runtime, uid, collision
+):
+    from types import SimpleNamespace
+
+    from ..supervisor_control import SupervisorControl
+    from .test_control_session import session
+
+    supervisor, workers, _, _ = launch_runtime
+    selected = []
+
+    async def choose(model_uid):
+        assert isinstance(model_uid, str) and model_uid
+        selected.append(model_uid)
+        return workers[0].address
+
+    authority = SimpleNamespace(
+        session=session(), validate=AsyncMock(), model_service_address=choose
+    )
+    control = SupervisorControl(supervisor, authority)
+    control.fence.ready = control.has_served = True
+    supervisor._controller_control = control
+    for worker in workers:
+        worker.get_model_count = AsyncMock(return_value=0)
+        worker.get_gpu_allocation_status = AsyncMock(return_value={})
+    if collision:
+        supervisor._model_uid_to_replica_info["test"] = object()
+    kwargs = launch_kwargs()
+    kwargs.pop("replica_config")
+    kwargs.update(model_uid=uid, replica=1)
+    result = await supervisor.launch_builtin_model(**kwargs)
+    if uid is not None:
+        assert result == uid
+    elif collision:
+        assert result.startswith("test-")
+    else:
+        assert result == "test"
+    assert selected == [result]
+    launches = [
+        worker.launch_builtin_model.await_args.kwargs
+        for worker in workers
+        if worker.launch_builtin_model.await_count
+    ]
+    assert len(launches) == 1
+    assert launches[0]["model_uid"] == result + "-rep0"
+
+
+@pytest.mark.asyncio
+async def test_concurrent_automatic_uids_are_reserved_before_service_placement(
+    launch_runtime,
+):
+    from types import SimpleNamespace
+
+    from ..supervisor_control import SupervisorControl
+    from .test_control_session import session
+
+    supervisor, workers, _, _ = launch_runtime
+    entered, release = asyncio.Event(), asyncio.Event()
+    selected = []
+
+    async def choose(uid):
+        selected.append(uid)
+        if len(selected) == 2:
+            entered.set()
+        await release.wait()
+        return workers[0].address
+
+    authority = SimpleNamespace(
+        session=session(), validate=AsyncMock(), model_service_address=choose
+    )
+    control = SupervisorControl(supervisor, authority)
+    control.fence.ready = control.has_served = True
+    supervisor._controller_control = control
+    for worker in workers:
+        worker.get_model_count = AsyncMock(return_value=0)
+        worker.get_gpu_allocation_status = AsyncMock(return_value={})
+    kwargs = launch_kwargs()
+    kwargs.update(model_uid=None, replica=1, replica_config=None)
+    tasks = [
+        asyncio.create_task(supervisor.launch_builtin_model(**kwargs)) for _ in range(2)
+    ]
+    try:
+        await asyncio.wait_for(entered.wait(), 1)
+        assert len(set(selected)) == 2
+        release.set()
+        results = await asyncio.gather(*tasks)
+        assert set(results) == set(selected)
+        launched = {
+            call.kwargs["model_uid"]
+            for worker in workers
+            for call in worker.launch_builtin_model.await_args_list
+        }
+        assert launched == {uid + "-rep0" for uid in results}
+    finally:
+        release.set()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["exception", "invalid", "cancel", "preflight"])
+async def test_service_placement_failure_releases_uid(launch_runtime, failure):
+    from types import SimpleNamespace
+
+    from ..control_session import ControlSessionRejected
+    from ..supervisor_control import SupervisorControl
+    from .test_control_session import session
+
+    supervisor, workers, actors, _ = launch_runtime
+    entered = asyncio.Event()
+
+    async def choose(uid):
+        entered.set()
+        if failure == "cancel":
+            await asyncio.Event().wait()
+        if failure == "exception":
+            raise RuntimeError("placement failed")
+        return None
+
+    authority = SimpleNamespace(
+        session=session(), validate=AsyncMock(), model_service_address=choose
+    )
+    control = SupervisorControl(supervisor, authority)
+    control.fence.ready = control.has_served = True
+    supervisor._controller_control = control
+    kwargs = launch_kwargs()
+    kwargs.update(model_uid=None, replica=1, replica_config=None)
+    if failure == "preflight":
+        kwargs["request_limits"] = -1
+    task = asyncio.create_task(supervisor.launch_builtin_model(**kwargs))
+    try:
+        if failure == "cancel":
+            await asyncio.wait_for(entered.wait(), 1)
+            task.cancel()
+        error = {
+            "exception": ControlSessionRejected,
+            "cancel": asyncio.CancelledError,
+        }.get(failure, ValueError)
+        with pytest.raises(error):
+            await task
+        assert not supervisor._model_uid_to_replica_info
+        assert not supervisor._initial_model_launches and not actors
+        for worker in workers:
+            worker.launch_builtin_model.assert_not_awaited()
+        authority.model_service_address = AsyncMock(return_value=workers[0].address)
+        for worker in workers:
+            worker.get_model_count = AsyncMock(return_value=0)
+            worker.get_gpu_allocation_status = AsyncMock(return_value={})
+        kwargs.pop("request_limits", None)
+        assert await supervisor.launch_builtin_model(**kwargs) == "test"
+    finally:
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_reserved_service_placement_updates_cache_config(launch_runtime):
+    from types import SimpleNamespace
+
+    from ..supervisor_control import SupervisorControl
+    from .test_control_session import session
+
+    supervisor, workers, actors, _ = launch_runtime
+    authority = SimpleNamespace(
+        session=session(),
+        validate=AsyncMock(),
+        model_service_address=AsyncMock(return_value=workers[1].address),
+    )
+    control = SupervisorControl(supervisor, authority)
+    control.fence.ready = control.has_served = True
+    supervisor._controller_control = control
+    kwargs = launch_kwargs()
+    kwargs.update(model_engine="MLX", model_format="mlx", quantization=None)
+    await supervisor.launch_builtin_model(**kwargs)
+    assert actors["XavierBytesCacheActor"].address == workers[1].address
+    for worker in workers:
+        assert (
+            worker.launch_builtin_model.await_args.kwargs["_xavier_cache_config"][
+                "address"
+            ]
+            == workers[1].address
+        )
+
+
+@pytest.mark.asyncio
+async def test_invalid_uid_is_rejected_before_service_placement(launch_runtime):
+    from types import SimpleNamespace
+
+    from ..supervisor_control import SupervisorControl
+    from .test_control_session import session
+
+    supervisor, workers, actors, _ = launch_runtime
+    authority = SimpleNamespace(
+        session=session(),
+        validate=AsyncMock(),
+        model_service_address=AsyncMock(return_value=workers[0].address),
+    )
+    control = SupervisorControl(supervisor, authority)
+    control.fence.ready = control.has_served = True
+    supervisor._controller_control = control
+    kwargs = launch_kwargs()
+    kwargs["model_uid"] = "invalid-rep0"
+    with pytest.raises(ValueError, match="model UID is invalid"):
+        await supervisor.launch_builtin_model(**kwargs)
+    authority.model_service_address.assert_not_awaited()
+    assert not actors
+    for worker in workers:
+        worker.launch_builtin_model.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -137,7 +412,7 @@ async def test_mlx_pd_recovery_keeps_bytes_cache_and_registers_replacement(role)
             XavierBytesCacheActor, address=pool.external_address, uid="bytes-cache"
         )
         namespace = (await cache.configure(contract().to_dict()))["namespace"]
-        worker = MagicMock()
+        worker = MagicMock(_control_fence=None)
         supervisor = AsyncMock()
         worker.get_supervisor_ref = AsyncMock(return_value=supervisor)
         worker.launch_builtin_model = AsyncMock(return_value="replacement:1234")
@@ -476,6 +751,55 @@ async def test_pd_route_waits_for_transfers(launch_runtime):
 @pytest.mark.parametrize(
     "stage", ["pre-worker-launch", "pd-finalization", "sharded-load"]
 )
+async def test_cancel_initial_launch_owns_complete_dispatch_lifecycle(
+    launch_runtime, stage
+):
+    supervisor, workers, _, _ = launch_runtime
+    entered = asyncio.Event()
+
+    async def wait(*args, **kwargs):
+        entered.set()
+        await asyncio.Event().wait()
+
+    kwargs = launch_kwargs()
+    kwargs["wait_ready"] = False
+    for worker in workers:
+        worker.cancel_launch_model = AsyncMock(
+            side_effect=RuntimeError("no launch guard")
+        )
+    if stage == "pre-worker-launch":
+        supervisor._resolve_download_hub_from_workers = wait
+    elif stage == "pd-finalization":
+        workers[1].start_transfer_for_vllm.side_effect = wait
+    else:
+        kwargs.pop("replica_config")
+        kwargs.update(n_worker=2, replica=1)
+        supervisor.is_local_deployment = lambda: False
+        supervisor._choose_worker = AsyncMock(side_effect=workers)
+        for worker in workers:
+            worker.get_model_registration = AsyncMock(return_value={})
+            worker.launch_builtin_model.return_value = ("model:1234", {})
+        workers[0].wait_for_load.side_effect = wait
+
+    await supervisor._launch_builtin_model(**kwargs)
+    await asyncio.wait_for(entered.wait(), 2)
+    await asyncio.wait_for(supervisor.cancel_launch_builtin_model("pd"), 2)
+    assert not supervisor._initial_model_launches
+    assert not supervisor._async_launch_tasks
+    assert not supervisor._model_uid_to_replica_info
+    assert not supervisor._replica_model_uid_to_worker
+    assert not supervisor._pd_model_mapping
+    assert not supervisor._collective_manager_mapping
+    assert not supervisor._block_tracker_mapping
+    for worker in workers:
+        if worker.launch_builtin_model.await_count:
+            assert worker.terminate_model.await_count
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "stage", ["pre-worker-launch", "pd-finalization", "sharded-load"]
+)
 async def test_supervisor_switch_waits_for_complete_async_launch(launch_runtime, stage):
     supervisor, workers, _, _ = launch_runtime
     entered, proceed = asyncio.Event(), asyncio.Event()
@@ -576,7 +900,7 @@ async def test_nixl_launch_skips_xavier_collectives(launch_runtime):
 async def test_nixl_worker_recovery_refreshes_route_without_collectives():
     from ..worker import WorkerActor
 
-    worker = MagicMock()
+    worker = MagicMock(_control_fence=None)
     supervisor = AsyncMock()
     worker.get_supervisor_ref = AsyncMock(return_value=supervisor)
     worker.launch_builtin_model = AsyncMock(return_value="new:1234")
@@ -640,6 +964,7 @@ async def test_nixl_startup_replay_is_skipped_and_removed(tmp_path):
     worker._supervisor_ref = AsyncMock()
     worker._supervisor_ref.describe_model.return_value = {"model_name": "still-running"}
     worker._model_uid_to_launch_args = {}
+    worker._pending_recovery_launch_args = {}
     worker.launch_builtin_model = AsyncMock()
     worker.wait_for_load = AsyncMock()
     (tmp_path / "models.json").write_text(
@@ -757,7 +1082,7 @@ async def test_sglang_recovery_replaces_registered_gpu_peer_and_invalidates_room
         await directory.prepare(2, "ns", "other", role, 1)
         with pytest.raises(ValueError, match="restarted"):
             await directory.register_peer(0, "new:1234")
-        worker = MagicMock()
+        worker = MagicMock(_control_fence=None)
         supervisor = AsyncMock()
         worker.get_supervisor_ref = AsyncMock(return_value=supervisor)
 
@@ -1174,14 +1499,35 @@ async def test_nvidia_mlx_rejects_unsupported_launch_before_allocation(
         worker.launch_builtin_model.assert_not_awaited()
 
 
+@pytest.fixture(params=["filesystem", "mooncake"])
+def lmcache_launch_options(request):
+    options = {"cpu_bytes": 8192}
+    if request.param == "filesystem":
+        options.update(disk_bytes=32768, disk_path="/cache")
+    else:
+        options.update(
+            l2_backend="mooncake",
+            storage_bytes=32768,
+            mooncake_config={
+                "local_hostname": "client",
+                "metadata_server": "http://store:18080/metadata",
+                "master_server_addr": "store:15051",
+                "protocol": "tcp",
+                "global_segment_size": "0",
+            },
+        )
+    return options
+
+
 @pytest.mark.asyncio
-async def test_lmcache_backend_launch_config(launch_runtime):
+async def test_lmcache_backend_launch_config(launch_runtime, lmcache_launch_options):
     supervisor, workers, actors, _ = launch_runtime
     kwargs = launch_kwargs()
     kwargs["enable_xavier"] = True
     for replica in kwargs["replica_config"]:
         replica.role = "hybrid"
-    config = {"cpu_bytes": 8192, "disk_bytes": 32768, "disk_path": "/cache"}
+    config = lmcache_launch_options
+    original = deepcopy(config)
     await supervisor.launch_builtin_model(
         **kwargs, xavier_cache_backend="lmcache", xavier_cache_backend_config=config
     )
@@ -1195,12 +1541,12 @@ async def test_lmcache_backend_launch_config(launch_runtime):
         assert "xavier_cache_backend" not in launch
         assert "xavier_cache_backend_config" not in launch
     assert len(namespaces) == 2
-    assert config == {"cpu_bytes": 8192, "disk_bytes": 32768, "disk_path": "/cache"}
+    assert config == original
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "invalid", ["disabled", "pd", "gpu", "cpu", "unsupported", "mlx", "single"]
+    "invalid", ["disabled", "gpu", "cpu", "unsupported", "mlx", "single"]
 )
 async def test_lmcache_backend_rejects_unsupported_launch_before_side_effects(
     launch_runtime, invalid
@@ -1210,10 +1556,7 @@ async def test_lmcache_backend_rejects_unsupported_launch_before_side_effects(
     kwargs["enable_xavier"] = invalid != "disabled"
     for replica in kwargs["replica_config"]:
         replica.role = "hybrid"
-    if invalid == "pd":
-        kwargs["replica_config"][0].role = "prefill"
-        kwargs["replica_config"][1].role = "decode"
-    elif invalid == "gpu":
+    if invalid == "gpu":
         kwargs["xavier_gpu_cache_bytes"] = 0
     elif invalid == "cpu":
         kwargs["xavier_cache_bytes"] = 8192
@@ -1236,15 +1579,15 @@ async def test_lmcache_backend_rejects_unsupported_launch_before_side_effects(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("engine", ["SGLang", "TRT-LLM"])
-async def test_lmcache_shared_actor_launch_and_cleanup(launch_runtime, engine):
+async def test_lmcache_shared_actor_launch_and_cleanup(
+    launch_runtime, engine, lmcache_launch_options
+):
     supervisor, workers, actors, destroy = launch_runtime
     kwargs = launch_kwargs()
     kwargs.update(model_engine=engine, enable_xavier=True)
     for replica in kwargs["replica_config"]:
         replica.role = None
-    options = dict(
-        cpu_bytes=8192, disk_bytes=32768, disk_path="/cache", read_timeout=45
-    )
+    options = {**lmcache_launch_options, "read_timeout": 45}
     await supervisor.launch_builtin_model(
         **kwargs, xavier_cache_backend="lmcache", xavier_cache_backend_config=options
     )
@@ -1286,3 +1629,213 @@ async def test_lmcache_rejects_sharded_launch_before_worker_launch(launch_runtim
     assert not actors
     for worker in workers:
         worker.launch_builtin_model.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "engines",
+    [("vLLM", "SGLang"), ("SGLang", "MLX"), ("vLLM", "TRT-LLM"), ("TRT-LLM", "MLX")],
+)
+async def test_cross_engine_ordinary_replicas_use_shared_canonical_store(
+    launch_runtime, engines
+):
+    supervisor, workers, actors, destroy = launch_runtime
+    kwargs = launch_kwargs()
+    kwargs.update(enable_xavier=True, xavier_cache_bytes=123456)
+    for cfg, engine in zip(kwargs["replica_config"], engines):
+        cfg.role = "hybrid"
+        cfg.model_engine = engine
+        cfg.engine_config = {"model_format": "mlx" if engine == "MLX" else "pytorch"}
+    await supervisor.launch_builtin_model(**kwargs)
+    assert set(actors) == {"XavierBytesCacheActor"}
+    for worker, engine in zip(workers, engines):
+        launch = worker.launch_builtin_model.call_args.kwargs
+        config = launch["_xavier_cache_config"]
+        assert launch["model_engine"] == engine
+        assert config["shared_prefix"] is True
+        assert config["logical_dtype"] == (
+            "bfloat16" if "TRT-LLM" in engines else "float16"
+        )
+        assert "role" not in config
+        assert launch["xavier_config"] is None
+        worker.launch_rank0_model.assert_not_awaited()
+    await supervisor.terminate_model("pd")
+    assert destroy.await_count == 1
+    assert not supervisor._xavier_cache_mapping
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("other", ["SGLang", "TRT-LLM", "MLX"])
+async def test_lmcache_rejects_mixed_ordinary_engines_before_side_effects(
+    launch_runtime, lmcache_launch_options, other
+):
+    supervisor, workers, actors, _ = launch_runtime
+    kwargs = launch_kwargs()
+    kwargs["enable_xavier"] = True
+    for cfg, engine in zip(kwargs["replica_config"], ("vLLM", other)):
+        cfg.role = "hybrid"
+        cfg.model_engine = engine
+    with pytest.raises(ValueError, match="LMCache backend requires"):
+        await supervisor.launch_builtin_model(
+            **kwargs,
+            xavier_cache_backend="lmcache",
+            xavier_cache_backend_config=lmcache_launch_options,
+        )
+    assert not actors
+    for worker in workers:
+        worker.launch_builtin_model.assert_not_awaited()
+        worker.launch_rank0_model.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "invalid,message",
+    [
+        ("workers", "sharded launch"),
+        ("transport", "NIXL requires explicit"),
+        ("quantized", "unquantized LLM weights"),
+        ("cuda-format", "PyTorch CUDA and MLX Metal weights"),
+        ("metal-format", "PyTorch CUDA and MLX Metal weights"),
+    ],
+)
+async def test_cross_engine_cache_rejects_invalid_launch_without_side_effects(
+    launch_runtime, invalid, message
+):
+    supervisor, workers, actors, _ = launch_runtime
+    supervisor.is_local_deployment = lambda: False
+    kwargs = launch_kwargs()
+    kwargs["enable_xavier"] = True
+    for cfg, engine in zip(kwargs["replica_config"], ("vLLM", "SGLang")):
+        cfg.role = "hybrid"
+        cfg.model_engine = engine
+    if invalid == "workers":
+        kwargs["n_worker"] = 2
+    elif invalid == "transport":
+        kwargs["vllm_transfer_backend_type"] = "nixl"
+    elif invalid == "quantized":
+        kwargs["quantization"] = "4-bit"
+    else:
+        cfg = kwargs["replica_config"][1]
+        cfg.model_engine = "MLX" if invalid == "metal-format" else "SGLang"
+        cfg.engine_config = {
+            "model_format": "pytorch" if invalid == "metal-format" else "ggufv2"
+        }
+    with pytest.raises(ValueError, match=message):
+        await supervisor.launch_builtin_model(**kwargs)
+    assert not actors and not supervisor._model_uid_to_replica_info
+    for worker in workers:
+        worker.launch_builtin_model.assert_not_awaited()
+        worker.launch_rank0_model.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prefill", ["vLLM", "SGLang", "TRT-LLM", "MLX"])
+@pytest.mark.parametrize("decode", ["vLLM", "SGLang", "TRT-LLM", "MLX"])
+async def test_pd_history_attaches_only_to_prefill_and_cleans_up(
+    launch_runtime, prefill, decode
+):
+    supervisor, workers, actors, destroy = launch_runtime
+    kwargs = launch_kwargs()
+    for cfg, engine in zip(kwargs["replica_config"], [prefill, decode]):
+        cfg.model_engine = engine
+        if engine == "MLX" and prefill != decode:
+            cfg.engine_config = {"model_format": "mlx"}
+    if prefill == decode == "MLX":
+        kwargs["model_format"] = "mlx"
+    if prefill == "MLX":
+        kwargs["xavier_cache_bytes"] = 16384
+    if (prefill, decode) != ("MLX", "MLX"):
+        kwargs["xavier_gpu_cache_bytes"] = 0
+    options = {"cpu_bytes": 8192, "disk_path": "/cache", "disk_bytes": 32768}
+    await supervisor.launch_builtin_model(
+        **kwargs, xavier_cache_backend="lmcache", xavier_cache_backend_config=options
+    )
+    store, proxy = actors["XavierHistoryCacheActor"], actors["XavierHistoryProxy"]
+    assert store.constructor_args[0]["config"] == {**options, "read_timeout": 30.0}
+    assert store.constructor_args[0]["namespace"]
+    assert proxy.address == workers[0].address
+    assert proxy.constructor_args == (
+        {"address": store.address, "uid": store.uid},
+        8192,
+    )
+    assert store.address == (
+        workers[0].address
+        if prefill != "MLX"
+        else workers[1].address if decode != "MLX" else supervisor.address
+    )
+    p, d = [w.launch_builtin_model.call_args.kwargs for w in workers]
+    assert p["_xavier_cache_config"]["prefix_cache"] == dict(
+        address=proxy.address,
+        uid="xavier-history-proxy-pd-1",
+        capacity_bytes=8192,
+        shared_prefix=True,
+        write_behind=True,
+        read_timeout=30.0,
+    )
+    assert "prefix_cache" not in d["_xavier_cache_config"]
+    for launch in (p, d):
+        assert launch["xavier_config"] is None
+        assert "cache_backend" not in launch["_xavier_cache_config"]
+    if prefill == "MLX":
+        live = actors[
+            "XavierBytesCacheActor" if decode == "MLX" else "XavierHostPDSource"
+        ]
+        assert live.constructor_kwargs["capacity_bytes"] == 16384
+    if [prefill, decode] != ["MLX", "MLX"]:
+        assert "XavierPDDirectory" in actors
+        assert p["_xavier_cache_config"]["heterogeneous"]
+    else:
+        assert "XavierBytesCacheActor" in actors
+    await supervisor.terminate_model("pd")
+    destroyed = [call.args[0] for call in destroy.await_args_list]
+    assert destroyed.index(proxy) < destroyed.index(store)
+    assert not supervisor._xavier_history_mapping
+    assert not supervisor._xavier_cache_mapping
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("engine", ["vLLM", "SGLang", "TRT-LLM"])
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        {"transfer_backend_type": "nixl"},
+        {"xavier_gpu_cache_bytes": 1024},
+        {"xavier_cache_bytes": 8192},
+    ],
+)
+async def test_pd_history_rejects_incompatible_launch_before_side_effects(
+    launch_runtime, engine, invalid
+):
+    supervisor, workers, actors, _ = launch_runtime
+    kwargs = {**launch_kwargs(), "model_engine": engine, **invalid}
+    with pytest.raises(ValueError, match="LMCache backend requires"):
+        await supervisor.launch_builtin_model(
+            **kwargs,
+            xavier_cache_backend="lmcache",
+            xavier_cache_backend_config={"disk_path": "/cache", "disk_bytes": 32768},
+        )
+    assert not actors and not supervisor._model_uid_to_replica_info
+    for worker in workers:
+        worker.launch_builtin_model.assert_not_awaited()
+        worker.launch_rank0_model.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_pd_history_rolls_back_actors_when_prefill_launch_fails(launch_runtime):
+    supervisor, workers, actors, destroy = launch_runtime
+    workers[0].wait_for_load.side_effect = RuntimeError("P failed")
+    with pytest.raises(RuntimeError, match="P failed"):
+        await supervisor.launch_builtin_model(
+            **launch_kwargs(),
+            xavier_cache_backend="lmcache",
+            xavier_cache_backend_config={
+                "cpu_bytes": 8192,
+                "disk_path": "/cache",
+                "disk_bytes": 32768,
+            },
+        )
+    assert not supervisor._xavier_history_mapping
+    assert not supervisor._xavier_cache_mapping
+    destroyed = [call.args[0] for call in destroy.await_args_list]
+    assert actors["XavierHistoryProxy"] in destroyed
+    assert actors["XavierHistoryCacheActor"] in destroyed

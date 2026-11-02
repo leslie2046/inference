@@ -22,6 +22,7 @@ from ..common import (
     async_streaming_response_iterator,
     convert_float_to_int_or_str,
     encode_world_reference,
+    normalize_endpoint,
 )
 
 if TYPE_CHECKING:
@@ -1318,7 +1319,7 @@ class AsyncRESTfulFlexibleModelHandle(AsyncRESTfulModelHandle):
 
 class AsyncClient:
     def __init__(self, base_url, api_key: Optional[str] = None):
-        self.base_url = base_url
+        self.base_url = normalize_endpoint(base_url)
         self._headers: Dict[str, str] = {}
         self._cluster_authed = False
         self.timeout = aiohttp.ClientTimeout(total=1800)
@@ -1373,10 +1374,8 @@ class AsyncClient:
         url = f"{self.base_url}/v1/models/vllm-supported"
         response = await self.session.get(url, headers=self._headers)
         if response.status != 200:
-            response_data = await response.json()
-            await _release_response(response)
             raise RuntimeError(
-                f"Failed to get cluster information, detail: {response_data['detail']}"
+                f"Failed to get cluster information, detail: {await _get_error_string(response)}"
             )
 
         try:
@@ -1395,10 +1394,8 @@ class AsyncClient:
 
         response = await self.session.post(url, json=payload)
         if response.status != 200:
-            response_data = await response.json()
-            await _release_response(response)
             raise RuntimeError(
-                f"Failed to get cluster information, detail: {response_data['detail']}"
+                f"Failed to get cluster information, detail: {await _get_error_string(response)}"
             )
 
         response_data = await response.json()
@@ -1626,7 +1623,8 @@ class AsyncClient:
     ) -> Dict[str, Any]:
         """Start an asynchronous parameter reload with the same model UID.
 
-        Engine changes require launch-time ``enable_weight_cache=True``;
+        Engine changes require weight retention enabled at launch (automatic
+        on supported configurations, or ``enable_weight_cache=True``);
         a standalone ``reasoning_content`` update does not. Use
         ``get_model_reload_status`` to wait for ready/error after HTTP 202.
         """

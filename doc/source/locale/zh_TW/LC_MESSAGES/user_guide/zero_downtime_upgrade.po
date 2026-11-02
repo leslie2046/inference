@@ -304,14 +304,19 @@ msgstr "模型和引擎"
 
 #: ../source/user_guide/zero_downtime_upgrade.rst:137
 msgid ""
-"Open a running model's detail view and choose **Reconfigure / upgrade model**. Engine "
-"replacement requires **Keep GPU weights for reload** (``enable_weight_cache=true``) at"
-" launch, vLLM 0.31.0+ or SGLang 0.5.21+, Linux with CUDA or ROCm, one Worker, one "
-"replica and fixed tensor parallelism."
+"Open a running model's detail view and choose **Reconfigure / upgrade "
+"model**. Engine replacement requires GPU weight retention enabled at launch,"
+" either automatically on a supported configuration or explicitly with "
+"``enable_weight_cache=True``. See :ref:`launch_weight_cache_reload` for "
+"prerequisites and the **Auto**, **Enabled** and **Disabled** settings. "
+"Multiple replicas are supported: each keeps its own weight cache, and model "
+"reload updates them sequentially. See the linked guide for partial failures,"
+" retries and scale-out."
 msgstr ""
-"開啟執行中模型的詳細資料，選擇 **重新設定 / 升級模型** 。替換引擎需要在啟動時開啟 **保留 GPU 權重以支援重載** （ "
-"``enable_weight_cache=true`` ），使用 vLLM 0.31.0+ 或 SGLang 0.5.21+、配備 CUDA 或 ROCm 的 "
-"Linux、單一 Worker、單一副本和固定的張量平行度。"
+"開啟執行中模型的詳細頁面，選擇 **重新設定 / 升級模型**。替換引擎需要在啟動時啟用 GPU 權重保留，可在支援的設定下自動開啟，或明確設定 "
+"``enable_weight_cache=True``。前提條件及 **自動**、**開啟** 和 **關閉** 設定請參閱 "
+":ref:`launch_weight_cache_reload`。 "
+"支援多副本：每個副本獨立保留權重快取，重載時逐個更新。部分失敗、重試和擴充行為請參閱上述指南。"
 
 #: ../source/user_guide/zero_downtime_upgrade.rst:149
 msgid ""
@@ -568,3 +573,54 @@ msgid ""
 "Check for updates again to confirm that all components report the new "
 "version."
 msgstr "再次檢查更新，確認所有元件均顯示新版本。"
+
+#: ../source/user_guide/zero_downtime_upgrade.rst:21
+msgid "An extension can optionally require controller sessions for Worker management RPCs. Callers must attach the versioned session and an operation ID; normal Supervisors do not add them automatically. A newer session is acknowledged only after management work drains, and failed drain keeps old sessions fenced. The provider must validate current authority on every check. Election and endpoint discovery are separate responsibilities. Worker replacement and model reload are rejected in this mode until session/resource transfer is supported. Without a provider, normal upgrade behavior is unchanged."
+msgstr "擴充功能可選擇要求 Worker 管理 RPC 攜帶控制器工作階段。呼叫端必須附上含版本的工作階段與操作 ID；一般 Supervisor 不會自動加入這些資訊。只有管理操作排空後，Worker 才確認新工作階段；排空失敗時，舊工作階段仍會被隔離。提供者必須在每次驗證時檢查目前的權威狀態。選主與端點探索由其他機制負責。在支援工作階段與資源移交之前，此模式會拒絕 Worker 替換與模型重新載入。未設定提供者時，原有升級行為維持不變。"
+
+#: ../../source/user_guide/zero_downtime_upgrade.rst:23
+msgid "Session metadata is also required through same-process ActorRefs. Startup recovery records are retained until an active session is installed. If installation happens during fencing or reconciliation, retry ``install_controller_session`` after activation to resume recovery. Recovery interrupted by a newer session preserves unfinished records."
+msgstr "透過同程序 ActorRef 呼叫時也必須攜帶工作階段資訊。啟動復原記錄會保留到安裝 active 工作階段後。如果安裝發生在隔離或協調階段，請在啟用後重試 ``install_controller_session``，以繼續復原。新工作階段中斷復原時，未完成的記錄仍會保留。"
+
+#: ../../source/user_guide/zero_downtime_upgrade.rst:25
+msgid "Worker-owned crash recovery and pending cache inventory publication acquire active-session admission for new events; already admitted operations keep their original session. Model OOM reports update only diagnostics for the current model incarnation and do not authorize management commands. Admitted termination finishes cleanup of its original model registration before drain completes. Interrupted native faults retain their intent and retry under active-session admission during installation or a later status report. This mechanism covers public management methods; private Python helpers remain internal. Lightweight heartbeats continue before session installation, during draining and after a drain timeout; they never register the Worker or resume recovery. Full status reports and their registration/recovery work still require active-session admission."
+msgstr "Worker 自身的故障復原和待處理快取目錄上報會為新事件申請 active 工作階段准入；已准入的操作保留原工作階段。模型 OOM 上報只能更新目前模型實例的診斷資訊，不能授權管理命令。 已接納的終止操作會在排空完成前清理其原始模型註冊的資源。被切換中斷的原生故障會保留處理意圖，在工作階段安裝或後續狀態回報時通過活躍工作階段准入後重試。此機制涵蓋公開管理方法，私有 Python helper 仍屬內部實作。 輕量心跳會在工作階段安裝前、排空期間以及排空逾時後持續回報；它們不會註冊 Worker 或恢復模型。完整狀態回報及其註冊、恢復操作仍需通過活躍工作階段准入。"
+msgid "A Supervisor authority provider can implement ``create_supervisor_control_authority(context)`` with a fixed process session, ``validate`` and ``close``. ``context.runtime`` supplies process-local ``pause(timeout)``, ``restore_worker(ref, replicas, incarnation)`` and ``resume()`` primitives. Optional async ``execute(operation, payload)`` and ``worker_registered(ref)`` hooks delegate extension-owned behavior. The runtime does not select Workers, probe models, confirm membership or orchestrate replacement. Old processes retain their original session. Fixed-session mode rejects native component replacement until session transfer is supported. These mechanisms add no failover command or HA service. Without a provider, normal upgrade behavior is unchanged. The port also provides a settings snapshot. Async provider callbacks execute on the actor loop and may overlap; providers synchronize their own services. A busy pause is rejected before management admission closes. Inference reads are unavailable before the first successful ``resume()``; afterwards, existing routes remain readable through later management pauses. Session-protected startup recovery retries outside the registration lock and retains persisted intent while access is fenced."
+msgstr "Supervisor 權威提供者可實作 ``create_supervisor_control_authority(context)``，提供固定程序工作階段、``validate`` 和 ``close``。``context.runtime`` 提供程序內 ``pause(timeout)``、``restore_worker(ref, replicas, incarnation)`` 和 ``resume()`` 原子操作。可選非同步 ``execute(operation, payload)`` 和 ``worker_registered(ref)`` 鉤子將擴充行為交給提供者。執行階段不選擇 Worker、不探測模型、不確認成員，也不編排替換。舊程序保留原工作階段。這些機制不增加故障切換命令或 HA 服務。未設定提供者時，正常升級行為保持不變。 連接埠亦提供設定快照。非同步提供者回呼在 actor 事件迴圈執行；回呼可並行，提供者須自行同步服務。忙碌時的暫停會在關閉管理准入前被拒絕。首次成功呼叫 ``resume()`` 前，推論讀取無法使用；之後的管理暫停不會中斷既有推論路由的讀取。工作階段保護的啟動恢復會在註冊鎖外重試，存取受限時保留持久化意圖。 固定工作階段模式在支援工作階段轉移前拒絕原生元件替換。"
+
+#: ../../source/user_guide/zero_downtime_upgrade.rst:220
+msgid ""
+"The default for ``enable_weight_cache`` changed from ``False`` to automatic "
+"selection (``None``). Retained-weight models now support multiple replicas, "
+"scale-out and sequential reload."
+msgstr ""
+"``enable_weight_cache`` 的預設值從 ``False`` 改為自動選擇（``None``）。 "
+"保留權重的模型現在支援多副本、擴充與逐個副本重載。"
+
+#: ../source/user_guide/zero_downtime_upgrade.rst:28
+msgid "Admitted calls can use optional asynchronous provider callbacks: ``around_supervisor_call(invocation, call)``, ``around_worker_call(invocation, call)`` and ``around_control_call(invocation, call)``. The immutable invocation describes the target, method, original control context and arguments. Await ``call()`` to execute; argument overrides preserve that context. The runtime supplies no receipts or replay policy. Worker callbacks also retain their original session when the Supervisor reference changes. Read-only ``controller_resource_state``, ``controller_catalog`` and ``control_operation_receipt`` expose observations or provider evidence; unavailable receipts raise. The local port can capture or replace catalogs and settings, list Worker references and invoke a public Supervisor method. Catalog replacement validates definitions first and does not rewrite registration files."
+msgstr "已獲准的呼叫支援可選的非同步提供者回呼：``around_supervisor_call(invocation, call)``、``around_worker_call(invocation, call)`` 和 ``around_control_call(invocation, call)``。不可變呼叫物件包含目標、方法、原始控制上下文及參數。等待 ``call()`` 執行呼叫；覆寫參數仍保留該上下文。執行階段不提供執行回執或重播策略。Supervisor 參照改變後，Worker 回呼仍保留原始工作階段。唯讀的 ``controller_resource_state``、``controller_catalog`` 和 ``control_operation_receipt`` 傳回觀測值或提供者證據；回執不可用時會報錯。本機連接埠支援讀取或取代目錄與設定、列出 Worker 參照及呼叫 Supervisor 的公開方法。取代目錄先驗證定義，且不改寫註冊檔案。"
+
+#: ../source/user_guide/zero_downtime_upgrade.rst:30
+msgid "Providers can opt in to ``controller_inventory(include_services=True)`` for ready specialized replicas, shard identities and coordinator observations. Setting the authority attribute ``include_model_services=True`` includes these replicas in ordinary registration reports as well. The local port supplies ``with_service_address(address, call)``, ``model_services(model_uid)`` and ``restore_model_services(model_uid, services)`` for scoped support-actor placement and reference restoration. An optional async ``model_services_changed(model_uid)`` callback can persist completed routing changes. Default placement and registration behavior are unchanged; these primitives do not select a host or perform recovery."
+msgstr "提供者可選用 ``controller_inventory(include_services=True)``，取得已就緒的專用副本、分片識別與協調 actor 觀測。權限提供者設定 ``include_model_services=True`` 後，一般註冊報告也會包含這些副本。本機連接埠提供 ``with_service_address(address, call)``、``model_services(model_uid)`` 與 ``restore_model_services(model_uid, services)``，用於限定呼叫範圍的輔助 actor 配置與參照還原。選用的非同步 ``model_services_changed(model_uid)`` 回呼可持久化已完成的路由變更。預設配置與註冊行為不變；這些原語不選擇主機，也不執行復原。"
+
+#: ../source/user_guide/zero_downtime_upgrade.rst:32
+msgid "The optional async ``model_service_address(model_uid)`` callback selects a support-actor address for both internal and public launches."
+msgstr "選用的非同步 ``model_service_address(model_uid)`` 回呼為內部與公開啟動選擇輔助 actor 位址。"
+
+#: ../source/user_guide/zero_downtime_upgrade.rst:34
+msgid "Optional ``create_model_service(actor_class, args, kwargs, address, uid)`` and ``destroy_model_service(ref)`` callbacks can delegate actor lifetime to Worker ``create_runtime_actor`` and ``destroy_runtime_actor`` management calls, which participate in session admission and draining. Without callbacks, ordinary actor creation and destruction remain unchanged."
+msgstr "選用的 ``create_model_service(actor_class, args, kwargs, address, uid)`` 與 ``destroy_model_service(ref)`` 回呼可將 actor 生命週期委派給 Worker 的 ``create_runtime_actor`` 與 ``destroy_runtime_actor`` 管理呼叫，納入工作階段准入與排空。沒有回呼時，一般 actor 建立與銷毀行為不變。"
+
+
+msgid "Interceptors describe admitted method calls, not a single overall operation. Child-task cleanup and Worker recovery helpers may produce additional calls with the original command; distinguish them by target and method. Use ``call(args=..., kwargs=...)`` for explicit argument overrides. The top-level keyword mapping is copied; nested payloads are not deep copies. Actor lifetime callbacks preserve native lifetimes and original exceptions. Cleanup notification failures are logged without aborting termination."
+msgstr "攔截器描述已准入的方法呼叫，而非一次完整操作。子任務清理和 Worker 復原輔助方法可能攜帶原始命令產生額外呼叫，應透過目標和方法區分。使用 ``call(args=..., kwargs=...)`` 明確覆寫參數。僅複製頂層關鍵字映射，巢狀資料不會深層複製。actor 生命週期回呼保留原生生命週期和原始例外。清理通知失敗只記錄日誌，不中斷終止。"
+
+
+msgid "``restore_worker(..., coordinators=...)`` accepts a list or tuple of ``-rank0`` UIDs, validated before registry mutation. Async ``filter_worker_inventory(ref, replicas)`` may only narrow observations; errors or its ten-second timeout reject registration before publication. Worker catalog replacement participates in management admission and draining; providers serialize snapshot selection with catalog writes. API extensions may set async ``app.state.system_settings_provider(operation, data)`` for ``get``, ``save`` and ``reset``. It owns persistence and token masking; ``ValueError`` from ``save`` returns HTTP 422."
+msgstr "``restore_worker(..., coordinators=...)`` 接受 ``-rank0`` UID 的串列或元組，並在修改登錄前驗證。非同步 ``filter_worker_inventory(ref, replicas)`` 只能縮小觀測範圍；例外或十秒逾時會在發布登錄前拒絕登錄。Worker 目錄替換受管理准入和 drain 追蹤；提供者應將快照選擇與目錄寫入序列化。API 擴充可設定非同步 ``app.state.system_settings_provider(operation, data)``，處理 ``get``、``save`` 和 ``reset``，並負責持久化及 token 遮罩；``save`` 拋出 ``ValueError`` 時回傳 HTTP 422。"
+
+
+msgid "Providers must await ``call()`` directly in the callback task; task-spawning wrappers such as ``asyncio.wait_for`` and ``asyncio.shield`` are unsupported. Local port restore methods require provider-owned ordering while management is paused. Explicit coordinator UIDs are selected by the caller separately from replica filtering, because a Worker may host only a coordinator."
+msgstr "提供者必須在回呼所在任務中直接 await ``call()``；不支援 ``asyncio.wait_for``、``asyncio.shield`` 等建立任務的包裝。管理操作暫停期間，本機連接埠的還原方法由提供者負責排序。呼叫方應獨立於副本篩選選擇明確的 coordinator UID，因為 Worker 可能只承載 coordinator。"

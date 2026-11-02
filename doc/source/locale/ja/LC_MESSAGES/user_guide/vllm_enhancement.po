@@ -64,8 +64,12 @@ msgid "SGLang >= ``0.5.21`` can share prefix KV cache through Xavier's HiCache s
 msgstr "SGLang >= ``0.5.21`` は Xavier の HiCache ストレージバックエンドを通じてプレフィックス KV キャッシュを共有できます。複数のレプリカを起動するときに ``model_engine=\"SGLang\"`` と ``enable_xavier=True`` を指定してください。初期アダプターは、完全なアテンション、非量子化 FP16 重み、TP=PP=DP=1 を使用する Qwen2、Qwen3、Llama のテキストモデルに対応します。LoRA、投機的デコード、ハイブリッドアテンション、マルチモーダル入力には対応しません。"
 
 #: source/user_guide/vllm_enhancement.rst
-msgid "``xavier_cache_bytes`` sets the deployment's shared CPU cache budget (default: ``536870912``, 512 MiB). Each SGLang replica also allocates its own GPU and HiCache host pools. Eviction or unavailable storage becomes a cache miss for ordinary replicas. Cache namespaces include the actual weights, tokenizer, model configuration, KV geometry and engine format; caches cannot yet be exchanged between vLLM and SGLang."
-msgstr "``xavier_cache_bytes`` はデプロイ全体の共有 CPU キャッシュ容量を設定します（既定値 ``536870912``、512 MiB）。各 SGLang レプリカは自身の GPU と HiCache ホストメモリプールも割り当てます。通常のレプリカでは、キャッシュの追い出しやストレージの利用不可はキャッシュミスとして扱われます。名前空間には実際の重み、トークナイザー、モデル設定、KV の形状、エンジン形式が含まれます。vLLM と SGLang 間のキャッシュ交換にはまだ対応しません。"
+msgid "``xavier_cache_bytes`` sets the deployment's shared CPU cache budget (default: ``536870912``, 512 MiB). Each SGLang replica also allocates its own GPU and HiCache host pools. Eviction or unavailable storage becomes a cache miss for ordinary replicas. Cache namespaces include the actual weights, tokenizer, model configuration, KV geometry and engine format; for cross-engine reuse, use :ref:`xavier-cross-engine-sharing`."
+msgstr ""
+"``xavier_cache_bytes`` はデプロイ全体の共有 CPU キャッシュ容量を設定します（既定値 ``536870912``、512 "
+"MiB）。各 SGLang レプリカは自身の GPU と HiCache "
+"ホストメモリプールも割り当てます。通常のレプリカでは、キャッシュの追い出しやストレージの利用不可はキャッシュミスとして扱われます。名前空間には実際の重み、トークナイザー、モデル設定、KV"
+" の形状、エンジン形式が含まれます。エンジン間の再利用は :ref:`xavier-cross-engine-sharing` を参照してください。"
 
 #: source/user_guide/vllm_enhancement.rst
 msgid "Ordinary SGLang replicas share CPU HiCache pages. Explicit prefill/decode roles use Xavier GPU-to-GPU transfer instead. For same-engine or cross-engine P/D and per-replica engine settings, see :ref:`user_guide_pd_separation`."
@@ -186,8 +190,8 @@ msgid "Storage backends"
 msgstr "ストレージバックエンド"
 
 #: source/user_guide/vllm_enhancement.rst:34
-msgid "``xavier_cache_backend=\"native\"`` is the default and keeps the existing CPU and GPU cache behavior. The optional ``lmcache`` backend adds disk-backed prefix reuse for ordinary vLLM V1, SGLang and TRT-LLM replicas. Install ``xinference[xavier-lmcache]`` in the Linux environment hosting storage: each vLLM transfer actor's environment, or the supervisor environment for SGLang and TRT-LLM. Model environments can remain separate. This adapter targets LMCache >= ``0.5.6`` and < ``0.6`` with its native FS extension, and Python 3.10 through 3.13."
-msgstr "``xavier_cache_backend=\"native\"`` が既定で、既存の CPU/GPU キャッシュ動作を維持します。任意の ``lmcache`` バックエンドは、通常の vLLM V1、SGLang、TRT-LLM レプリカにディスクを使ったプレフィックス再利用を提供します。ストレージを実行する Linux 環境に ``xinference[xavier-lmcache]`` をインストールしてください。vLLM では各転送 actor の環境、SGLang と TRT-LLM では supervisor の環境です。モデル環境は分離できます。このアダプターはネイティブ FS 拡張を備えた LMCache >= ``0.5.6`` かつ < ``0.6`` と Python 3.10～3.13 を対象とします。"
+msgid "``xavier_cache_backend=\"native\"`` is the default and keeps the existing CPU and GPU cache behavior. The optional ``lmcache`` backend adds external prefix-cache storage for ordinary vLLM V1, SGLang and TRT-LLM replicas. Install ``xinference[xavier-lmcache]`` in the Linux environment hosting storage: each vLLM transfer actor's environment, or the supervisor environment for SGLang and TRT-LLM. Model environments can remain separate. This adapter targets LMCache >= ``0.5.6`` and < ``0.6`` with the native extension for the selected L2 backend, and Python 3.10 through 3.13."
+msgstr "``xavier_cache_backend=\"native\"`` が既定で、既存の CPU/GPU キャッシュ動作を維持します。任意の ``lmcache`` バックエンドは、通常の vLLM V1、SGLang、TRT-LLM レプリカに外部プレフィックスキャッシュストレージを提供します。ストレージを実行する Linux 環境に ``xinference[xavier-lmcache]`` をインストールしてください。vLLM では各転送 actor の環境、SGLang と TRT-LLM では supervisor の環境です。モデル環境は分離できます。このアダプターは選択した L2 バックエンドのネイティブ拡張を備えた LMCache >= ``0.5.6`` かつ < ``0.6`` と Python 3.10～3.13 を対象とします。"
 
 #: source/user_guide/vllm_enhancement.rst:36
 msgid "Select the backend when launching the model:"
@@ -201,9 +205,9 @@ msgstr "``cpu_bytes`` は各 LMCache インスタンスの DRAM プールを制�
 msgid "``read_timeout`` bounds a cache lookup's wait in seconds (default: 30). Missing, unavailable or timed-out cache reads fall back to local prefill. At most one LMCache prefetch job runs per storage instance; a timed-out or cancelled job still releases its LMCache read locks. Reads exceeding the transient capacity return a bounded prefix or fall back to local prefill. Compare TTFT and read latency against prefill cost for your workload."
 msgstr "``read_timeout`` はキャッシュ検索の待機時間を秒で制限します（既定 30）。未登録、利用不能、タイムアウト時はローカル prefill に戻ります。ストレージインスタンスごとに実行する LMCache プリフェッチは最大一つです。タイムアウトやキャンセル後も読み取りロックを解放します。一時容量を超える読み取りは制限されたプレフィックスを返すか、ローカル prefill に戻ります。ワークロードに応じて TTFT、読み取り遅延と prefill コストを比較してください。"
 
-#: source/user_guide/vllm_enhancement.rst:61
-msgid "The LMCache backend requires multiple ordinary replicas of the same engine and preserves that engine's existing Xavier model, dtype and parallelism limits. P/D roles, legacy vLLM V0 and MLX are unsupported; P/D KV handoff remains a separate transport concern. Use backend ``cpu_bytes`` instead of the native ``xavier_cache_bytes`` or ``xavier_gpu_cache_bytes`` budgets. Backend selection does not enable cross-engine cache sharing or change existing cache-salt behavior. Each deployment and storage instance owns a separate namespace and directory; relaunching does not recover old entries. Graceful shutdown removes that directory; after a process crash, remove abandoned deployment directories when they are no longer in use."
-msgstr "LMCache バックエンドには同じエンジンの複数の通常レプリカが必要です。各エンジンの既存の Xavier モデル、dtype、並列度の制約を維持します。P/D ロール、旧 vLLM V0、MLX は非対応で、P/D KV 引き渡しは別の転送経路が担います。native の ``xavier_cache_bytes`` や ``xavier_gpu_cache_bytes`` ではなく、バックエンドの ``cpu_bytes`` を使ってください。バックエンド選択で異なるエンジン間のキャッシュ共有が有効になったり、既存の cache-salt 動作が変わったりすることはありません。各デプロイのストレージインスタンスは専用の名前空間とディレクトリを持ち、再起動で古いエントリは復元しません。正常終了時にディレクトリを削除します。クラッシュ後は、使用していないことを確認して残存ディレクトリを削除してください。"
+#: source/user_guide/vllm_enhancement.rst
+msgid "For ordinary replicas, the LMCache backend requires multiple replicas of the same engine and preserves that engine's existing Xavier model, dtype and parallelism limits; legacy vLLM V0 and ordinary MLX replicas are unsupported. For P/D roles, see :ref:`xavier-pd-lmcache`. Use backend ``cpu_bytes`` instead of the native ``xavier_cache_bytes`` or ``xavier_gpu_cache_bytes`` budgets. Backend selection does not change cache-salt behavior. Each deployment and storage instance owns a separate namespace and directory; relaunching does not recover old entries. Graceful shutdown removes that directory; after a process crash, remove abandoned deployment directories when they are no longer in use."
+msgstr "通常のレプリカでは、LMCache バックエンドに同じエンジンの複数レプリカが必要で、既存の Xavier モデル、dtype、並列度の制限を維持します。旧 vLLM V0 と通常の MLX レプリカは非対応です。P/D ロールは :ref:`xavier-pd-lmcache` を参照してください。native の ``xavier_cache_bytes`` や ``xavier_gpu_cache_bytes`` ではなく、バックエンドの ``cpu_bytes`` を使ってください。バックエンド選択で cache-salt 動作は変わりません。各デプロイのストレージインスタンスは専用の名前空間とディレクトリを持ち、再起動で古いエントリは復元しません。正常終了時にディレクトリを削除します。クラッシュ後は、使用していないことを確認して残存ディレクトリを削除してください。"
 
 #: source/user_guide/vllm_enhancement.rst:34
 msgid "LMCache storage for ordinary vLLM V1, SGLang and TRT-LLM replicas."
@@ -216,15 +220,16 @@ msgstr "デプロイ方式の選択"
 #: ../../source/user_guide/vllm_enhancement.rst:15
 msgid ""
 "Use ordinary replicas to share compatible prefixes while each replica "
-"handles complete requests. Shared prefix caching currently stays within the "
-"same engine. For separate prefill and decode roles, including cross-engine "
-"and CUDA/Metal deployments, use :ref:`user_guide_pd_separation`. P/D "
-"transport and ordinary cache storage have separate configuration and "
-"compatibility limits."
+"handles complete requests. By default, shared prefix caching uses replicas "
+"of the same engine. To mix engines in ordinary replicas, see :ref:`xavier-"
+"cross-engine-sharing`. For separate prefill and decode roles, including "
+"cross-engine and CUDA/Metal deployments, use "
+":ref:`user_guide_pd_separation`. P/D transport and ordinary cache storage "
+"have separate configuration and compatibility limits."
 msgstr ""
-"通常のレプリカは各リクエストを最後まで処理しながら、互換性のあるプレフィックスを共有します。プレフィックス共有は現在、同一エンジン内に限られます。異種エンジンや"
-" CUDA/Metal を含めて prefill と decode を分離する場合は :ref:`user_guide_pd_separation` "
-"を参照してください。P/D 転送と通常キャッシュストレージは設定と互換性の制約が異なります。"
+"既定では同じエンジンのレプリカでプレフィックスを共有します。独立した prefill/decode 配置は "
+":ref:`user_guide_pd_separation` を参照してください。 エンジン間の再利用は :ref:`xavier-cross-"
+"engine-sharing` を参照してください。"
 
 #: ../../source/user_guide/vllm_enhancement.rst:26
 msgid ""
@@ -327,13 +332,14 @@ msgid ""
 "locally on a miss or unavailable storage; incompatible deployments cannot "
 "share pages. Returned usage reports reused tokens in "
 "``prompt_tokens_details.cached_tokens``. Explicit prefill/decode roles "
-"enable MLX Xavier P/D automatically. Cross-engine cache sharing is not yet "
-"supported."
+"enable MLX Xavier P/D automatically. For cross-engine reuse, use "
+":ref:`xavier-cross-engine-sharing`."
 msgstr ""
 "``xavier_cache_bytes`` は共有 CPU キャッシュを制限します（既定値 512 MiB）。各レプリカはモデルと Metal KV "
 "キャッシュも保持します。通常レプリカはミスやストレージ利用不可時にローカル計算し、互換性のないデプロイ間ではページを共有できません。使用量の "
 "``prompt_tokens_details.cached_tokens`` に再利用トークン数を返します。明示的な prefill/decode "
-"ロールは MLX Xavier P/D を自動で有効にします。異なるエンジン間のキャッシュ共有は未対応です。"
+"ロールは MLX Xavier P/D を自動で有効にします。エンジン間の再利用は :ref:`xavier-cross-engine-sharing`"
+" を参照してください。"
 
 #: ../../source/user_guide/vllm_enhancement.rst:140
 msgid "Native storage"
@@ -359,3 +365,150 @@ msgstr "LMCache"
 #: ../../source/user_guide/vllm_enhancement.rst:213
 msgid "TRT-LLM does not support ``cache_salt`` through this adapter."
 msgstr "このアダプターの TRT-LLM は ``cache_salt`` に未対応です。"
+
+
+#: source/user_guide/vllm_enhancement.rst:184
+msgid "Mooncake Store"
+msgstr "Mooncake Store"
+
+#: source/user_guide/vllm_enhancement.rst
+msgid "Set ``l2_backend=\"mooncake\"`` in ``xavier_cache_backend_config`` to use LMCache's Mooncake Store adapter. The default ``l2_backend=\"filesystem\"`` preserves the disk configuration above. This selects storage for ordinary prefix-cache reuse or P-side history; P/D transport and supported engine/model combinations remain the same."
+msgstr "``xavier_cache_backend_config`` に ``l2_backend=\"mooncake\"`` を設定すると、LMCache の Mooncake Store アダプターを使用できます。デフォルトの ``l2_backend=\"filesystem\"`` は上記のディスク設定を維持します。この設定は通常のプレフィックスキャッシュ再利用または P 側の履歴用ストレージを選択し、P/D 転送と対応するエンジン・モデルの組み合わせは変わりません。"
+
+#: source/user_guide/vllm_enhancement.rst:191
+msgid "The storage environment needs LMCache built with ``BUILD_MOONCAKE=1`` and compatible Mooncake SDK headers and libraries. Start the Mooncake master, metadata service and storage pool first. Use a reachable ``local_hostname`` without a port; Mooncake allocates a distinct port for each storage actor. Replace the endpoints in this TCP example with reachable service addresses, and pass the object as ``xavier_cache_backend_config``:"
+msgstr "ストレージ環境には ``BUILD_MOONCAKE=1`` でビルドした LMCache と、互換性のある Mooncake SDK のヘッダーおよびライブラリが必要です。最初に Mooncake master、メタデータサービス、ストレージプールを起動してください。``local_hostname`` にはポートを含まない到達可能なホスト名を使用し、Mooncake が各ストレージ actor に別々のポートを割り当てます。以下の TCP 例のエンドポイントを到達可能なサービスアドレスに置き換え、オブジェクトを ``xavier_cache_backend_config`` として渡してください。"
+
+#: source/user_guide/vllm_enhancement.rst:210
+msgid "``storage_bytes`` bounds this actor's tracked remote cache capacity, together with ``cpu_bytes``; it is not a Mooncake cluster quota. At capacity, a new page is skipped and one least-recently-used owned object is scheduled for deletion. Only one deletion runs at a time, after outstanding LMCache writes drain; sustained traffic with new prefixes can therefore skip many new pages. Mooncake manages actual storage capacity and eviction; ``global_segment_size`` is the memory this client contributes. ``disk_path`` and ``disk_bytes`` apply only to filesystem storage and are rejected with Mooncake. ``protocol=\"rdma\"`` additionally requires working RDMA hardware and drivers; LMCache registers the eagerly allocated L1 buffer."
+msgstr "``storage_bytes`` は ``cpu_bytes`` と合わせて、この actor が追跡するリモートキャッシュ容量を制限します。容量の上限に達すると、新しいページはスキップされ、最も長く使われていない所有オブジェクトを一つ削除するよう予約します。未完了の LMCache 書き込みが終了した後、一度に一つの削除だけを実行するため、新しいプレフィックスが継続して発生するトラフィックでは、多くの新規ページがスキップされる場合があります。上限のあるバックグラウンドの退避処理中は、新しいページの書き込みをスキップする場合があります。実際の容量と削除は Mooncake が管理し、``global_segment_size`` はこのクライアントが提供するメモリです。``disk_path`` と ``disk_bytes`` はファイルシステム専用で、Mooncake では拒否されます。``protocol=\"rdma\"`` には動作する RDMA ハードウェアとドライバーも必要で、LMCache は事前割り当てした L1 バッファーを登録します。"
+
+#: source/user_guide/vllm_enhancement.rst:212
+msgid "Deployment, schema and cache-salt isolation still apply. vLLM uses a distinct storage namespace per replica rank; SGLang and TRT-LLM replicas share one supervisor-owned storage actor. Other deployments' objects are not discovered, and relaunching does not recover old entries. Cache misses, unavailable reads and timeouts fall back to local prefill. Graceful shutdown drains writes and deletes only this actor's tracked namespaced objects before closing its client. If cleanup fails or the process crashes, remaining objects are subject to Mooncake's eviction policy. Cleanup never explicitly deletes other clients' keys or stops the shared service. A client contributing memory withdraws that segment on close; use ``global_segment_size=0`` with a separate storage pool to avoid this."
+msgstr "デプロイ、スキーマ、cache-salt による分離は引き続き適用されます。vLLM はレプリカの rank ごとに異なるストレージ名前空間を使用します。SGLang と TRT-LLM のレプリカは、supervisor が管理する一つのストレージ actor を共有します。他のデプロイのオブジェクトは検出されず、再起動しても古いエントリーは復元されません。キャッシュミス、読み取り不可、タイムアウト時にはローカル prefill に戻ります。正常終了では書き込み完了を待ち、この actor が追跡する名前空間付きオブジェクトだけを削除してからクライアントを閉じます。クリーンアップ失敗やプロセスクラッシュ時の残存オブジェクトには Mooncake の削除ポリシーが適用されます。他のクライアントのキーを明示的に削除したり、共有サービスを停止したりしません。メモリを提供するクライアントは終了時にそのセグメントを撤回するため、別のストレージプールと ``global_segment_size=0`` を使用してこの影響を避けてください。"
+
+#: user_guide/vllm_enhancement.rst
+msgid "Cross-engine prefix sharing"
+msgstr "エンジン間のプレフィックス共有"
+
+#: user_guide/vllm_enhancement.rst
+msgid ""
+"Ordinary replicas can share cached prefixes across vLLM, SGLang, TRT-LLM and"
+" MLX. Each replica still handles complete requests: a later request on "
+"SGLang can reuse a prefix computed by vLLM, and vice versa. Enable Xavier "
+"and select an engine for each replica; no prefill/decode roles are needed."
+msgstr ""
+"通常のレプリカは vLLM、SGLang、TRT-LLM、MLX "
+"間でキャッシュ済みプレフィックスを共有できます。各レプリカは完全なリクエストを処理し、SGLang の後続リクエストは vLLM "
+"が計算したプレフィックスを再利用でき、その逆も可能です。Xavier を有効にして各レプリカのエンジンを選択します。prefill/decode "
+"ロールは不要です。"
+
+#: user_guide/vllm_enhancement.rst
+msgid ""
+"All replicas must use identical local checkpoint and tokenizer files, "
+"effective context limits and unquantized full-attention models. "
+"vLLM/SGLang/MLX combinations support FP16 Qwen2, Qwen3 and Llama text "
+"models. A topology containing TRT-LLM requires BF16 dense Qwen3 on every "
+"replica. Use one worker and one device per replica; existing engine version "
+"requirements apply."
+msgstr ""
+"全レプリカで同じローカル重みとトークナイザーファイル、有効なコンテキスト上限、非量子化の全注意モデルを使用してください。vLLM/SGLang/MLX "
+"の組み合わせは FP16 の Qwen2、Qwen3、Llama テキストモデルをサポートします。TRT-LLM を含む場合、全レプリカで BF16 "
+"の密な Qwen3 が必要です。各レプリカは 1 Worker・1 デバイスで動作し、既存のバージョン要件が適用されます。"
+
+#: user_guide/vllm_enhancement.rst
+msgid ""
+"For MLX, set its replica's ``engine_config`` to include "
+"``model_format=\"mlx\"`` and its local ``model_path``. Use the original "
+"unconverted checkpoint on the Mac. Engine-specific options belong in "
+"``engine_config``; worker-local paths may also be set there for CUDA "
+"replicas. Configure the same effective context limit for every engine."
+msgstr ""
+"MLX レプリカの ``engine_config`` に ``model_format=\"mlx\"`` とローカルの ``model_path``"
+" を指定してください。Mac では変換していない元の重みを使用します。エンジン固有の設定と CUDA Worker のローカルパスも "
+"``engine_config`` に指定できます。全エンジンの有効なコンテキスト上限を一致させてください。"
+
+#: user_guide/vllm_enhancement.rst
+msgid ""
+"Xavier stores immutable, complete 64-token pages in a supervisor-owned CPU "
+"cache and transfers them through actor RPC. ``xavier_cache_bytes`` bounds "
+"this shared pool (default: 512 MiB), excluding model weights, engine caches "
+"and in-flight copies. Partial tails and the final prompt token are computed "
+"locally. Misses, eviction and unavailable storage fall back to local "
+"prefill. Incompatible models fail configuration before sharing pages."
+msgstr ""
+"Xavier は Supervisor の CPU キャッシュに不変の完全な 64-token ページを保存し、actor RPC "
+"で転送します。``xavier_cache_bytes`` は共有プールの上限（既定 512 "
+"MiB）で、重み、エンジンキャッシュ、転送中のコピーを含みません。端数とプロンプトの最終 token "
+"はローカル計算します。未命中、追い出し、ストレージ障害時はローカル prefill に戻ります。互換性のないモデルは共有前の設定で拒否されます。"
+
+#: user_guide/vllm_enhancement.rst
+msgid ""
+"This mode uses the native backend. LMCache/Mooncake storage and retained GPU"
+" history are not supported for cross-engine sharing. Quantization, sharded "
+"KV, LoRA, speculation, multimodal input and hybrid attention remain "
+"unsupported. TRT-LLM retains its existing ``cache_salt`` restriction; vLLM, "
+"SGLang and MLX preserve request-scoped isolation."
+msgstr ""
+"このモードは native バックエンドを使います。エンジン間共有では LMCache/Mooncake と GPU "
+"履歴の保持は未対応です。量子化、KV 分割、LoRA、推測デコード、マルチモーダル入力、ハイブリッド注意も未対応です。TRT-LLM の既存の "
+"``cache_salt`` 制限は維持され、vLLM、SGLang、MLX はリクエスト単位で分離されます。"
+
+#: user_guide/vllm_enhancement.rst
+msgid "Measure repeated-prefix TTFT against local prefill on the receiving engine. CPU copies and network transfer can exceed prefill cost for short prefixes. Use cached-token usage to confirm reuse on every engine. The ``imported_pages`` counter reports completed imports only for vLLM and TRT-LLM receivers; SGLang and MLX receivers use cached-token usage instead. Response correctness alone does not prove a cache hit."
+msgstr "受信側エンジンのローカル prefill と比較して、繰り返すプレフィックスの TTFT を測定してください。短いプレフィックスでは、CPU コピーとネットワーク転送のコストが prefill を上回る場合があります。すべてのエンジンでキャッシュ済みトークンの使用量を確認し、再利用を検証してください。``imported_pages`` カウンターは vLLM と TRT-LLM の受信側で完了したインポートのみを記録します。SGLang と MLX の受信側では、代わりにキャッシュ済みトークンの使用量を確認してください。応答が正しいだけではキャッシュヒットの証明になりません。"
+
+#: user_guide/vllm_enhancement.rst
+msgid "Requests must use options supported by every engine in the deployment. TRT-LLM rejects tools, ``response_format``, log probabilities, ``echo`` and ``n>1``. MLX Xavier rejects structured ``response_format``, forced tool choice and thinking budgets. Otherwise, success can depend on which replica receives the request."
+msgstr "リクエストには、デプロイ内のすべてのエンジンが対応するオプションを使用してください。TRT-LLM はツール、``response_format``、対数確率、``echo``、``n>1`` を拒否します。MLX Xavier は構造化された ``response_format``、ツール選択の強制、思考予算を拒否します。これらを使用すると、リクエストの成否が処理するレプリカに依存する場合があります。"
+
+#: source/user_guide/vllm_enhancement.rst
+msgid "LMCache history for P/D"
+msgstr "P/D 用 LMCache 履歴キャッシュ"
+
+#: source/user_guide/vllm_enhancement.rst
+msgid "Select ``xavier_cache_backend=\"lmcache\"`` and pass the backend configuration above when launching Xavier P/D roles. Prefill can run on vLLM, SGLang, TRT-LLM or MLX, including cross-engine deployments. Decode keeps the existing Xavier handoff and does not access LMCache. Native NIXL deployments cannot use this option."
+msgstr "Xavier P/D ロールの起動時に ``xavier_cache_backend=\"lmcache\"`` と上記のバックエンド設定を指定します。Prefill は vLLM、SGLang、TRT-LLM、MLX に対応し、エンジン間の構成も可能です。Decode は既存の Xavier 引き渡しを使用し、LMCache にアクセスしません。ネイティブ NIXL 構成では使用できません。"
+
+#: source/user_guide/vllm_enhancement.rst
+msgid "P restores compatible historical prefix pages before computing the remaining prompt. Owned CPU snapshots enter a worker-local write queue bounded by ``cpu_bytes`` per P replica; LMCache writes run in the background. A full queue or failed write drops optional history. Missing or failed reads compute locally, while live P/D transfer failures still raise errors. CPU snapshot packing and local enqueueing remain part of prefill latency; asynchronous writes do not remove those costs."
+msgstr "P は互換性のある履歴プレフィックスページを復元してから残りのプロンプトを計算します。独立した CPU スナップショットは worker ローカルの書き込みキューに入り、各 P レプリカの上限は ``cpu_bytes`` です。LMCache 書き込みはバックグラウンドで実行されます。キューが満杯または書き込み失敗の場合、任意の履歴データを破棄します。読み取りの欠落や失敗はローカル計算に戻りますが、live P/D 転送の失敗はエラーになります。CPU スナップショットのパックとローカルのキュー投入は prefill 遅延に含まれ、非同期書き込みでもこのコストは残ります。"
+
+#: source/user_guide/vllm_enhancement.rst
+msgid "One shared LMCache history store runs on the first CUDA worker; install ``xinference[xavier-lmcache]`` in that worker's environment. All-MLX groups require a Linux model-service host for the store. Each P replica adds a bounded CPU write queue and owned read buffers; SGLang also allocates its native HiCache host pool. Include these allocations in addition to the LMCache memory budgets above. Disk paths belong to the storage host."
+msgstr "共有 LMCache 履歴ストアは最初の CUDA worker 上で動作します。その worker 環境に ``xinference[xavier-lmcache]`` をインストールしてください。MLX のみの構成にはストア用の Linux モデルサービスホストが必要です。各 P レプリカには上限付き CPU 書き込みキューと独立した読み取りバッファーが追加され、SGLang はネイティブ HiCache ホストプールも確保します。上記 LMCache のメモリ予算に加えてこれらも計算してください。ディスクパスはストレージホスト上のパスです。"
+
+#: user_guide/vllm_enhancement.rst:248
+msgid ""
+"This option uses the canonical P/D model contract and its model, dtype, "
+"single-device and 64-token page restrictions, even for same-engine CUDA "
+"groups. CUDA P/D also uses the canonical request path, which rejects "
+"logprobs and structured outputs (``guided_*``, ``structured_outputs``, "
+"``json_schema`` and JSON ``response_format``). See "
+":ref:`user_guide_pd_separation`. Engine-local prefix reuse remains available"
+" on vLLM, SGLang and MLX P. TRT-LLM isolates native prefix reuse per request"
+" and uses LMCache for historical reuse. Different cache salts remain "
+"isolated; TRT-LLM's existing rejection of ``cache_salt`` is unchanged. "
+"Historical entries are scoped to the deployment and are not recovered after "
+"relaunch."
+msgstr ""
+"このオプションでは、同一エンジンの CUDA 構成でも、標準化された P/D モデル契約と、そのモデル、dtype、単一デバイス、64 "
+"トークンページの制限が適用されます。CUDA P/D は標準化されたリクエスト経路も使用し、logprobs "
+"と構造化出力（``guided_*``、``structured_outputs``、``json_schema``、JSON "
+"``response_format``）を受け付けません。:ref:`user_guide_pd_separation` "
+"を参照してください。vLLM、SGLang、MLX の P ではエンジンローカルのプレフィックス再利用を引き続き使用できます。TRT-LLM "
+"はネイティブのプレフィックス再利用をリクエストごとに分離し、履歴の再利用には LMCache を使います。異なる cache salt "
+"は分離され、TRT-LLM が ``cache_salt`` "
+"を拒否する既存の動作は変わりません。履歴エントリはデプロイ単位で、再起動後には復元されません。"
+
+#: source/user_guide/vllm_enhancement.rst
+msgid "For MLX prefill, ``xavier_cache_bytes`` still bounds live host handoff pages independently of LMCache. CUDA P/D may omit ``xavier_gpu_cache_bytes`` or set it to ``0``; retained Xavier GPU history is disabled with this backend."
+msgstr "MLX prefill の ``xavier_cache_bytes`` は、LMCache とは独立して live ホスト引き渡しページを制限します。CUDA P/D の ``xavier_gpu_cache_bytes`` は省略するか ``0`` に設定できます。このバックエンドでは Xavier GPU 履歴を保持しません。"
+
+#: user_guide/vllm_enhancement.rst:250
+msgid ""
+"On vLLM P, each scheduler-side history RPC has a one-second deadline; "
+"``read_timeout`` bounds the proxy's storage work."
+msgstr ""
+"vLLM P では、スケジューラー側の各履歴 RPC の期限は 1 秒です。``read_timeout`` "
+"はプロキシのストレージ処理の待機時間を制限します。"

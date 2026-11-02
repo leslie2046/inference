@@ -373,16 +373,25 @@ msgstr "Modèle et moteur"
 
 #: ../source/user_guide/zero_downtime_upgrade.rst:137
 msgid ""
-"Open a running model's detail view and choose **Reconfigure / upgrade model**. Engine "
-"replacement requires **Keep GPU weights for reload** (``enable_weight_cache=true``) at"
-" launch, vLLM 0.31.0+ or SGLang 0.5.21+, Linux with CUDA or ROCm, one Worker, one "
-"replica and fixed tensor parallelism."
+"Open a running model's detail view and choose **Reconfigure / upgrade "
+"model**. Engine replacement requires GPU weight retention enabled at launch,"
+" either automatically on a supported configuration or explicitly with "
+"``enable_weight_cache=True``. See :ref:`launch_weight_cache_reload` for "
+"prerequisites and the **Auto**, **Enabled** and **Disabled** settings. "
+"Multiple replicas are supported: each keeps its own weight cache, and model "
+"reload updates them sequentially. See the linked guide for partial failures,"
+" retries and scale-out."
 msgstr ""
-"Ouvrez la vue détaillée d’un modèle en cours d’exécution et choisissez **Reconfigure /"
-" upgrade model**. Le remplacement du moteur nécessite l’activation de **Keep GPU "
-"weights for reload** (``enable_weight_cache=true``) au lancement, vLLM 0.31.0+ ou "
-"SGLang 0.5.21+, Linux avec CUDA ou ROCm, un Worker, une réplique et un parallélisme "
-"tensoriel fixe."
+"Ouvrez les détails d’un modèle en cours d’exécution et choisissez "
+"**Reconfigurer / mettre à niveau le modèle**. Le remplacement du moteur "
+"nécessite la conservation des poids sur GPU activée au démarrage, "
+"automatiquement dans une configuration compatible ou explicitement avec "
+"``enable_weight_cache=True``. Consultez :ref:`launch_weight_cache_reload` "
+"pour les conditions et les réglages **Automatique**, **Activé** et "
+"**Désactivé**. Plusieurs répliques sont prises en charge : chacune conserve "
+"son propre cache de poids et le rechargement les met à jour successivement. "
+"Consultez le guide lié pour les échecs partiels, les nouvelles tentatives et"
+" l’ajout de répliques."
 
 #: ../source/user_guide/zero_downtime_upgrade.rst:149
 msgid ""
@@ -705,3 +714,56 @@ msgid ""
 msgstr ""
 "Recherchez à nouveau les mises à jour pour confirmer que tous les composants"
 " affichent la nouvelle version."
+
+#: ../source/user_guide/zero_downtime_upgrade.rst:21
+msgid "An extension can optionally require controller sessions for Worker management RPCs. Callers must attach the versioned session and an operation ID; normal Supervisors do not add them automatically. A newer session is acknowledged only after management work drains, and failed drain keeps old sessions fenced. The provider must validate current authority on every check. Election and endpoint discovery are separate responsibilities. Worker replacement and model reload are rejected in this mode until session/resource transfer is supported. Without a provider, normal upgrade behavior is unchanged."
+msgstr "Une extension peut exiger des sessions de contrôleur pour les RPC de gestion des Workers. Les appelants doivent joindre une session versionnée et un identifiant d’opération ; les Supervisors ordinaires ne les ajoutent pas automatiquement. Une nouvelle session est confirmée uniquement après la fin des opérations de gestion en cours ; si cette attente échoue, les anciennes sessions restent bloquées. Le fournisseur doit vérifier l’autorité actuelle à chaque validation. L’élection et la découverte des points d’accès relèvent de mécanismes distincts. Dans ce mode, le remplacement des Workers et le rechargement des modèles sont refusés tant que le transfert des sessions et des ressources n’est pas pris en charge. Sans fournisseur, le comportement habituel des mises à niveau reste inchangé."
+
+#: ../../source/user_guide/zero_downtime_upgrade.rst:23
+msgid "Session metadata is also required through same-process ActorRefs. Startup recovery records are retained until an active session is installed. If installation happens during fencing or reconciliation, retry ``install_controller_session`` after activation to resume recovery. Recovery interrupted by a newer session preserves unfinished records."
+msgstr "Les métadonnées de session sont également requises via les ActorRef du même processus. Les enregistrements de récupération au démarrage sont conservés jusqu’à l’installation d’une session active. Si l’installation a lieu pendant le fencing ou la réconciliation, réessayez ``install_controller_session`` après l’activation pour reprendre la récupération. Une interruption par une nouvelle session conserve les enregistrements inachevés."
+
+#: ../../source/user_guide/zero_downtime_upgrade.rst:25
+msgid "Worker-owned crash recovery and pending cache inventory publication acquire active-session admission for new events; already admitted operations keep their original session. Model OOM reports update only diagnostics for the current model incarnation and do not authorize management commands. Admitted termination finishes cleanup of its original model registration before drain completes. Interrupted native faults retain their intent and retry under active-session admission during installation or a later status report. This mechanism covers public management methods; private Python helpers remain internal. Lightweight heartbeats continue before session installation, during draining and after a drain timeout; they never register the Worker or resume recovery. Full status reports and their registration/recovery work still require active-session admission."
+msgstr "La récupération après panne propre au Worker et la publication en attente de l’inventaire du cache obtiennent une admission sous session active pour chaque nouvel événement ; les opérations déjà admises conservent leur session initiale. Les rapports OOM ne mettent à jour que les diagnostics de l’instance actuelle du modèle et n’autorisent aucune commande de gestion. Une terminaison déjà admise nettoie les ressources de son enregistrement de modèle initial avant la fin du drainage. Les traitements de panne natifs interrompus conservent leur intention et sont réessayés après admission par une session active, lors de son installation ou d’un rapport d’état ultérieur. Ce mécanisme couvre les méthodes publiques de gestion ; les fonctions auxiliaires Python privées restent internes. Les battements de cœur légers continuent avant l’installation de la session, pendant le drainage et après son expiration ; ils n’enregistrent jamais le Worker et ne reprennent pas la restauration. Les rapports d’état complets et leurs opérations d’enregistrement et de restauration nécessitent toujours l’admission par une session active."
+msgid "A Supervisor authority provider can implement ``create_supervisor_control_authority(context)`` with a fixed process session, ``validate`` and ``close``. ``context.runtime`` supplies process-local ``pause(timeout)``, ``restore_worker(ref, replicas, incarnation)`` and ``resume()`` primitives. Optional async ``execute(operation, payload)`` and ``worker_registered(ref)`` hooks delegate extension-owned behavior. The runtime does not select Workers, probe models, confirm membership or orchestrate replacement. Old processes retain their original session. Fixed-session mode rejects native component replacement until session transfer is supported. These mechanisms add no failover command or HA service. Without a provider, normal upgrade behavior is unchanged. The port also provides a settings snapshot. Async provider callbacks execute on the actor loop and may overlap; providers synchronize their own services. A busy pause is rejected before management admission closes. Inference reads are unavailable before the first successful ``resume()``; afterwards, existing routes remain readable through later management pauses. Session-protected startup recovery retries outside the registration lock and retains persisted intent while access is fenced."
+msgstr "Un fournisseur d’autorité Supervisor peut implémenter ``create_supervisor_control_authority(context)`` avec une session de processus fixe, ``validate`` et ``close``. ``context.runtime`` fournit les primitives locales ``pause(timeout)``, ``restore_worker(ref, replicas, incarnation)`` et ``resume()``. Les hooks asynchrones facultatifs ``execute(operation, payload)`` et ``worker_registered(ref)`` délèguent le comportement à l’extension. Le runtime ne choisit pas les Workers, ne sonde pas les modèles, ne confirme pas les membres et n’orchestre pas leur remplacement. Les anciens processus conservent leur session. Ces mécanismes n’ajoutent aucune commande de basculement ni service HA. Sans fournisseur, le comportement normal des mises à niveau reste inchangé. Le port fournit aussi un instantané des paramètres. Les callbacks asynchrones s’exécutent sur la boucle actor et peuvent se chevaucher ; le fournisseur synchronise ses services. Une pause demandée pendant une opération est refusée avant la fermeture des admissions de gestion. Les lectures d’inférence sont indisponibles avant le premier ``resume()`` réussi ; ensuite, les routes existantes restent lisibles pendant les pauses de gestion ultérieures. La récupération au démarrage réessaie hors du verrou d’enregistrement et conserve les intentions persistées lorsque l’accès est refusé. Le mode à session fixe refuse le remplacement natif des composants tant que le transfert de session n’est pas pris en charge."
+
+#: ../../source/user_guide/zero_downtime_upgrade.rst:220
+msgid ""
+"The default for ``enable_weight_cache`` changed from ``False`` to automatic "
+"selection (``None``). Retained-weight models now support multiple replicas, "
+"scale-out and sequential reload."
+msgstr ""
+"La valeur par défaut de ``enable_weight_cache`` est passée de ``False`` à la"
+" sélection automatique (``None``). Les modèles conservant leurs poids "
+"prennent désormais en charge plusieurs répliques, leur ajout et le "
+"rechargement séquentiel."
+
+#: ../source/user_guide/zero_downtime_upgrade.rst:28
+msgid "Admitted calls can use optional asynchronous provider callbacks: ``around_supervisor_call(invocation, call)``, ``around_worker_call(invocation, call)`` and ``around_control_call(invocation, call)``. The immutable invocation describes the target, method, original control context and arguments. Await ``call()`` to execute; argument overrides preserve that context. The runtime supplies no receipts or replay policy. Worker callbacks also retain their original session when the Supervisor reference changes. Read-only ``controller_resource_state``, ``controller_catalog`` and ``control_operation_receipt`` expose observations or provider evidence; unavailable receipts raise. The local port can capture or replace catalogs and settings, list Worker references and invoke a public Supervisor method. Catalog replacement validates definitions first and does not rewrite registration files."
+msgstr "Les appels admis peuvent utiliser les rappels asynchrones facultatifs du fournisseur : ``around_supervisor_call(invocation, call)``, ``around_worker_call(invocation, call)`` et ``around_control_call(invocation, call)``. L’invocation immuable décrit la cible, la méthode, le contexte de contrôle original et les arguments. Attendez ``call()`` pour exécuter ; modifier les arguments conserve ce contexte. Le runtime ne fournit ni reçus ni politique de rejeu. Les rappels Worker conservent leur session originale lorsque la référence Supervisor change. Les méthodes en lecture seule ``controller_resource_state``, ``controller_catalog`` et ``control_operation_receipt`` exposent des observations ou des preuves du fournisseur ; un reçu indisponible produit une erreur. Le port local peut capturer ou remplacer catalogues et paramètres, lister les références Worker et appeler une méthode publique du Supervisor. Le remplacement du catalogue valide d’abord les définitions sans réécrire les fichiers d’enregistrement."
+
+#: ../source/user_guide/zero_downtime_upgrade.rst:30
+msgid "Providers can opt in to ``controller_inventory(include_services=True)`` for ready specialized replicas, shard identities and coordinator observations. Setting the authority attribute ``include_model_services=True`` includes these replicas in ordinary registration reports as well. The local port supplies ``with_service_address(address, call)``, ``model_services(model_uid)`` and ``restore_model_services(model_uid, services)`` for scoped support-actor placement and reference restoration. An optional async ``model_services_changed(model_uid)`` callback can persist completed routing changes. Default placement and registration behavior are unchanged; these primitives do not select a host or perform recovery."
+msgstr "Les fournisseurs peuvent utiliser ``controller_inventory(include_services=True)`` pour observer les réplicas spécialisés prêts, les fragments et les coordinateurs. L’attribut ``include_model_services=True`` les inclut aussi dans les rapports d’enregistrement. Le port local fournit ``with_service_address(address, call)``, ``model_services(model_uid)`` et ``restore_model_services(model_uid, services)`` pour placer les acteurs auxiliaires dans la portée de l’appel et restaurer leurs références. Le rappel asynchrone facultatif ``model_services_changed(model_uid)`` peut persister les changements de routage terminés. Le placement et l’enregistrement par défaut restent inchangés ; ces primitives ne choisissent aucun hôte et n’effectuent aucune récupération."
+
+#: ../source/user_guide/zero_downtime_upgrade.rst:32
+msgid "The optional async ``model_service_address(model_uid)`` callback selects a support-actor address for both internal and public launches."
+msgstr "Le rappel asynchrone facultatif ``model_service_address(model_uid)`` choisit l’adresse des acteurs auxiliaires pour les lancements internes et publics."
+
+#: ../source/user_guide/zero_downtime_upgrade.rst:34
+msgid "Optional ``create_model_service(actor_class, args, kwargs, address, uid)`` and ``destroy_model_service(ref)`` callbacks can delegate actor lifetime to Worker ``create_runtime_actor`` and ``destroy_runtime_actor`` management calls, which participate in session admission and draining. Without callbacks, ordinary actor creation and destruction remain unchanged."
+msgstr "Les rappels facultatifs ``create_model_service(actor_class, args, kwargs, address, uid)`` et ``destroy_model_service(ref)`` peuvent déléguer le cycle de vie aux appels de gestion Worker ``create_runtime_actor`` et ``destroy_runtime_actor``, soumis à l’admission de session et au drainage. Sans rappel, la création et la destruction ordinaires restent inchangées."
+
+
+msgid "Interceptors describe admitted method calls, not a single overall operation. Child-task cleanup and Worker recovery helpers may produce additional calls with the original command; distinguish them by target and method. Use ``call(args=..., kwargs=...)`` for explicit argument overrides. The top-level keyword mapping is copied; nested payloads are not deep copies. Actor lifetime callbacks preserve native lifetimes and original exceptions. Cleanup notification failures are logged without aborting termination."
+msgstr "Les intercepteurs décrivent des appels de méthode admis, et non une opération globale. Le nettoyage des tâches enfants et les auxiliaires de récupération Worker peuvent produire plusieurs appels avec la commande initiale ; distinguez-les par cible et méthode. Utilisez ``call(args=..., kwargs=...)`` pour remplacer explicitement les arguments. Seule la table des mots-clés de premier niveau est copiée, sans copie profonde des données imbriquées. Les callbacks de cycle de vie des acteurs conservent la durée native et les exceptions originales. Un échec de notification de nettoyage est journalisé sans interrompre la terminaison."
+
+
+msgid "``restore_worker(..., coordinators=...)`` accepts a list or tuple of ``-rank0`` UIDs, validated before registry mutation. Async ``filter_worker_inventory(ref, replicas)`` may only narrow observations; errors or its ten-second timeout reject registration before publication. Worker catalog replacement participates in management admission and draining; providers serialize snapshot selection with catalog writes. API extensions may set async ``app.state.system_settings_provider(operation, data)`` for ``get``, ``save`` and ``reset``. It owns persistence and token masking; ``ValueError`` from ``save`` returns HTTP 422."
+msgstr "``restore_worker(..., coordinators=...)`` accepte une liste ou un tuple d'UID ``-rank0``, validé avant toute modification du registre. Le callback asynchrone ``filter_worker_inventory(ref, replicas)`` ne peut que réduire les observations ; une erreur ou un délai de dix secondes rejette l'enregistrement avant publication. Le remplacement du catalogue Worker participe à l'admission et au drain ; les fournisseurs sérialisent la sélection du snapshot avec les écritures du catalogue. Les extensions API peuvent définir ``app.state.system_settings_provider(operation, data)`` asynchrone pour ``get``, ``save`` et ``reset``. Il gère la persistance et le masquage des tokens ; un ``ValueError`` de ``save`` renvoie HTTP 422."
+
+
+msgid "Providers must await ``call()`` directly in the callback task; task-spawning wrappers such as ``asyncio.wait_for`` and ``asyncio.shield`` are unsupported. Local port restore methods require provider-owned ordering while management is paused. Explicit coordinator UIDs are selected by the caller separately from replica filtering, because a Worker may host only a coordinator."
+msgstr "Les fournisseurs doivent attendre directement ``call()`` dans la tâche du callback ; les wrappers créant une tâche, tels que ``asyncio.wait_for`` et ``asyncio.shield``, ne sont pas pris en charge. Le fournisseur ordonne les méthodes de restauration du port local pendant la pause des opérations de gestion. L'appelant sélectionne les UID explicites des coordinators séparément du filtrage des réplicas, car un Worker peut héberger uniquement un coordinator."

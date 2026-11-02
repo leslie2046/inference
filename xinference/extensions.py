@@ -81,6 +81,54 @@ class LaunchHistoryStoreContext:
 
 
 @dataclass(frozen=True)
+class SupervisorJournalStoreContext:
+    """One Supervisor-owned journal and its immutable optional control session.
+
+    Stores implement synchronous load(default) and save(payload). Both use the
+    existing JSON payload schema. Failed writes must raise before returning;
+    consumers publish in-memory updates only after save succeeds. Providers may
+    enforce write authority and optimistic concurrency without changing payloads.
+    """
+
+    kind: Literal["worker_ownership", "worker_relaunch"]
+    path: str
+    address: str
+    control_session: Any = None
+
+
+@dataclass(frozen=True)
+class WorkerControlAuthorityContext:
+    """Worker identity only; an authority must not initialize an auth store.
+
+    The optional provider returns an object with validate(session, phases=...).
+    Validation may be async; synchronous validation runs in the Worker's thread
+    pool. Every call must check current authority and raise on rejection or
+    unavailability. Returning None from the factory preserves legacy admission.
+    This hook does not elect or automatically install a controller session.
+    """
+
+    address: str
+    incarnation: str
+
+
+@dataclass(frozen=True)
+class SupervisorControlAuthorityContext:
+    """Process-local runtime capabilities for an optional control extension.
+
+    Providers implement an immutable ControllerSession, validate and close.
+    Optional async execute(operation, payload) and worker_registered(ref) hooks
+    own extension behavior. runtime exposes local pause/restore/resume primitives;
+    it is not serializable. Async callbacks run on the actor loop and may
+    overlap; providers synchronize their own services. worker_registered receives
+    one reference, not a complete membership set. Synchronous hooks use a thread
+    pool. An unconfigured hook preserves ordinary behavior.
+    """
+
+    address: str
+    runtime: Any = None
+
+
+@dataclass(frozen=True)
 class ModelCatalogCredentials:
     """An ephemeral catalog token whose repr stays safe in actor call logs."""
 
@@ -208,6 +256,60 @@ def resolve_launch_history_store(context: LaunchHistoryStoreContext) -> Any:
     if not providers:
         return None
     return _call_hook(providers[0], "create_launch_history_store", context)
+
+
+def resolve_supervisor_journal_store(context: SupervisorJournalStoreContext) -> Any:
+    """Select one journal provider; only an explicit None selects local files."""
+    providers = [
+        e for e in get_extensions() if hasattr(e, "create_supervisor_journal_store")
+    ]
+    if len(providers) > 1:
+        raise ValueError("Multiple Supervisor journal store providers")
+    if not providers:
+        return None
+    store = _call_hook(providers[0], "create_supervisor_journal_store", context)
+    if store is not None and not all(
+        callable(getattr(store, name, None)) for name in ("load", "save")
+    ):
+        raise TypeError("Supervisor journal store must implement load and save")
+    return store
+
+
+def resolve_worker_control_authority(context: WorkerControlAuthorityContext) -> Any:
+    providers = [
+        e for e in get_extensions() if hasattr(e, "create_worker_control_authority")
+    ]
+    if len(providers) > 1:
+        raise ValueError("Multiple worker control authority providers")
+    if not providers:
+        return None
+    authority = _call_hook(providers[0], "create_worker_control_authority", context)
+    if authority is not None and not callable(getattr(authority, "validate", None)):
+        raise TypeError("Worker control authority must implement validate")
+    return authority
+
+
+def resolve_supervisor_control_authority(
+    context: SupervisorControlAuthorityContext,
+) -> Any:
+    providers = [
+        e for e in get_extensions() if hasattr(e, "create_supervisor_control_authority")
+    ]
+    if len(providers) > 1:
+        raise ValueError("Multiple Supervisor control authority providers")
+    if not providers:
+        return None
+    authority = _call_hook(providers[0], "create_supervisor_control_authority", context)
+    if authority is not None:
+        from .core.control_session import ControllerSession
+
+        if not isinstance(
+            getattr(authority, "session", None), ControllerSession
+        ) or not all(
+            callable(getattr(authority, name, None)) for name in ("validate", "close")
+        ):
+            raise TypeError("Invalid Supervisor control authority")
+    return authority
 
 
 def resolve_model_catalog_credentials(

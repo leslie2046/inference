@@ -148,6 +148,9 @@ export type ModelEngineItem = {
   multimodal_projectors?: string[];
   quantization?: string;
   quantizations?: string[];
+  runtime_precisions?: string[];
+  default_runtime_precision?: string;
+  default_model_config?: Record<string, unknown>;
   /** whether this engine can run a drafter for speculative decoding */
   support_draft_model?: boolean;
 };
@@ -166,6 +169,40 @@ export interface ReplicaItem {
   accelerators?: string[] | null;
   replica_uid?: string;
   gpu_idx?: number[];
+}
+
+export interface ModelInstanceInfo {
+  model_uid: string;
+  model_name: string;
+  model_version?: string | null;
+  model_ability: ModelAbility[];
+  replica: number;
+  n_worker?: number | null;
+  status: string;
+  instance_created_ts: number;
+  replica_statuses: ReplicaItem[];
+  can_cancel_launch?: boolean;
+}
+
+export interface LaunchProgressReplica {
+  replica_id: number;
+  replica_model_uid: string;
+  progress: number;
+  stage: string;
+  info: string | null;
+  updated_at: number | null;
+  download_files: DownloadProgressFile[];
+  dependency_install_completed?: number | null;
+  dependency_install_total?: number | null;
+  dependency_install_plan?: string[] | null;
+  dependency_install_status?: 'performed' | 'skipped' | null;
+}
+
+export interface LaunchProgressResponse {
+  progress?: number | string;
+  stage?: string;
+  download_files?: DownloadProgressFile[];
+  replicas?: LaunchProgressReplica[];
 }
 
 export interface AddReplicaRequest {
