@@ -1,10 +1,263 @@
 import hashlib
 import sys
+from copy import deepcopy
 from types import SimpleNamespace
 
 import pytest
 
 from .. import core
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model_name", ["deepseek-r1", "deepseek-r1-distill-qwen"])
+async def test_tool_only_history_count_matches_generation_prompt(
+    monkeypatch, model_name
+):
+    from tokenizers import Tokenizer, models, pre_tokenizers
+    from transformers import PreTrainedTokenizerFast
+
+    from .....api.protocols import parse_anthropic_request
+    from ... import BUILTIN_LLM_FAMILIES
+
+    model = object.__new__(core.MLXChatModel)
+    model.model_family = next(
+        f for f in BUILTIN_LLM_FAMILIES if f.model_name == model_name
+    )
+    model.reasoning_parser = model.tool_parser = None
+    model.model_uid = "test"
+    model._model_config = model._model_generation_config = {}
+    tokenizer = Tokenizer(models.WordLevel({"[UNK]": 0}, unk_token="[UNK]"))
+    tokenizer.pre_tokenizer = pre_tokenizers.Whitespace()
+    model._tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=tokenizer, unk_token="[UNK]"
+    )
+    request = parse_anthropic_request(
+        {
+            "model": "test",
+            "max_tokens": 16,
+            "messages": [
+                {"role": "user", "content": "read a"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "call_read",
+                            "name": "Read",
+                            "input": {},
+                        }
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "call_read",
+                            "content": "TOOL_RESULT_42",
+                        }
+                    ],
+                },
+            ],
+        }
+    )
+    config = request.to_openai_body()
+    config.pop("model")
+    config.pop("messages")
+    original = deepcopy((request.messages, config))
+    # Counting must receive the original history, including null content.
+    rendered_messages = []
+    get_full_context = model.get_full_context
+
+    def capture_context(messages, *args, **kwargs):
+        rendered_messages.append(deepcopy(messages))
+        return get_full_context(messages, *args, **kwargs)
+
+    monkeypatch.setattr(model, "get_full_context", capture_context)
+    prepared = model.prepare_anthropic_request(request.messages, config)
+    assert rendered_messages[0][1]["content"] is None
+    assert request.messages[1]["content"] is None
+    assert (request.messages, config) == original
+    assert prepared["messages"] == request.messages
+
+    class StopBeforeGeneration(Exception):
+        pass
+
+    async def capture_prompt(prompt, generate_config):
+        assert "Read" in prompt
+        assert "TOOL_RESULT_42" in prompt
+        assert prepared["input_tokens"] == len(model._tokenizer.encode(prompt)) > 0
+        raise StopBeforeGeneration
+
+    monkeypatch.setattr(model, "async_generate", capture_prompt)
+    with pytest.raises(StopBeforeGeneration):
+        await model.async_chat(prepared["messages"], prepared["generate_config"])
+
+
+@pytest.mark.parametrize("engine", ["mlx", "vllm", "sglang", "transformers"])
+@pytest.mark.parametrize(
+    "model_name",
+    [
+        "deepseek-r1",
+        "deepseek-r1-distill-llama",
+        "deepseek-v2.5",
+        "qwenLong-l1",
+        "skywork-or1",
+        "skywork-or1-preview",
+        "Baichuan-M2",
+    ],
+)
+@pytest.mark.parametrize("content", [None, "omitted"])
+async def test_tool_only_history_generation(monkeypatch, engine, model_name, content):
+    from tokenizers import Tokenizer, models, pre_tokenizers
+    from transformers import PreTrainedTokenizerFast
+
+    from ... import BUILTIN_LLM_FAMILIES
+    from ...sglang.core import SGLANGChatModel
+    from ...transformers.core import PytorchChatModel
+    from ...vllm.core import VLLMChatModel
+
+    model_class = {
+        "mlx": core.MLXChatModel,
+        "vllm": VLLMChatModel,
+        "sglang": SGLANGChatModel,
+        "transformers": PytorchChatModel,
+    }[engine]
+    model = object.__new__(model_class)
+    model.model_family = next(
+        f for f in BUILTIN_LLM_FAMILIES if f.model_name == model_name
+    )
+    model.reasoning_parser = model.tool_parser = None
+    model.model_uid = "test"
+    model._model_config = model._model_generation_config = {}
+    tokenizer = Tokenizer(models.WordLevel({"[UNK]": 0}, unk_token="[UNK]"))
+    tokenizer.pre_tokenizer = pre_tokenizers.Whitespace()
+    model._tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=tokenizer, unk_token="[UNK]"
+    )
+    call = {
+        "role": "assistant",
+        "content": content,
+        "tool_calls": [
+            {
+                "id": "call_read",
+                "type": "function",
+                "function": {"name": "Read", "arguments": "{}"},
+            }
+        ],
+    }
+    if content == "omitted":
+        del call["content"]
+    messages = [
+        {"role": "user", "content": "read a"},
+        call,
+        {"role": "tool", "tool_call_id": "call_read", "content": "TOOL_RESULT_42"},
+    ]
+    original = deepcopy(messages)
+    prompts = []
+
+    class StopBeforeGeneration(Exception):
+        pass
+
+    async def capture_prompt(prompt, config):
+        prompts.append(prompt)
+        raise StopBeforeGeneration
+
+    if engine == "mlx":
+        monkeypatch.setattr(model, "async_generate", capture_prompt)
+        with pytest.raises(StopBeforeGeneration):
+            await model.async_chat(messages, {"max_tokens": 16})
+        prompt = prompts[0]
+    elif engine == "transformers":
+        prompt = model._get_full_prompt(messages, None, {})
+    else:
+        if engine == "vllm":
+
+            async def get_tokenizer(lora_request):
+                return model._tokenizer
+
+            monkeypatch.setattr(model, "_get_tokenizer", get_tokenizer)
+        prompt = (await model._prepare_chat_inputs(messages, {}))[0]
+    assert "Read" in prompt
+    assert "TOOL_RESULT_42" in prompt
+    assert model.count_tokens(messages) == len(model._tokenizer.encode(prompt)) > 0
+    assert messages == original
+
+
+@pytest.mark.parametrize(
+    "model_name",
+    ["QwQ-32B", "deepseek-r1-0528", "marco-o1", "Baichuan-M2", "internlm3-instruct"],
+)
+@pytest.mark.parametrize("path", ["tool-only", "with-text", "chat"])
+def test_anthropic_tool_history_preparation(model_name, path):
+    from tokenizers import Tokenizer, models, pre_tokenizers
+    from transformers import PreTrainedTokenizerFast
+
+    from .....api.protocols import parse_anthropic_request
+    from ....scheduler.request import InferenceRequest
+    from ... import BUILTIN_LLM_FAMILIES
+    from ...transformers.core import PytorchChatModel
+
+    model = object.__new__(PytorchChatModel)
+    model.model_family = next(
+        f for f in BUILTIN_LLM_FAMILIES if f.model_name == model_name
+    )
+    model.reasoning_parser = model.tool_parser = None
+    model._context_length = 8192
+    tokenizer = Tokenizer(models.WordLevel({"[UNK]": 0}, unk_token="[UNK]"))
+    tokenizer.pre_tokenizer = pre_tokenizers.Whitespace()
+    model._tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=tokenizer, unk_token="[UNK]"
+    )
+    assistant = [{"type": "tool_use", "id": "call_read", "name": "Read", "input": {}}]
+    if path == "with-text":
+        assistant.insert(0, {"type": "text", "text": "Reading a."})
+    canonical = parse_anthropic_request(
+        {
+            "model": "test",
+            "max_tokens": 16,
+            "tools": [{"name": "Read", "input_schema": {"type": "object"}}],
+            "messages": [
+                {"role": "user", "content": "read a"},
+                {"role": "assistant", "content": assistant},
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "call_read",
+                            "content": "TOOL_RESULT_42",
+                        }
+                    ],
+                },
+            ],
+        }
+    )
+    config = canonical.to_openai_body()
+    config.pop("model")
+    config.pop("messages")
+    original = deepcopy((canonical.messages, config))
+    assert canonical.messages[1]["content"] == (
+        "Reading a." if path == "with-text" else None
+    )
+    if path == "chat":
+        request = InferenceRequest(canonical.messages, None, True, "chat", config)
+        request.sanitized_generate_config = {"max_tokens": 16, "stream_interval": 1}
+        model.prepare_batch_inference([request])
+        assert request.error_msg is None
+        assert "TOOL_RESULT_42" in request.full_prompt
+    else:
+        prepared = model.prepare_anthropic_request(canonical.messages, config)
+        prompt = model.get_full_context(
+            model.prefill_messages(deepcopy(canonical.messages)),
+            model.model_family.chat_template,
+            tokenizer=model._tokenizer,
+            tools=config["tools"],
+        )
+        assert "TOOL_RESULT_42" in prompt
+        assert prepared["input_tokens"] == len(model._tokenizer.encode(prompt)) > 0
+        assert prepared["messages"] == canonical.messages
+    assert (canonical.messages, config) == original
 
 
 @pytest.mark.parametrize("start,end", [("analysis", "final"), ("<think>", None)])

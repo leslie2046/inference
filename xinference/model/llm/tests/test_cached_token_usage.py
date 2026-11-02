@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# CI: linux
+
 import json
 import sys
 from types import ModuleType, SimpleNamespace
@@ -58,6 +60,11 @@ def model_factory(engine, monkeypatch):
             monkeypatch.setattr(core, "VLLM_INSTALLED", False)
             monkeypatch.setattr(core, "VLLM_VERSION", Version("0.5.0"))
             model = object.__new__(core.VLLMModel)
+            model.model_family = SimpleNamespace(
+                model_name="test-model",
+                model_family="test-model",
+                has_architecture=lambda _: False,
+            )
             model._nixl_config = model._xavier_config = None
             model.reasoning_parser = None
 
@@ -211,6 +218,19 @@ async def test_stream_cached_tokens_reach_final_and_usage_chunks(
     assert events[-1]["response"]["usage"]["input_tokens_details"] == {
         "cached_tokens": cached_tokens
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream_options", [{}, {"include_obfuscation": False}])
+async def test_stream_options_without_include_usage(model_factory, stream_options):
+    # OpenAI's stream_options may omit include_usage; it defaults to false.
+    stream = await model_factory(0).async_generate(
+        "prompt",
+        {"max_tokens": 2, "stream": True, "stream_options": stream_options},
+    )
+    chunks = [chunk async for chunk in stream]
+    assert chunks
+    assert all(chunk["choices"] for chunk in chunks)
 
 
 @pytest.mark.asyncio

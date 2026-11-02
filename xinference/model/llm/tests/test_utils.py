@@ -22,6 +22,7 @@ import pytest
 from ..core import chat_context_var
 from ..reasoning_parser import ReasoningParser
 from ..tool_parsers.deepseek_v4_tool_parser import DeepseekV4ToolParser
+from ..tool_parsers.glm4_tool_parser import Glm4ToolParser
 from ..tool_parsers.llama3_tool_parser import Llama3ToolParser
 from ..tool_parsers.qwen_tool_parser import QwenToolParser
 from ..utils import ChatModelMixin
@@ -291,6 +292,140 @@ def test_to_chat_completion_chunks_usage_only_chunk_without_metadata():
             "total_tokens": 5,
         },
     }
+
+
+@pytest.mark.parametrize("stream_mode", ["sync", "async"])
+@pytest.mark.parametrize("chunk_format", ["text_completion", "chat.completion.chunk"])
+@pytest.mark.parametrize(
+    "scenario", ["plain-content", "tool", "content-then-tool", "reasoning-then-tool"]
+)
+async def test_stream_chunks_keep_completion_id(stream_mode, chunk_format, scenario):
+    mixin = ChatModelMixin()
+    mixin.model_uid = "test-model"
+    mixin.model_family = None
+    mixin.tool_parser = QwenToolParser() if scenario != "plain-content" else None
+    mixin.reasoning_parser = (
+        ReasoningParser(True, "<think>", "</think>", auto_insert_start_tag=False)
+        if scenario == "reasoning-then-tool"
+        else None
+    )
+    if scenario == "plain-content":
+        texts = ["Hello", " world"]
+    else:
+        texts = [
+            '<tool_call>\n{"name": "get_weather", "arguments":',
+            '{"city": "Beijing"}}\n</tool_call>',
+            '<tool_call>\n{"name": "get_weather", "arguments":',
+            '{"city": "Shanghai"}}\n</tool_call>',
+        ]
+        if scenario == "content-then-tool":
+            texts.insert(0, "Let me check. ")
+        elif scenario == "reasoning-then-tool":
+            texts[:0] = ["<think>", "need the tool", "</think>Let me check. "]
+    base = {
+        "id": (
+            "cmpl-engine-stream-1"
+            if chunk_format == "text_completion"
+            else "chatcmpl-engine-stream-1"
+        ),
+        "object": chunk_format,
+        "model": "test-model",
+        "created": 123,
+    }
+    chunks = []
+    for text in texts + [""]:
+        choice = {
+            "index": 0,
+            "finish_reason": "stop" if len(chunks) == len(texts) else None,
+        }
+        if chunk_format == "text_completion":
+            choice["text"] = text
+        else:
+            choice["delta"] = {"content": text}
+        chunks.append({**base, "choices": [choice]})
+    usage = {"prompt_tokens": 3, "completion_tokens": len(texts)}
+    usage["total_tokens"] = sum(usage.values())
+    # Exercise the fallback identity for a usage chunk without engine metadata.
+    chunks.append({"choices": [], "usage": usage})
+
+    if stream_mode == "sync":
+        if mixin.tool_parser:
+            results = list(mixin._to_tool_completion_chunks(iter(chunks)))
+        else:
+            results = list(mixin._to_chat_completion_chunks(iter(chunks)))
+    else:
+
+        async def source():
+            for chunk in chunks:
+                yield chunk
+
+        if mixin.tool_parser:
+            stream = mixin._async_to_tool_completion_chunks(source())
+        else:
+            stream = mixin._async_to_chat_completion_chunks(source())
+        results = [chunk async for chunk in stream]
+
+    assert results[-1]["choices"] == []
+    assert results[-1]["usage"] == usage
+    assert results[-2]["choices"][0]["finish_reason"] == (
+        "tool_calls" if mixin.tool_parser else "stop"
+    )
+    deltas = [choice["delta"] for chunk in results for choice in chunk["choices"]]
+    if mixin.tool_parser:
+        call_ids = [
+            call["id"]
+            for delta in deltas
+            for call in delta.get("tool_calls", [])
+            if "id" in call
+        ]
+        assert len(call_ids) == len(set(call_ids)) == 2
+        assert "chatcmpl-engine-stream-1" not in call_ids
+    else:
+        assert "".join(delta.get("content") or "" for delta in deltas) == "Hello world"
+    if mixin.reasoning_parser:
+        assert (
+            "".join(delta.get("reasoning_content") or "" for delta in deltas)
+            == "need the tool"
+        )
+    assert {chunk["id"] for chunk in results} == {"chatcmpl-engine-stream-1"}
+
+
+@pytest.mark.parametrize("chunk_id", ["engine-stream-1", "cmpl-engine-stream-1"])
+def test_post_process_completion_chunk_keeps_chatglm_explicit_id(chunk_id):
+    mixin = ChatModelMixin()
+    mixin.tool_parser = Glm4ToolParser()
+    base = {"id": chunk_id, "model": "test-model", "created": 123}
+    results = mixin._get_first_chat_completion_chunk(
+        {**base, "choices": [{"text": "", "index": 0, "finish_reason": None}]}
+    )
+    tool_chunk = mixin._post_process_completion_chunk(
+        None,
+        "test-model",
+        {
+            "id": "chatcmpl-ignored",
+            "object": "chat.completion.chunk",
+            "name": "get_weather",
+            "arguments": '{"city": "Beijing"}',
+            "choices": [{}],
+        },
+        chunk_id=chunk_id,
+    )
+    assert tool_chunk is not None
+    assert tool_chunk["choices"][0]["delta"]["tool_calls"][0]["id"] != tool_chunk["id"]
+    results.append(tool_chunk)
+    results.append(
+        mixin._get_usage_chat_completion_chunk(
+            {
+                **base,
+                "usage": {
+                    "prompt_tokens": 3,
+                    "completion_tokens": 2,
+                    "total_tokens": 5,
+                },
+            }
+        )
+    )
+    assert {chunk["id"] for chunk in results} == {"chat" + chunk_id}
 
 
 def test_to_chat_completion_propagates_logprobs():
@@ -1135,6 +1270,89 @@ def test_transform_messages_preserves_tool_call_fields():
     }
 
 
+@pytest.mark.parametrize("model_name", ["MiniCPM-V-2.6", "MiniCPM-V-4.5"])
+@pytest.mark.parametrize("with_system", [False, True])
+@pytest.mark.parametrize("add_generation_prompt", [False, True])
+@pytest.mark.parametrize(
+    "content, expected_content",
+    [
+        ("Before middle after", "Before middle after"),
+        (
+            [
+                {"type": "text", "text": "Before "},
+                {"type": "text", "text": "middle"},
+                {"type": "text", "text": " after"},
+            ],
+            "Before middle after",
+        ),
+        (
+            [
+                {"type": "text", "text": "Before "},
+                {"type": "image_url", "image_url": {"url": "image-one.png"}},
+                {"type": "text", "text": " between "},
+                {"type": "image_url", "image_url": {"url": "image-two.png"}},
+                {"type": "text", "text": " after"},
+            ],
+            "Before (<image>./</image>) between (<image>./</image>) after",
+        ),
+    ],
+    ids=["string", "text-parts", "image-parts"],
+)
+def test_minicpmv_chat_template_content(
+    model_name, with_system, add_generation_prompt, content, expected_content
+):
+    from copy import deepcopy
+
+    from .. import BUILTIN_LLM_FAMILIES
+
+    family = next(f for f in BUILTIN_LLM_FAMILIES if f.model_name == model_name)
+    mixin = ChatModelMixin()
+    mixin.model_family = family
+    string_messages = [
+        {"role": "user", "content": expected_content},
+        {"role": "assistant", "content": " Earlier reply.\n"},
+        {"role": "user", "content": "Next question."},
+    ]
+    if with_system:
+        string_messages.insert(0, {"role": "system", "content": "Keep text in order."})
+    messages = deepcopy(string_messages)
+    messages[1 if with_system else 0]["content"] = content
+    if isinstance(content, list):
+        # vLLM/SGLang normalize content before rendering the catalog template.
+        messages = mixin._transform_messages(messages)
+
+    # Snapshot of the original catalog template, shared by both model families.
+    original_template = (
+        "{% for message in messages %}"
+        "{% if loop.first and messages[0]['role'] != 'system' %}"
+        "{{ '<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n' }}"
+        "{% endif %}"
+        "{{'<|im_start|>' + message['role'] + '\n' + message['content'] "
+        "+ '<|im_end|>' + '\n'}}"
+        "{% endfor %}{% if add_generation_prompt %}"
+        "{{ '<|im_start|>assistant\n' }}{% endif %}"
+    )
+    expected = mixin.get_full_context(
+        string_messages,
+        original_template,
+        add_generation_prompt=add_generation_prompt,
+    )
+    assert (
+        mixin.get_full_context(
+            string_messages,
+            family.chat_template,
+            add_generation_prompt=add_generation_prompt,
+        )
+        == expected
+    )
+    assert (
+        mixin.get_full_context(
+            messages, family.chat_template, add_generation_prompt=add_generation_prompt
+        )
+        == expected
+    )
+
+
 @pytest.mark.parametrize("model_name", ["Qwen3-VL-Instruct", "Qwen3-VL-Thinking"])
 @pytest.mark.parametrize("protocol", ["openai", "anthropic"])
 def test_qwen3_vl_renders_tool_only_history(model_name, protocol):
@@ -1459,6 +1677,125 @@ def test_chat_template_kwargs_string_normalizes_thinking():
     )
 
     assert kwargs == {"thinking": True, "enable_thinking": True}
+
+
+@pytest.mark.parametrize("tokenizer_template", [False, True])
+@pytest.mark.parametrize(
+    "model_name,on_mode,off_mode",
+    [("Baichuan-M2", "on", "off"), ("MiniMax-M3", "enabled", "disabled")],
+)
+def test_enable_thinking_renders_native_thinking_mode(
+    model_name: str, on_mode: str, off_mode: str, tokenizer_template: bool
+) -> None:
+    from tokenizers import Tokenizer, models
+    from transformers import PreTrainedTokenizerFast
+
+    from .. import BUILTIN_LLM_FAMILIES
+
+    family = next(f for f in BUILTIN_LLM_FAMILIES if f.model_name == model_name)
+    mixin = ChatModelMixin()
+    mixin.model_family = family
+    messages = [{"role": "user", "content": "What is 2 + 2?"}]
+    tokenizer = None
+    if tokenizer_template:
+        tokenizer = PreTrainedTokenizerFast(
+            tokenizer_object=Tokenizer(
+                models.WordLevel({"[UNK]": 0}, unk_token="[UNK]")
+            ),
+            unk_token="[UNK]",
+            chat_template=family.chat_template,
+        )
+
+    def render(**kwargs) -> str:
+        context = (
+            mixin._get_chat_template_kwargs_from_generate_config(
+                {"chat_template_kwargs": kwargs}
+            )
+            or {}
+        )
+        return mixin.get_full_context(
+            messages,
+            None if tokenizer_template else family.chat_template,
+            tokenizer=tokenizer,
+            **context,
+        )
+
+    native_on = render(thinking_mode=on_mode)
+    native_off = render(thinking_mode=off_mode)
+    assert native_on != native_off
+    assert render(enable_thinking=True) == native_on
+    assert render(enable_thinking=False) == native_off
+    assert render(enable_thinking=False, thinking_mode=on_mode) == native_on
+    assert render(enable_thinking=True, thinking_mode=off_mode) == native_off
+    if model_name == "MiniMax-M3":
+        adaptive = render(thinking_mode="adaptive")
+        assert render(enable_thinking=True, thinking_mode="adaptive") == adaptive
+        assert render(enable_thinking=False, thinking_mode="adaptive") == adaptive
+
+
+@pytest.mark.parametrize("enable_thinking", [False, True])
+def test_enable_thinking_preserves_qwen3_template(enable_thinking: bool) -> None:
+    from .. import BUILTIN_LLM_FAMILIES
+
+    family = next(f for f in BUILTIN_LLM_FAMILIES if f.model_name == "qwen3")
+    chat_template = family.chat_template
+    assert chat_template is not None
+    mixin = ChatModelMixin()
+    mixin.model_family = family
+    messages = [{"role": "user", "content": "What is 2 + 2?"}]
+    prompt = mixin.get_full_context(
+        messages, chat_template, enable_thinking=enable_thinking
+    )
+
+    assert prompt == mixin._build_from_raw_template(
+        messages, chat_template, enable_thinking=enable_thinking
+    )
+    suffix = "<|im_start|>assistant\n"
+    if not enable_thinking:
+        suffix += "<think>\n\n</think>\n\n"
+    assert prompt.endswith(suffix)
+
+
+@pytest.mark.parametrize(
+    "template_kwargs",
+    [
+        {"enable_thinking": True, "thinking": True},
+        {"enable_thinking": False, "thinking": False},
+        {},
+    ],
+    ids=["thinking-true", "thinking-false", "omitted"],
+)
+def test_qwen2_vl_forwards_chat_template_kwargs(monkeypatch, template_kwargs):
+    import sys
+    from unittest.mock import Mock
+
+    from ..transformers.multimodal.qwen2_vl import Qwen2VLChatModel
+
+    processor = Mock(return_value=SimpleNamespace(to=lambda device: None))
+    processor.apply_chat_template.return_value = "prompt"
+    monkeypatch.setitem(
+        sys.modules,
+        "qwen_vl_utils",
+        SimpleNamespace(process_vision_info=lambda messages: (None, None)),
+    )
+    model = object.__new__(Qwen2VLChatModel)
+    model._processor = processor
+    model._device = "cpu"
+    model.reasoning_parser = None
+    generate_config = (
+        {"chat_template_kwargs": template_kwargs} if template_kwargs else {}
+    )
+
+    model.build_inputs_from_messages(
+        [{"role": "user", "content": "hello"}], generate_config
+    )
+
+    processor.apply_chat_template.assert_called_once_with(
+        [{"role": "user", "content": [{"type": "text", "text": "hello"}]}],
+        tokenize=False,
+        add_generation_prompt=True,
+        **template_kwargs,
+    )
 
 
 def test_post_process_completion_chunk_without_thinking():
@@ -3755,3 +4092,226 @@ def test_raw_template_can_omit_generation_prefix():
         model._build_from_raw_template(messages, template, add_generation_prompt=False)
         == "hello"
     )
+
+
+@pytest.mark.parametrize("tokenizer_template", [False, True])
+@pytest.mark.parametrize("content", [None, "omitted", ""])
+@pytest.mark.parametrize("string_content", [False, True])
+def test_tool_history_template_content_normalization(
+    tokenizer_template, content, string_content
+):
+    from copy import deepcopy
+
+    from tokenizers import Tokenizer, models
+    from transformers import PreTrainedTokenizerFast
+
+    # A positive null-content guard must see null (including omitted content).
+    # String-only templates must receive empty content before rendering.
+    template = (
+        "{% for message in messages %}"
+        + ("{{ message.content + ':' }}" if string_content else "")
+        + "{% if message['role'] == 'assistant' and "
+        + (
+            "message['content'] == ''"
+            if string_content
+            else "message['content'] is none"
+        )
+        + " %}{{ message.tool_calls[0].function.name }}{% endif %}{% endfor %}"
+        "{% if add_generation_prompt %}ASSISTANT{% endif %}"
+    )
+    messages = [
+        {
+            "role": "assistant",
+            "content": content,
+            "tool_calls": [{"function": {"name": "Read", "arguments": "{}"}}],
+        }
+    ]
+    if content == "omitted":
+        del messages[0]["content"]
+    original = deepcopy(messages)
+    model = ChatModelMixin()
+    model.model_family = SimpleNamespace(model_name="test", model_ability=["chat"])
+    tokenizer = None
+    if tokenizer_template:
+        tokenizer = PreTrainedTokenizerFast(
+            tokenizer_object=Tokenizer(
+                models.WordLevel({"[UNK]": 0}, unk_token="[UNK]")
+            ),
+            unk_token="[UNK]",
+            chat_template=template,
+        )
+    prompt = model.get_full_context(
+        model.prefill_messages(messages),
+        None if tokenizer_template else template,
+        tokenizer=tokenizer,
+        add_generation_prompt=False,
+    )
+    assert ("Read" in prompt) == (string_content or content != "")
+    assert "ASSISTANT" not in prompt
+    assert messages == original
+
+
+@pytest.mark.parametrize("tokenizer_template", [False, True])
+@pytest.mark.parametrize("content", [None, "omitted"])
+def test_tool_history_trim_does_not_render_none(tokenizer_template, content):
+    from copy import deepcopy
+
+    from tokenizers import Tokenizer, models
+    from transformers import PreTrainedTokenizerFast
+
+    template = (
+        "{{ messages[0].content | trim }}"
+        "{{ messages[0].tool_calls[0].function.name }}"
+    )
+    messages = [
+        {
+            "role": "assistant",
+            "content": content,
+            "tool_calls": [{"function": {"name": "Read", "arguments": "{}"}}],
+        }
+    ]
+    if content == "omitted":
+        del messages[0]["content"]
+    original = deepcopy(messages)
+    model = ChatModelMixin()
+    model.model_family = SimpleNamespace(model_name="test", model_ability=["chat"])
+    tokenizer = None
+    if tokenizer_template:
+        tokenizer = PreTrainedTokenizerFast(
+            tokenizer_object=Tokenizer(
+                models.WordLevel({"[UNK]": 0}, unk_token="[UNK]")
+            ),
+            unk_token="[UNK]",
+            chat_template=template,
+        )
+    assert (
+        model.get_full_context(
+            model.prefill_messages(messages),
+            None if tokenizer_template else template,
+            tokenizer=tokenizer,
+        )
+        == "Read"
+    )
+    assert messages == original
+
+
+@pytest.mark.parametrize("selection", ["default", "tool_use", "named", "override"])
+@pytest.mark.parametrize("null_content", [False, True])
+@pytest.mark.parametrize("content", [None, "omitted", ""])
+def test_tool_history_uses_selected_tokenizer_template(
+    selection, null_content, content
+):
+    from copy import deepcopy
+
+    from tokenizers import Tokenizer, models
+    from transformers import PreTrainedTokenizerFast
+
+    null_template = (
+        "{% for message in messages %}"
+        "{% if message['role'] == 'assistant' and message['content'] is none %}"
+        "{{ message.tool_calls[0].function.name }}{% endif %}{% endfor %}"
+    )
+    string_template = (
+        "{{ messages[0].content | trim }}"
+        "{{ messages[0].tool_calls[0].function.name }}"
+    )
+    selected = null_template if null_content else string_template
+    other = string_template if null_content else null_template
+    templates = {"default": other, "tool_use": other, "named": other}
+    if selection != "override":
+        templates[selection] = selected
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=Tokenizer(models.WordLevel({"[UNK]": 0}, unk_token="[UNK]")),
+        unk_token="[UNK]",
+        chat_template=templates,
+    )
+    messages = [
+        {
+            "role": "assistant",
+            "content": content,
+            "tool_calls": [{"function": {"name": "Read", "arguments": "{}"}}],
+        }
+    ]
+    if content == "omitted":
+        del messages[0]["content"]
+    original = deepcopy(messages)
+    model = ChatModelMixin()
+    model.model_family = SimpleNamespace(model_name="test", model_ability=["chat"])
+    chat_template = {"named": "named", "override": selected}.get(selection)
+    prompt = model.get_full_context(
+        model.prefill_messages(messages),
+        chat_template,
+        tokenizer=tokenizer,
+        tools=[] if selection == "tool_use" else None,
+    )
+    assert prompt == ("" if null_content and content == "" else "Read")
+    assert messages == original
+
+
+@pytest.mark.parametrize("role", ["assistant", "user", "tool"])
+@pytest.mark.parametrize("tool_calls", [None, [], [{"function": {"name": "Read"}}]])
+@pytest.mark.parametrize("content", [None, "omitted", "", "text", [{"text": "image"}]])
+def test_prefill_messages_defers_only_assistant_tool_calls(role, tool_calls, content):
+    from copy import deepcopy
+
+    message = {"role": role, "content": content}
+    if content == "omitted":
+        del message["content"]
+    if tool_calls is not None:
+        message["tool_calls"] = tool_calls
+    original = deepcopy(message)
+    expected = content
+    if content is None or content == "omitted":
+        expected = None if role == "assistant" and tool_calls else ""
+    assert ChatModelMixin.prefill_messages([message])[0]["content"] == expected
+    assert message == original
+
+
+@pytest.mark.parametrize("content", [None, ""])
+def test_tool_history_normalization_preserves_template_errors(content):
+    model = ChatModelMixin()
+    messages = [
+        {
+            "role": "assistant",
+            "content": content,
+            "tool_calls": [{"function": {"name": "Read"}}],
+        }
+    ]
+    with pytest.raises(TypeError):
+        model._build_from_raw_template(messages, "{{ 1 + 'invalid' }}")
+
+
+@pytest.mark.parametrize("tokenizer_template", [False, True])
+@pytest.mark.parametrize("error", ["{{ 1 + 'invalid' }}", "{{ missing() }}"])
+def test_null_tool_content_does_not_retry_template_errors(tokenizer_template, error):
+    from jinja2.exceptions import UndefinedError
+    from tokenizers import Tokenizer, models
+    from transformers import PreTrainedTokenizerFast
+
+    template = (
+        "{% for message in messages %}"
+        "{% if message['role'] == 'assistant' and message['content'] is none %}"
+        "{{ message.tool_calls[0].function.name }}" + error + "{% endif %}{% endfor %}"
+    )
+    model = ChatModelMixin()
+    model.model_family = SimpleNamespace(model_name="test", model_ability=["chat"])
+    tokenizer = None
+    if tokenizer_template:
+        tokenizer = PreTrainedTokenizerFast(
+            tokenizer_object=Tokenizer(
+                models.WordLevel({"[UNK]": 0}, unk_token="[UNK]")
+            ),
+            unk_token="[UNK]",
+            chat_template=template,
+        )
+    messages = [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{"function": {"name": "Read", "arguments": "{}"}}],
+        }
+    ]
+    with pytest.raises(UndefinedError if "missing" in error else TypeError):
+        model.get_full_context(
+            messages, None if tokenizer_template else template, tokenizer=tokenizer
+        )

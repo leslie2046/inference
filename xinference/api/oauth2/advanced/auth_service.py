@@ -132,11 +132,18 @@ except (TypeError, ValueError):
 
 
 class AdvancedAuthService:
-    def __init__(self, db_path: str, jwt_secret_key: str, encryption_key: str):
+    def __init__(
+        self,
+        db_path: str,
+        jwt_secret_key: str,
+        encryption_key: str,
+        *,
+        api_key_cache_enabled: bool = True,
+    ):
         self._db = create_auth_store(db_path)
         self._jwt_secret_key = jwt_secret_key
         self._encryption_key = derive_encryption_key(encryption_key)
-        self._cache = ApiKeyCache(self._db)
+        self._cache = ApiKeyCache(self._db, enabled=api_key_cache_enabled)
         self._db.get_or_create_setup_token()
 
         try:
@@ -502,9 +509,8 @@ class AdvancedAuthService:
 
         # Look up key in cache (including disabled/expired) for proper (IP, Key) ban handling
         _key_hash = sha256_hex(token)
-        api_key_entry = self._cache.get(_key_hash)
+        api_key_entry, user_obj = self._cache.get_with_user(_key_hash)
         if api_key_entry:
-            user_obj = self._db.get_user_by_id(api_key_entry.user_id)
             _username = user_obj["username"] if user_obj else ""
 
             if not api_key_entry.is_valid():
@@ -624,6 +630,7 @@ class AdvancedAuthService:
                 key_prefix=api_key_entry.key_prefix,
                 auth_type="api_key",
             )
+            request.state.authenticated_api_key = api_key_entry
             return user_obj
 
         # Token not found in API key cache — check prefix

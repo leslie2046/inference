@@ -22,6 +22,8 @@ import logging
 import multiprocessing
 import os
 import pprint
+import re
+import socket
 import struct
 import time
 import uuid
@@ -87,7 +89,11 @@ from ..constants import (
     is_metrics_disabled,
 )
 from ..core.event import Event, EventCollectorActor, EventType
-from ..core.exceptions import InvalidAudioInputError, ModelNotReadyError
+from ..core.exceptions import (
+    InvalidAudioInputError,
+    InvalidModelRequestError,
+    ModelNotReadyError,
+)
 from ..core.http_protocol import create_hardened_http_protocol
 from ..core.replica_config import ReplicaConfig
 from ..core.rpc_context import actor_call, correlate_model_ref
@@ -154,6 +160,21 @@ from .streaming_outcome import (
 from .utils import get_request_route_path, require_model
 
 logger = logging.getLogger(__name__)
+
+
+def _parse_kwargs(kwargs: Optional[str]) -> Dict[str, Any]:
+    if kwargs is None:
+        return {}
+    try:
+        parsed_kwargs = json.loads(kwargs)
+    except (TypeError, ValueError) as e:
+        raise HTTPException(
+            status_code=400, detail="kwargs must be a valid JSON object"
+        ) from e
+    if not isinstance(parsed_kwargs, dict):
+        raise HTTPException(status_code=400, detail="kwargs must be a JSON object")
+    return parsed_kwargs
+
 
 # One base64-encoded 512 MiB media reference plus bounded JSON/config overhead.
 _MAX_WORLD_REQUEST_BYTES = ((512 * 1024 * 1024 + 2) // 3) * 4 + 1024 * 1024
@@ -476,13 +497,26 @@ async def _cleanup_model_stream(
                 or isinstance(model_iterator, IteratorWrapper)
             ):
                 try:
-                    await model.decrease_serve_count()
+                    await _release_model_stream(model, model_iterator)
                 except (asyncio.CancelledError, Exception):
                     logger.exception(
                         "Failed to release serve count for %s request %s",
                         kind,
                         request_id,
                     )
+
+
+async def _release_model_stream(model, iterator) -> None:
+    """Release the slot on the actor that actually admitted this iterator."""
+    from xoscar.api import IteratorWrapper
+
+    if isinstance(iterator, IteratorWrapper):
+        model = iterator._actor_ref
+        if model is None:
+            model = await xo.actor_ref(
+                address=iterator._actor_addr, uid=iterator._actor_uid
+            )
+    await model.decrease_serve_count()
 
 
 def _request_credential(request: Request) -> str:
@@ -740,6 +774,8 @@ class RESTfulAPI(CancelMixin):
         supervisor_address: str,
         host: str,
         port: int,
+        *,
+        api_key_cache_enabled: bool = True,
     ):
         super().__init__()
         self._supervisor_address = supervisor_address
@@ -778,16 +814,27 @@ class RESTfulAPI(CancelMixin):
                 db_path=XINFERENCE_AUTH_DB_PATH,
                 jwt_secret_key=jwt_secret_key,
                 encryption_key=encryption_key,
+                api_key_cache_enabled=api_key_cache_enabled,
             )
             self._auth_service = self._advanced_auth_service
             setup_token = self._advanced_auth_service.setup_token
             if setup_token is not None:
                 _log_setup_required_notice(setup_token)
 
-        from ..core.launch_history_store import LaunchHistoryStore
+        from ..core.launch_history_store import create_launch_history_store
+        from ..core.model_favorites_store import create_model_favorites_store
 
-        self._launch_history_store = LaunchHistoryStore(
-            XINFERENCE_LAUNCH_HISTORY_DB_PATH
+        self._model_favorites_store = create_model_favorites_store(
+            XINFERENCE_AUTH_DB_PATH,
+            self._advanced_auth_service.db if self._advanced_auth_service else None,
+        )
+
+        self._launch_history_store = create_launch_history_store(
+            XINFERENCE_LAUNCH_HISTORY_DB_PATH,
+            service="api",
+            auth_store=(
+                self._advanced_auth_service.db if self._advanced_auth_service else None
+            ),
         )
 
         from ..core.monitor_config_store import MonitorConfigStore
@@ -858,9 +905,15 @@ class RESTfulAPI(CancelMixin):
         token = _request_credential(request)
         if not token:
             return
-        if not self._advanced_auth_service.validate_model_access(
-            token, model_uid, model_type
-        ):
+        entry = getattr(request.state, "authenticated_api_key", None)
+        allowed = (
+            entry.has_model_access(model_uid, model_type)
+            if entry is not None
+            else self._advanced_auth_service.validate_model_access(
+                token, model_uid, model_type
+            )
+        )
+        if not allowed:
             request.state._audit_model_uid = model_uid
             request.state._audit_model_type = model_type or ""
             request.state.audit_status = "denied"
@@ -882,18 +935,12 @@ class RESTfulAPI(CancelMixin):
     ):
         if not self._advanced_auth_service:
             return
-        token = _request_credential(request)
-        if not token:
+        identity = getattr(request.state, "audit_identity", {}) or {}
+        if identity.get("auth_type") != "api_key":
             return
-        from .oauth2.advanced.crypto import sha256_hex
-
-        key_hash = sha256_hex(token)
-        entry = self._advanced_auth_service.cache.get(key_hash)
-        if not entry:
-            return
-
-        user = self._advanced_auth_service.db.get_user_by_id(entry.user_id)
-        username = user["username"] if user else ""
+        username = identity.get("user", "")
+        api_key_name = identity.get("api_key_name", "")
+        api_key_prefix = identity.get("api_key_prefix", "")
 
         model_name = (
             getattr(request.state, "model_name", "")
@@ -906,8 +953,8 @@ class RESTfulAPI(CancelMixin):
 
         record_audit_event(
             user=username,
-            api_key_name=entry.name or "",
-            api_key_prefix=entry.key_prefix,
+            api_key_name=api_key_name,
+            api_key_prefix=api_key_prefix,
             model_id=model_uid,
             model_name=model_name,
             model_type=model_type,
@@ -927,7 +974,7 @@ class RESTfulAPI(CancelMixin):
             _requests_total.inc(
                 {
                     "user": username,
-                    "api_key_name": entry.name or "",
+                    "api_key_name": api_key_name,
                     "model_id": model_uid,
                     "model_name": model_name,
                     "model_type": model_type,
@@ -1059,13 +1106,81 @@ class RESTfulAPI(CancelMixin):
         return response
 
     @staticmethod
-    def handle_request_limit_error(e: Exception):
+    def handle_request_limit_error(e: Exception, *, sanitize: bool = False):
         from ..model.llm.context_length import ContextLengthExceeded
 
-        if isinstance(e, ContextLengthExceeded):
-            raise HTTPException(status_code=400, detail=str(e))
-        if "Rate limit reached" in str(e):
-            raise HTTPException(status_code=429, detail=str(e))
+        message = str(e)
+        context_error = isinstance(e, ContextLengthExceeded)
+        if sanitize and (
+            isinstance(e, ValueError)
+            or (
+                type(e).__module__ == "vllm.exceptions"
+                and type(e).__name__ == "VLLMValidationError"
+            )
+        ):
+            # Recognize vLLM's native validation type without importing the
+            # optional engine. Match known prompt-length forms, but never echo
+            # worker text (which can contain credentials as well as actor IDs).
+            context_error = context_error or bool(
+                re.search(
+                    r"The (?:decoder|encoder) prompt \(length \d+\) "
+                    r"(?:is longer than|plus the number of requested output tokens "
+                    r"\(at least 1\) is longer than) the maximum model length of \d+\.",
+                    message,
+                )
+            )
+        if sanitize and isinstance(e, ValueError):
+            if re.search(
+                r"(?:Invalid|Empty) (?:base64 )?data URI"
+                r"(?: for (?:image_url|video_url))?$",
+                message,
+            ):
+                raise HTTPException(status_code=400, detail="Invalid media data URI.")
+            if message.endswith(
+                (
+                    "This vLLM V1 version does not support cache_salt",
+                    "cache_salt on legacy vLLM requires Xavier",
+                    "cache_salt is not supported by this model engine",
+                )
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail="The model backend does not support cache_salt for this request.",
+                )
+        if context_error:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Request exceeds the model's configured context length."
+                    if sanitize
+                    else str(e)
+                ),
+            )
+        if "Rate limit reached" in message or (
+            sanitize and isinstance(e, HTTPException) and e.status_code == 429
+        ):
+            raise HTTPException(
+                status_code=429, detail="Rate limit reached" if sanitize else str(e)
+            )
+
+    @staticmethod
+    def _chat_completion_error_detail() -> str:
+        """Return a client-safe error while preserving the original in logs/events."""
+        return "The chat completion request failed. Check the server logs for details."
+
+    @staticmethod
+    def _count_multimodal_items(messages: List[dict], item_type: str) -> int:
+        count = 0
+        for message in messages:
+            content = message.get("content") if isinstance(message, dict) else None
+            if not isinstance(content, list):
+                continue
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                if item.get("type") == f"{item_type}_url" or item_type in item:
+                    count += 1
+        return count
 
     @staticmethod
     def _set_trace_model(model_uid: Optional[str]) -> None:
@@ -1280,7 +1395,13 @@ class RESTfulAPI(CancelMixin):
             headers=response_headers,
         )
 
-    def serve(self, logging_conf: Optional[dict] = None):
+    def serve(
+        self,
+        logging_conf: Optional[dict] = None,
+        *,
+        server_factory: Optional[Callable[[Config], Server]] = None,
+        sockets: Optional[List[socket.socket]] = None,
+    ):
         # Optional fastapi-guard security middleware (no-op when disabled).
         # Attached FIRST so it nests INSIDE both CORS and the audited IP
         # middleware (Starlette runs the last-added middleware outermost):
@@ -1406,6 +1527,10 @@ class RESTfulAPI(CancelMixin):
         invalid_routes = []
         try:
             for router in self._router.routes:
+                from starlette.routing import WebSocketRoute
+
+                if isinstance(router, WebSocketRoute):
+                    continue
                 return_annotation = router.endpoint.__annotations__.get("return")
                 # Resolve string annotations (e.g. under __future__ annotations)
                 if isinstance(return_annotation, str):
@@ -1474,8 +1599,11 @@ class RESTfulAPI(CancelMixin):
             timeout_keep_alive=XINFERENCE_HTTP_TIMEOUT_KEEP_ALIVE,
             limit_concurrency=XINFERENCE_HTTP_LIMIT_CONCURRENCY,
         )
-        server = Server(config)
-        server.run()
+        server = (server_factory or Server)(config)
+        if sockets is None:
+            server.run()
+        else:
+            server.run(sockets=sockets)
 
     async def _cluster_metrics_update_loop(self):
         """Periodically refresh Supervisor-side Prometheus Gauges (every 15s)."""
@@ -1614,6 +1742,10 @@ class RESTfulAPI(CancelMixin):
         try:
             models = await (await self._get_supervisor_ref()).list_models()
 
+            if model_id not in models:
+                raise HTTPException(
+                    status_code=404, detail=f"Model not found: {model_id}"
+                )
             model_info = models[model_id]
 
             # Convert to Anthropic format
@@ -1697,6 +1829,7 @@ class RESTfulAPI(CancelMixin):
             "model_path",
             "enable_virtual_env",
             "virtual_env_packages",
+            "model_python_executable",
             "virtual_env_find_links",
             "envs",
             "replica_config",
@@ -1815,13 +1948,32 @@ class RESTfulAPI(CancelMixin):
             logger.error(str(e), exc_info=True)
             raise HTTPException(status_code=500, detail=str(e))
 
-    async def get_model_reload_config(self, model_uid: str) -> JSONResponse:
+    async def get_model_reload_config(
+        self, model_uid: str, request: Request
+    ) -> JSONResponse:
         try:
             result = await (await self._get_supervisor_ref()).get_model_reload_config(
                 model_uid
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        auth = self.__dict__.get("_advanced_auth_service")
+        allowed = True
+        if auth is not None:
+            from fastapi.security import SecurityScopes
+
+            user = await auth(
+                request,
+                SecurityScopes(scopes=["models:list"]),
+                _request_credential(request),
+            )
+            allowed = "admin" in user.get("permissions", []) and not getattr(
+                request.state, "authenticated_api_key", None
+            )
+        result = dict(result)
+        result["can_upgrade_environment"] = allowed
+        if not allowed:
+            result.pop("python_executable", None)
         return JSONResponse(content=result)
 
     async def get_model_reload_status(self, model_uid: str) -> JSONResponse:
@@ -1843,19 +1995,36 @@ class RESTfulAPI(CancelMixin):
             if not isinstance(payload, dict) or set(payload) - {
                 "model_config",
                 "drain_timeout",
+                "python_executable",
             }:
-                raise ValueError("Expected model_config and optional drain_timeout")
-            config = payload.get("model_config")
+                raise ValueError(
+                    "Expected model_config and optional drain_timeout or python_executable"
+                )
+            from ..core.worker_relaunch import validate_relaunch_options
+
+            python_executable = payload.get("python_executable")
+            validate_relaunch_options(python_executable)
+            auth = self.__dict__.get("_advanced_auth_service")
+            if python_executable is not None and auth is not None:
+                from fastapi.security import SecurityScopes
+
+                await auth(
+                    request,
+                    SecurityScopes(scopes=["admin"]),
+                    _request_credential(request),
+                )
+            config = payload.get("model_config", {} if python_executable else None)
             metadata = await (await self._get_supervisor_ref()).get_model_reload_config(
                 model_uid
             )
             # Validate the request's shape and types before crossing the actor boundary.
-            if not isinstance(config, dict) or not config:
+            if not isinstance(config, dict) or (not config and not python_executable):
                 raise ValueError("model_config must be a non-empty object")
             if set(config) - set(metadata["parameters"]):
                 raise ValueError("Unsupported reload parameters")
             engine = metadata["engine"]
-            validate_reload_patch(engine, config)
+            if config:
+                validate_reload_patch(engine, config)
             timeout = payload.get("drain_timeout", 300)
             if (
                 type(timeout) not in (int, float)
@@ -1864,7 +2033,7 @@ class RESTfulAPI(CancelMixin):
             ):
                 raise ValueError("drain_timeout must be between 0 and 3600 seconds")
             result = await (await self._get_supervisor_ref()).reload_model(
-                model_uid, config, timeout
+                model_uid, config, timeout, python_executable=python_executable
             )
         except ModelNotReadyError as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
@@ -2934,7 +3103,7 @@ class RESTfulAPI(CancelMixin):
                             or inspect.isgenerator(iterator)
                             or isinstance(iterator, IteratorWrapper)
                         ):
-                            await model.decrease_serve_count()
+                            await _release_model_stream(model, iterator)
 
             anthropic_events = anthropic_stream_events(
                 physical_chunks(),
@@ -3163,7 +3332,7 @@ class RESTfulAPI(CancelMixin):
                 or inspect.isgenerator(iterator)
                 or isinstance(iterator, IteratorWrapper)
             ):
-                await model.decrease_serve_count()
+                await _release_model_stream(model, iterator)
 
         cleanup_task: asyncio.Task[None] | None = None
 
@@ -3314,8 +3483,11 @@ class RESTfulAPI(CancelMixin):
         )
 
     async def create_embedding(self, request: Request) -> Response:
-        payload = await request.json()
-        body = CreateEmbeddingRequest.parse_obj(payload)
+        try:
+            payload = await request.json()
+            body = CreateEmbeddingRequest.parse_obj(payload)
+        except (TypeError, ValueError) as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
         model_uid = body.model
         self._set_trace_model(model_uid)
         self._set_trace_model_type("embedding")
@@ -3346,8 +3518,11 @@ class RESTfulAPI(CancelMixin):
             raise HTTPException(status_code=500, detail=str(e))
 
     async def convert_ids_to_tokens(self, request: Request) -> Response:
-        payload = await request.json()
-        body = CreateEmbeddingRequest.parse_obj(payload)
+        try:
+            payload = await request.json()
+            body = CreateEmbeddingRequest.parse_obj(payload)
+        except (TypeError, ValueError) as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
         model_uid = body.model
         self._set_trace_model(model_uid)
         self._set_trace_model_type("embedding")
@@ -3374,22 +3549,22 @@ class RESTfulAPI(CancelMixin):
             raise HTTPException(status_code=500, detail=str(e))
 
     async def rerank(self, request: Request) -> Response:
-        payload = await request.json()
-        body = RerankRequest.parse_obj(payload)
+        try:
+            payload = await request.json()
+            body = RerankRequest.parse_obj(payload)
+        except (TypeError, ValueError) as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
         model_uid = body.model
         self._set_trace_model(model_uid)
         self._set_trace_model_type("rerank")
         self._check_model_access(request, model_uid, "rerank")
+        parsed_kwargs = _parse_kwargs(body.kwargs)
 
         model = await require_model(
             self._get_supervisor_ref, model_uid, self._report_error_event
         )
 
         try:
-            if body.kwargs is not None:
-                parsed_kwargs = json.loads(body.kwargs)
-            else:
-                parsed_kwargs = {}
             scores = await model.rerank(
                 body.documents,
                 body.query,
@@ -3452,15 +3627,12 @@ class RESTfulAPI(CancelMixin):
         self._set_trace_model(model_uid)
         self._set_trace_model_type("audio")
         self._check_model_access(request, model_uid, "audio")
+        parsed_kwargs = _parse_kwargs(kwargs)
         model_ref = await require_model(
             self._get_supervisor_ref, model_uid, self._report_error_event
         )
 
         try:
-            if kwargs is not None:
-                parsed_kwargs = json.loads(kwargs)
-            else:
-                parsed_kwargs = {}
             transcription = await model_ref.transcriptions(
                 audio=await file.read(),
                 language=language,
@@ -3500,15 +3672,12 @@ class RESTfulAPI(CancelMixin):
         self._set_trace_model(model_uid)
         self._set_trace_model_type("audio")
         self._check_model_access(request, model_uid, "audio")
+        parsed_kwargs = _parse_kwargs(kwargs)
         model_ref = await require_model(
             self._get_supervisor_ref, model_uid, self._report_error_event
         )
 
         try:
-            if kwargs is not None:
-                parsed_kwargs = json.loads(kwargs)
-            else:
-                parsed_kwargs = {}
             translation = await model_ref.translations(
                 audio=await file.read(),
                 language=language,
@@ -3536,24 +3705,24 @@ class RESTfulAPI(CancelMixin):
             None, media_type="application/octet-stream"
         ),
     ) -> Response:
-        if prompt_speech or prompt_latent:
-            f = await request.form()
-        else:
-            f = await request.json()
-        body = SpeechRequest.parse_obj(f)
+        try:
+            if prompt_speech or prompt_latent:
+                f = await request.form()
+            else:
+                f = await request.json()
+            body = SpeechRequest.parse_obj(f)
+        except (TypeError, ValueError) as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
         model_uid = body.model
         self._set_trace_model(model_uid)
         self._set_trace_model_type("audio")
         self._check_model_access(request, model_uid, "audio")
+        parsed_kwargs = _parse_kwargs(body.kwargs)
         model = await require_model(
             self._get_supervisor_ref, model_uid, self._report_error_event
         )
 
         try:
-            if body.kwargs is not None:
-                parsed_kwargs = json.loads(body.kwargs)
-            else:
-                parsed_kwargs = {}
             if prompt_speech is not None:
                 parsed_kwargs["prompt_speech"] = await prompt_speech.read()
             if prompt_latent is not None:
@@ -3577,7 +3746,7 @@ class RESTfulAPI(CancelMixin):
                         ):
                             yield item
                     finally:
-                        await model.decrease_serve_count()
+                        await _release_model_stream(model, out)
 
                 return EventSourceResponse(
                     media_type="application/octet-stream",
@@ -3589,8 +3758,8 @@ class RESTfulAPI(CancelMixin):
                     media_type=_audio_response_media_type(body.response_format),
                     content=out,
                 )
-        except InvalidAudioInputError as e:
-            logger.warning("Invalid speech audio for model %s: %s", model_uid, e)
+        except (InvalidAudioInputError, InvalidModelRequestError) as e:
+            logger.warning("Invalid speech request for model %s: %s", model_uid, e)
             raise HTTPException(status_code=400, detail=e.client_message) from e
         except Exception as e:
             e = await self._get_model_last_error(model.uid, e)
@@ -3600,18 +3769,21 @@ class RESTfulAPI(CancelMixin):
             raise HTTPException(status_code=500, detail=str(e))
 
     async def create_images(self, request: Request) -> Response:
-        body = TextToImageRequest.parse_obj(await request.json())
+        try:
+            body = TextToImageRequest.parse_obj(await request.json())
+        except (TypeError, ValueError) as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
         model_uid = body.model
         self._set_trace_model(model_uid)
         self._set_trace_model_type("image")
         self._check_model_access(request, model_uid, "image")
+        kwargs = _parse_kwargs(body.kwargs or None)
         model = await require_model(
             self._get_supervisor_ref, model_uid, self._report_error_event
         )
 
         request_id = None
         try:
-            kwargs = json.loads(body.kwargs) if body.kwargs else {}
             request_id = kwargs.get("request_id")
             self._add_running_task(request_id)
             image_list = await model.text_to_image(
@@ -3788,16 +3960,13 @@ class RESTfulAPI(CancelMixin):
         self._set_trace_model(model_uid)
         self._set_trace_model_type("image")
         self._check_model_access(request, model_uid, "image")
+        parsed_kwargs = _parse_kwargs(kwargs)
         model_ref = await require_model(
             self._get_supervisor_ref, model_uid, self._report_error_event
         )
 
         request_id = None
         try:
-            if kwargs is not None:
-                parsed_kwargs = json.loads(kwargs)
-            else:
-                parsed_kwargs = {}
             request_id = parsed_kwargs.get("request_id")
             self._add_running_task(request_id)
 
@@ -3848,16 +4017,13 @@ class RESTfulAPI(CancelMixin):
         self._set_trace_model(model_uid)
         self._set_trace_model_type("image")
         self._check_model_access(request, model_uid, "image")
+        parsed_kwargs = _parse_kwargs(kwargs)
         model_ref = await require_model(
             self._get_supervisor_ref, model_uid, self._report_error_event
         )
 
         request_id = None
         try:
-            if kwargs is not None:
-                parsed_kwargs = json.loads(kwargs)
-            else:
-                parsed_kwargs = {}
             request_id = parsed_kwargs.get("request_id")
             self._add_running_task(request_id)
             im = Image.open(image.file)
@@ -3899,16 +4065,13 @@ class RESTfulAPI(CancelMixin):
         self._set_trace_model(model_uid)
         self._set_trace_model_type("image")
         self._check_model_access(request, model_uid, "image")
+        parsed_kwargs = _parse_kwargs(kwargs)
         model_ref = await require_model(
             self._get_supervisor_ref, model_uid, self._report_error_event
         )
 
         request_id = None
         try:
-            if kwargs is not None:
-                parsed_kwargs = json.loads(kwargs)
-            else:
-                parsed_kwargs = {}
             request_id = parsed_kwargs.get("request_id")
             self._add_running_task(request_id)
             head = image.file.read(len(PDF_MAGIC))
@@ -4026,25 +4189,13 @@ class RESTfulAPI(CancelMixin):
         self._set_trace_model(model_uid)
         self._set_trace_model_type("image")
         self._check_model_access(request, model_uid, "image")
+        parsed_kwargs = _parse_kwargs(kwargs)
         model_ref = await require_model(
             self._get_supervisor_ref, model_uid, self._report_error_event
         )
 
         request_id = None
         try:
-            if kwargs is not None:
-                try:
-                    parsed_kwargs = json.loads(kwargs)
-                except json.JSONDecodeError:
-                    raise HTTPException(
-                        status_code=400, detail="kwargs must be a valid JSON object"
-                    )
-                if not isinstance(parsed_kwargs, dict):
-                    raise HTTPException(
-                        status_code=400, detail="kwargs must be a JSON object"
-                    )
-            else:
-                parsed_kwargs = {}
             request_id = parsed_kwargs.get("request_id")
             self._add_running_task(request_id)
             file_bytes = await file.read()
@@ -4355,18 +4506,21 @@ class RESTfulAPI(CancelMixin):
             raise HTTPException(status_code=500, detail=str(e))
 
     async def create_videos(self, request: Request) -> Response:
-        body = TextToVideoRequest.parse_obj(await request.json())
+        try:
+            body = TextToVideoRequest.parse_obj(await request.json())
+        except (TypeError, ValueError) as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
         model_uid = body.model
         self._set_trace_model(model_uid)
         self._set_trace_model_type("video")
         self._check_model_access(request, model_uid, "video")
+        kwargs = _parse_kwargs(body.kwargs or None)
         model = await require_model(
             self._get_supervisor_ref, model_uid, self._report_error_event
         )
 
         request_id = None
         try:
-            kwargs = json.loads(body.kwargs) if body.kwargs else {}
             request_id = kwargs.get("request_id")
             self._add_running_task(request_id)
             video_list = await model.text_to_video(
@@ -4380,6 +4534,9 @@ class RESTfulAPI(CancelMixin):
             logger.error(err_str)
             await self._report_error_event(model_uid, err_str)
             raise HTTPException(status_code=409, detail=err_str)
+        except InvalidModelRequestError as e:
+            logger.warning("Invalid video request for model %s: %s", model_uid, e)
+            raise HTTPException(status_code=400, detail=e.client_message) from e
         except Exception as e:
             e = await self._get_model_last_error(model.uid, e)
             logger.error(e, exc_info=True)
@@ -4402,16 +4559,13 @@ class RESTfulAPI(CancelMixin):
         self._set_trace_model(model_uid)
         self._set_trace_model_type("video")
         self._check_model_access(request, model_uid, "video")
+        parsed_kwargs = _parse_kwargs(kwargs)
         model_ref = await require_model(
             self._get_supervisor_ref, model_uid, self._report_error_event
         )
 
         request_id = None
         try:
-            if kwargs is not None:
-                parsed_kwargs = json.loads(kwargs)
-            else:
-                parsed_kwargs = {}
             if video is not None:
                 parsed_kwargs["video"] = await video.read()
             request_id = parsed_kwargs.get("request_id")
@@ -4429,6 +4583,9 @@ class RESTfulAPI(CancelMixin):
             logger.error(err_str)
             await self._report_error_event(model_uid, err_str)
             raise HTTPException(status_code=409, detail=err_str)
+        except InvalidModelRequestError as e:
+            logger.warning("Invalid video request for model %s: %s", model_uid, e)
+            raise HTTPException(status_code=400, detail=e.client_message) from e
         except Exception as e:
             e = await self._get_model_last_error(model_ref.uid, e)
             logger.error(e, exc_info=True)
@@ -4451,16 +4608,13 @@ class RESTfulAPI(CancelMixin):
         self._set_trace_model(model_uid)
         self._set_trace_model_type("video")
         self._check_model_access(request, model_uid, "video")
+        parsed_kwargs = _parse_kwargs(kwargs)
         model_ref = await require_model(
             self._get_supervisor_ref, model_uid, self._report_error_event
         )
 
         request_id = None
         try:
-            if kwargs is not None:
-                parsed_kwargs = json.loads(kwargs)
-            else:
-                parsed_kwargs = {}
             request_id = parsed_kwargs.get("request_id")
             self._add_running_task(request_id)
             video_list = await model_ref.flf_to_video(
@@ -4477,6 +4631,9 @@ class RESTfulAPI(CancelMixin):
             logger.error(err_str)
             await self._report_error_event(model_uid, err_str)
             raise HTTPException(status_code=409, detail=err_str)
+        except InvalidModelRequestError as e:
+            logger.warning("Invalid video request for model %s: %s", model_uid, e)
+            raise HTTPException(status_code=400, detail=e.client_message) from e
         except Exception as e:
             e = await self._get_model_last_error(model_ref.uid, e)
             logger.error(e, exc_info=True)
@@ -4781,6 +4938,7 @@ class RESTfulAPI(CancelMixin):
             GLM5_TOOL_CALL_FAMILY,
             KIMI_K3_TOOL_CALL_FAMILY,
             LLAMA3_TOOL_CALL_FAMILY,
+            MINICPM5_TOOL_CALL_FAMILY,
             QWEN_TOOL_CALL_FAMILY,
         )
 
@@ -4797,6 +4955,7 @@ class RESTfulAPI(CancelMixin):
             | QWEN_TOOL_CALL_FAMILY
             | GLM5_TOOL_CALL_FAMILY
             | KIMI_K3_TOOL_CALL_FAMILY
+            | MINICPM5_TOOL_CALL_FAMILY
         )
         if model_family not in total_call_family:
             if body.tools:
@@ -4823,6 +4982,31 @@ class RESTfulAPI(CancelMixin):
             except MessageRoleOrderError as ve:
                 raise HTTPException(status_code=400, detail=str(ve))
 
+        limits = None
+        if is_vllm_backend and any(
+            self._count_multimodal_items(messages, item_type)
+            for item_type in ("image", "video", "audio")
+        ):
+            try:
+                limits = await model.get_limit_mm_per_prompt()
+            except Exception:
+                logger.debug(
+                    "Cannot read multimodal limits; defer validation to the worker.",
+                    exc_info=True,
+                )
+        for item_type, limit in (limits if isinstance(limits, dict) else {}).items():
+            if type(limit) is not int or limit < 0:
+                continue
+            count = self._count_multimodal_items(messages, item_type)
+            if count > limit:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"At most {limit} {item_type}(s) may be provided in one prompt; "
+                        f"received {count}."
+                    ),
+                )
+
         if "skip_special_tokens" in raw_kwargs and is_vllm_backend:
             kwargs["skip_special_tokens"] = raw_kwargs["skip_special_tokens"]
         if body.stream:
@@ -4836,15 +5020,11 @@ class RESTfulAPI(CancelMixin):
                 observed_iterator = None
                 completed = False
                 try:
-                    try:
-                        iterator = await model.chat(
-                            messages,
-                            kwargs,
-                            **model_call_kwargs,
-                        )
-                    except RuntimeError as re:
-                        await self._report_error_event(model_uid, str(re))
-                        self.handle_request_limit_error(re)
+                    iterator = await model.chat(
+                        messages,
+                        kwargs,
+                        **model_call_kwargs,
+                    )
                     observed_iterator = observe_stream(
                         iterator,
                         get_stream_outcome_reporter(request),
@@ -4872,8 +5052,14 @@ class RESTfulAPI(CancelMixin):
                     ex = await self._get_model_last_error(model.uid, ex)
                     logger.exception("Chat completion stream got an error: %s", ex)
                     await self._report_error_event(model_uid, str(ex))
+                    try:
+                        self.handle_request_limit_error(ex, sanitize=True)
+                    except HTTPException as safe_error:
+                        detail = safe_error.detail
+                    else:
+                        detail = self._chat_completion_error_detail()
                     # https://github.com/openai/openai-python/blob/e0aafc6c1a45334ac889fe3e54957d309c3af93f/src/openai/_streaming.py#L107
-                    yield dict(data=json.dumps({"error": str(ex)}))
+                    yield dict(data=json.dumps({"error": detail}))
                     return
                 finally:
                     await _cleanup_model_stream(
@@ -4913,8 +5099,10 @@ class RESTfulAPI(CancelMixin):
                 e = await self._get_model_last_error(model.uid, e)
                 logger.error(e, exc_info=True)
                 await self._report_error_event(model_uid, str(e))
-                self.handle_request_limit_error(e)
-                raise HTTPException(status_code=500, detail=str(e))
+                self.handle_request_limit_error(e, sanitize=True)
+                raise HTTPException(
+                    status_code=500, detail=self._chat_completion_error_detail()
+                )
 
     async def recommend_model(self, request: Request) -> JSONResponse:
         from .._compat import ValidationError

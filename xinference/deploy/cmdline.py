@@ -19,7 +19,7 @@ import os
 import sys
 import time
 import warnings
-from typing import Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import click
 from click.core import ParameterSource
@@ -331,6 +331,11 @@ def supervisor(
     type=int,
     help="Specify the port number for the Xinference metrics exporter worker.",
 )
+@click.option(
+    "--replace-worker",
+    type=str,
+    help="Take over running model processes from this worker actor address on the same machine.",
+)
 def worker(
     log_level: str,
     endpoint: Optional[str],
@@ -338,7 +343,14 @@ def worker(
     worker_port: Optional[int],
     metrics_exporter_host: Optional[str],
     metrics_exporter_port: Optional[int],
+    replace_worker: Optional[str] = None,
 ):
+    from .worker_host import HOST_SOCKET
+
+    if replace_worker and not os.environ.get(HOST_SOCKET):
+        raise click.UsageError(
+            "Use POST /v1/workers/{worker_address}/relaunch to replace a managed Worker and retain its service and model processes."
+        )
     from ..core.system_settings_store import initialize_system_settings
 
     initialize_system_settings(XINFERENCE_SYSTEM_SETTINGS_PATH)
@@ -362,6 +374,11 @@ def worker(
     supervisor_internal_addr = client._get_supervisor_internal_address()
 
     address = f"{host}:{worker_port or get_next_port()}"
+    worker_options: Dict[str, Any] = {}
+    if replace_worker:
+        worker_options["replace_worker"] = replace_worker
+    if not os.environ.get(HOST_SOCKET):
+        worker_options["use_process_host"] = True
     main(
         address=address,
         supervisor_address=supervisor_internal_addr,
@@ -369,6 +386,7 @@ def worker(
         metrics_exporter_host=metrics_exporter_host,
         metrics_exporter_port=metrics_exporter_port,
         logging_conf=dict_config,
+        **worker_options,
     )
 
 
@@ -670,7 +688,8 @@ def list_cached_models(
     table_data = []
     for model in cached_models:
         row_data = [
-            str(value) if value is not None else "-" for value in model.values()
+            str(model[header]) if model.get(header) is not None else "-"
+            for header in headers
         ]
         table_data.append(row_data)
     print(tabulate(table_data, headers=headers, tablefmt="pretty"))
@@ -1253,7 +1272,7 @@ def model_list(endpoint: Optional[str], api_key: Optional[str]):
                     str(model_spec["controlnet"]),
                 ]
             )
-        elif model_spec["model_type"] == "audio":
+        elif model_spec["model_type"] in ("audio", "flexible"):
             audio_table.append(
                 [model_uid, model_spec["model_type"], model_spec["model_name"]]
             )
@@ -1374,7 +1393,7 @@ def model_terminate(
 @click.option("--model-uid", required=True, type=str)
 @click.option(
     "--model-config",
-    required=True,
+    default="{}",
     type=str,
     help="JSON object of changed engine parameters.",
 )
@@ -1384,16 +1403,23 @@ def model_terminate(
     type=click.FloatRange(min=0, min_open=True, max=3600),
 )
 @click.option("--api-key", "-ak", default=None, type=str)
+@click.option(
+    "--python-executable",
+    default=None,
+    type=str,
+    help="Installed Python executable on the model's Worker machine.",
+)
 def model_reload(
     endpoint: Optional[str],
     model_uid: str,
     model_config: str,
     drain_timeout: float,
     api_key: Optional[str],
+    python_executable: Optional[str] = None,
 ):
     try:
         config = json.loads(model_config)
-        if not isinstance(config, dict) or not config:
+        if not isinstance(config, dict) or (not config and not python_executable):
             raise ValueError("Expected a non-empty JSON object")
     except ValueError as exc:
         raise click.BadParameter(str(exc), param_hint="--model-config") from exc
@@ -1401,8 +1427,62 @@ def model_reload(
     client = RESTfulClient(base_url=endpoint, api_key=api_key)
     if api_key is None:
         client._set_token(get_stored_token(endpoint, client))
-    result = client.reload_model(model_uid, config, drain_timeout)
+    result = client.reload_model(
+        model_uid, config, drain_timeout, python_executable=python_executable
+    )
     click.echo(json.dumps(result))
+
+
+@cli.command(
+    "relaunch-api",
+    help="Restart or upgrade the distributed API without restarting models.",
+)
+@click.option("--endpoint", "-e", type=str, help="Xinference endpoint.")
+@click.option(
+    "--python-executable",
+    default=None,
+    type=str,
+    help="Prepared Python executable on the Supervisor machine.",
+)
+@click.option("--request-id", default=None, type=str)
+@click.option("--api-key", "-ak", default=None, type=str)
+def api_relaunch(
+    endpoint: Optional[str],
+    python_executable: Optional[str],
+    request_id: Optional[str],
+    api_key: Optional[str],
+):
+    endpoint = get_endpoint(endpoint)
+    client = RESTfulClient(base_url=endpoint, api_key=api_key)
+    if api_key is None:
+        client._set_token(get_stored_token(endpoint, client))
+    click.echo(json.dumps(client.relaunch_api(python_executable, request_id)))
+
+
+@cli.command(
+    "relaunch-supervisor",
+    help="Restart or upgrade the distributed Supervisor without restarting models.",
+)
+@click.option("--endpoint", "-e", type=str, help="Xinference endpoint.")
+@click.option(
+    "--python-executable",
+    default=None,
+    type=str,
+    help="Prepared Python executable on the Supervisor machine.",
+)
+@click.option("--request-id", default=None, type=str)
+@click.option("--api-key", "-ak", default=None, type=str)
+def supervisor_relaunch(
+    endpoint: Optional[str],
+    python_executable: Optional[str],
+    request_id: Optional[str],
+    api_key: Optional[str],
+):
+    endpoint = get_endpoint(endpoint)
+    client = RESTfulClient(base_url=endpoint, api_key=api_key)
+    if api_key is None:
+        client._set_token(get_stored_token(endpoint, client))
+    click.echo(json.dumps(client.relaunch_supervisor(python_executable, request_id)))
 
 
 @cli.command("generate", help="Generate text using a running LLM.")
@@ -1766,40 +1846,36 @@ def query_engine_by_model_name(
             )
             return
 
+    def normalize_model_size(size: Union[str, int]) -> str:
+        # Match sizes the way launch does: "0.5" and "0_5" are the same size.
+        return str(size).replace("_", ".")
+
     table = []
     engines = [model_engine] if model_engine is not None else list(llm_engines.keys())
     for engine in engines:
         params = llm_engines[engine]
         for param in params:
-            if (
-                (model_format is None or model_format == param["model_format"])
-                and (
-                    model_size_in_billions is None
-                    or model_size_in_billions == str(param["model_size_in_billions"])
-                )
-                and (quantization is None or quantization in param["quantizations"])
+            if (model_format is None or model_format == param["model_format"]) and (
+                model_size_in_billions is None
+                or normalize_model_size(model_size_in_billions)
+                == normalize_model_size(param["model_size_in_billions"])
             ):
-                if quantization is not None:
+                # Quantization names are matched case-insensitively, as on launch.
+                quants = [
+                    quant
+                    for quant in param["quantizations"]
+                    if quantization is None or quant.lower() == quantization.lower()
+                ]
+                for quant in quants:
                     table.append(
                         [
                             model_name,
                             engine,
                             param["model_format"],
                             param["model_size_in_billions"],
-                            quantization,
+                            quant,
                         ]
                     )
-                else:
-                    for quant in param["quantizations"]:
-                        table.append(
-                            [
-                                model_name,
-                                engine,
-                                param["model_format"],
-                                param["model_size_in_billions"],
-                                quant,
-                            ]
-                        )
     if len(table) == 0:
         print(
             f"Xinference does not support "

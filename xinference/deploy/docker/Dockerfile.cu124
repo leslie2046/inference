@@ -70,19 +70,22 @@ WORKDIR /opt/inference
 # dependencies again.
 COPY pyproject.toml build_backend.py build_web.py ./
 COPY xinference/__init__.py ./xinference/
-COPY . /opt/inference
 RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
     --mount=type=cache,target=/root/.cache/uv,sharing=locked \
     touch README.md && \
     pip install -i "$PIP_INDEX" uv && \
-    NO_WEB_UI=1 uv pip install --system --index-url "$PIP_INDEX" \
+    XINFERENCE_SKIP_MODEL_SPEC_VALIDATION=1 NO_WEB_UI=1 \
+      uv pip install --system --index-url "$PIP_INDEX" \
       --extra-index-url "$TORCH_INDEX" --index-strategy unsafe-best-match \
       --constraint /opt/requirements-runtime.txt \
       ".[otel]" transformers accelerate
 
+COPY . /opt/inference
 COPY --from=web-builder /opt/inference/xinference/ui/web/dist /opt/inference/xinference/ui/web/dist
 RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked \
-    NO_WEB_UI=1 uv pip install --system --no-deps --reinstall "."
+    NO_WEB_UI=1 uv pip install --system --no-deps --reinstall "." && \
+    uv pip check --system && \
+    python -c "import torch, torchvision, torchaudio, torchcodec, transformers, accelerate; assert torch.version.cuda == '12.4', torch.__version__"
 
 ENTRYPOINT []
 CMD ["/bin/bash"]

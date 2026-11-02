@@ -15,7 +15,9 @@ from . import (
     images,
     launch_history,
     llm,
+    model_favorites,
     models,
+    realtime,
     rerank,
     runtime_logs,
     system_settings,
@@ -34,10 +36,12 @@ def register_all_routes(api: RESTfulAPI) -> None:
     runtime_logs.register_routes(api)
     system_settings.register_routes(api)
     models.register_routes(api)
+    model_favorites.register_routes(api)
     llm.register_routes(api)
     embeddings.register_routes(api)
     rerank.register_routes(api)
     audio.register_routes(api)
+    realtime.register_routes(api)
     images.register_routes(api)
     videos.register_routes(api)
     worlds.register_routes(api)

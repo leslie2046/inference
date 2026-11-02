@@ -1,34 +1,7 @@
 name: Install Script CI
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - 'scripts/install*'
-      - 'pyproject.toml'
-      - 'scripts/check_install.py'
-      - 'scripts/manage_install.py'
-      - 'xinference/deploy/service.py'
-      - 'xinference/deploy/cmdline.py'
-      - 'xinference/deploy/test/test_service.py'
-      - 'xinference/deploy/test/test_installer.py'
-      - '.github/workflows/install-script.yaml'
-  pull_request:
-    types: ['opened', 'reopened', 'synchronize']
-    paths:
-      - 'scripts/install*'
-      - 'pyproject.toml'
-      - 'scripts/check_install.py'
-      - 'scripts/manage_install.py'
-      - 'xinference/deploy/service.py'
-      - 'xinference/deploy/cmdline.py'
-      - 'xinference/deploy/test/test_service.py'
-      - 'xinference/deploy/test/test_installer.py'
-      - '.github/workflows/install-script.yaml'
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  workflow_call:
 
 permissions:
   contents: read
@@ -101,3 +74,11 @@ jobs:
           Set-Location $env:RUNNER_TEMP
           uv run --no-project --no-config --python 3.12 --with psutil python "$env:GITHUB_WORKSPACE/scripts/check_install.py"
           if ($LASTEXITCODE -ne 0) { throw 'Native service lifecycle failed' }
+      - name: Show Windows service logs on failure
+        if: failure() && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Get-ChildItem (Join-Path $env:ProgramFiles 'Xinference/service/logs') -Filter '*.log' -ErrorAction SilentlyContinue | ForEach-Object {
+            Write-Output "--- $($_.FullName) ---"
+            Get-Content $_.FullName -Tail 100
+          }

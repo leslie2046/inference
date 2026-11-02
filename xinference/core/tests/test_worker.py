@@ -397,6 +397,66 @@ async def test_allocate_cuda_devices(setup_pool):
     assert devices == [0, 1, 2, 3, 4]
 
 
+@pytest.mark.parametrize(
+    "devices,existing,specified,n_gpu,allowed,expected",
+    [
+        ([0, 1], {0: {"a", "b"}}, {}, 2, None, [0, 1]),
+        ([0, 1], {}, {}, 2, None, [0, 1]),
+        ([0, 1], {0: {"a"}, 1: {"b"}}, {}, 2, None, [0, 1]),
+        ([0, 1], {0: {"a", "b"}}, {}, 1, None, [1]),
+        ([0, 1], {0: {"a"}}, {1: {("b", "LLM")}}, 1, None, [1]),
+        ([1, 0], {}, {}, 1, None, [0]),
+        ([0, 1, 2], {0: {"a"}}, {}, 2, [0, 2], [0, 2]),
+        ([0, 1], {}, {}, 0, None, []),
+        ([], {}, {}, 0, None, []),
+    ],
+    ids=[
+        "uneven-load",
+        "idle-control",
+        "even-load-control",
+        "single-gpu-control",
+        "running-model-tie-control",
+        "device-index-tie-control",
+        "allowed-devices-control",
+        "zero-gpu-control",
+        "no-devices-control",
+    ],
+)
+@pytest.mark.asyncio
+async def test_allocate_devices_least_loaded(
+    devices, existing, specified, n_gpu, allowed, expected
+):
+    worker = WorkerActor("test", None, SimpleNamespace(), gpu_devices=devices)
+    worker._allow_multi_replica_per_gpu = True
+    worker._gpu_to_model_uids.update(existing)
+    worker._user_specified_gpu_to_model_uids.update(specified)
+
+    assert worker.allocate_devices("new", n_gpu, allowed) == expected
+    assert (
+        sorted(dev for dev, uids in worker._gpu_to_model_uids.items() if "new" in uids)
+        == expected
+    )
+    worker.release_devices("new")
+    assert dict(worker._gpu_to_model_uids) == existing
+    assert dict(worker._user_specified_gpu_to_model_uids) == specified
+
+
+@pytest.mark.parametrize(
+    "devices,allowed", [([0, 1], None), ([0, 1, 2], [0, 2]), ([], None)]
+)
+@pytest.mark.asyncio
+async def test_allocate_devices_exceeds_available(devices, allowed):
+    worker = WorkerActor("test", None, SimpleNamespace(), gpu_devices=devices)
+    worker._allow_multi_replica_per_gpu = True
+    with pytest.raises(
+        RuntimeError, match="^Requested GPUs exceed the number of available devices$"
+    ):
+        worker.allocate_devices(
+            "new", len(devices) + 1 if allowed is None else 3, allowed
+        )
+    assert not worker._gpu_to_model_uids
+
+
 @pytest.mark.asyncio
 async def test_terminate_model_flag(setup_pool):
     pool = setup_pool
@@ -687,6 +747,7 @@ async def test_worker_heartbeat_failure_clears_cached_supervisor_refs():
     class DummyWorker:
         heartbeat = WorkerActor.heartbeat
         _run_on_actor_loop = WorkerActor._run_on_actor_loop
+        _ownership_metadata = WorkerActor._ownership_metadata
         _call_supervisor_on_actor_loop = WorkerActor._call_supervisor_on_actor_loop
         _call_supervisor = WorkerActor._call_supervisor
         _clear_supervisor_refs = WorkerActor._clear_supervisor_refs
@@ -762,6 +823,7 @@ async def test_worker_heartbeat_rpc_runs_on_actor_loop():
     class DummyWorker:
         heartbeat = WorkerActor.heartbeat
         _run_on_actor_loop = WorkerActor._run_on_actor_loop
+        _ownership_metadata = WorkerActor._ownership_metadata
         _call_supervisor_on_actor_loop = WorkerActor._call_supervisor_on_actor_loop
         _call_supervisor = WorkerActor._call_supervisor
 
@@ -803,6 +865,7 @@ async def test_worker_report_status_upload_runs_on_actor_loop(monkeypatch):
     class DummyWorker:
         report_status = WorkerActor.report_status
         _run_on_actor_loop = WorkerActor._run_on_actor_loop
+        _ownership_metadata = WorkerActor._ownership_metadata
         _call_supervisor_on_actor_loop = WorkerActor._call_supervisor_on_actor_loop
         _call_supervisor = WorkerActor._call_supervisor
 
@@ -842,6 +905,7 @@ async def test_actor_loop_dispatch_cancellation_releases_registration_lock():
 
     class DummyWorker:
         _run_on_actor_loop = WorkerActor._run_on_actor_loop
+        _ownership_metadata = WorkerActor._ownership_metadata
         _call_supervisor_on_actor_loop = WorkerActor._call_supervisor_on_actor_loop
         _call_supervisor = WorkerActor._call_supervisor
 
@@ -1003,6 +1067,30 @@ def test_prepare_virtual_env_injects_engine_vars(tmp_path):
     assert packages == ["pkgA==1.0.0", "pkgB==2.0.0"]
     assert kwargs["engine"] == "vllm"
     assert kwargs["model_engine"] == "vllm"
+
+
+@pytest.mark.parametrize("engine", ["TRT-LLM", "vllm", "Transformers"])
+@pytest.mark.parametrize("with_settings", [False, True])
+def test_prepare_virtual_env_trt_defaults_are_selected_at_launch(
+    tmp_path, monkeypatch, engine, with_settings
+):
+    manager = DummyVirtualEnvManager()
+    manager.env_path = str(tmp_path / "venv")
+    settings = (
+        VirtualEnvSettings(packages=[], inherit_pip_config=False)
+        if with_settings
+        else None
+    )
+    monkeypatch.setattr(worker_module, "get_pip_config_args", lambda: {})
+    WorkerActor._prepare_virtual_env(manager, settings, None, model_engine=engine)
+    if engine == "TRT-LLM":
+        assert len(manager.calls) == 1
+        packages, _ = manager.calls[0]
+        assert any(package.startswith("tensorrt_llm==1.2.1") for package in packages)
+    else:
+        assert not manager.calls
+    if settings is not None:
+        assert settings.packages == []
 
 
 def test_prepare_virtual_env_reports_dependency_plan_per_replica(tmp_path, monkeypatch):
@@ -3513,6 +3601,7 @@ def test_clear_supervisor_refs_does_not_remove_newer_reference():
 
     class DummyWorker:
         _clear_supervisor_refs = WorkerActor._clear_supervisor_refs
+        _ownership_metadata = WorkerActor._ownership_metadata
         _get_supervisor_ref_on_actor_loop = (
             WorkerActor._get_supervisor_ref_on_actor_loop
         )
@@ -3558,6 +3647,7 @@ def test_clear_supervisor_refs_does_not_remove_newer_same_reference_generation()
 
     class DummyWorker:
         _clear_supervisor_refs = WorkerActor._clear_supervisor_refs
+        _ownership_metadata = WorkerActor._ownership_metadata
         _get_supervisor_ref_on_actor_loop = (
             WorkerActor._get_supervisor_ref_on_actor_loop
         )
@@ -3620,6 +3710,7 @@ async def test_periodical_report_status_reregisters_after_heartbeat_failure(
         )
         _get_supervisor_ref_generation = WorkerActor._get_supervisor_ref_generation
         _clear_supervisor_refs = WorkerActor._clear_supervisor_refs
+        _ownership_metadata = WorkerActor._ownership_metadata
         _get_supervisor_ref_on_actor_loop = (
             WorkerActor._get_supervisor_ref_on_actor_loop
         )
@@ -3724,6 +3815,7 @@ async def test_supervisor_registration_is_single_flight_and_replays_latest_snaps
             WorkerActor._get_supervisor_ref_with_generation
         )
         _clear_supervisor_refs = WorkerActor._clear_supervisor_refs
+        _ownership_metadata = WorkerActor._ownership_metadata
         _get_supervisor_ref_on_actor_loop = (
             WorkerActor._get_supervisor_ref_on_actor_loop
         )
@@ -3928,6 +4020,7 @@ class _RecoverWorkerStub:
         # None -> unbounded branch; int (e.g. 1) -> bounded branch (AUTO_RECOVER_LIMIT)
         self._model_uid_to_recover_count = {"model-x-0": recover_count}
         self._model_uid_to_subpool_pids: dict = {}
+        self._model_uid_to_subpool_addresses = {"model-x-0": {"addr-1"}}
 
     async def get_supervisor_ref(self, add_worker: bool = False):
         return self._supervisor_ref

@@ -82,6 +82,7 @@ from ..utils import (
     GEMMA_TOOL_CALL_FAMILY,
     GLM5_TOOL_CALL_FAMILY,
     KIMI_K3_TOOL_CALL_FAMILY,
+    LLAMA3_TOOL_CALL_FAMILY,
     MINICPM5_TOOL_CALL_FAMILY,
     QWEN_TOOL_CALL_FAMILY,
     QWEN_TOOL_CALL_SYMBOLS,
@@ -204,6 +205,14 @@ def _get_transformers_version() -> Optional[version.Version]:
 
 DEFAULT_VLLM_VERSION = version.parse("0.21.0")
 MINICPMV47_MIN_VLLM_VERSION = version.parse("0.31.1rc1.dev281+gc85616efc")
+
+
+def _is_gpt_oss_model(model_family: Optional["LLMFamilyV2"]) -> bool:
+    if model_family is None:
+        return False
+    return model_family.has_architecture("GptOssForCausalLM") or (
+        (model_family.model_family or model_family.model_name) == "gpt-oss"
+    )
 
 
 def _get_effective_vllm_version() -> version.Version:
@@ -935,6 +944,13 @@ class VLLMModel(WeightCachedModel, LLM):
         # to call aynsc method with asyncio.run_coroutine_threadsafe
         self._loop = loop  # type: ignore
 
+    def get_limit_mm_per_prompt(self) -> Optional[Dict[str, int]]:
+        """Return the effective multimodal item limits for request preflight."""
+        if not isinstance(self._model_config, dict):
+            return None
+        limit = self._model_config.get("limit_mm_per_prompt")
+        return dict(limit) if isinstance(limit, dict) else None
+
     def _is_vllm_v1(self) -> bool:
         """
         Check if vLLM v1 is being used.
@@ -1613,6 +1629,34 @@ class VLLMModel(WeightCachedModel, LLM):
             model_config["speculative_config"],
         )
 
+    def _should_force_fp8(self) -> bool:
+        """Keep the FP8 fallback only when checkpoint metadata permits it."""
+        try:
+            with open(os.path.join(self.model_path, "config.json")) as f:
+                config = json.load(f)
+        except FileNotFoundError:
+            return True
+        except (OSError, ValueError) as e:
+            logger.warning("Cannot read checkpoint quantization config: %s", e)
+            return False
+
+        if not isinstance(config, dict):
+            return False
+        for section in (config, config.get("text_config")):
+            if section is None:
+                continue
+            if not isinstance(section, dict):
+                return False
+            quant_config = section.get("quantization_config")
+            if quant_config is None:
+                continue
+            if not isinstance(quant_config, dict):
+                return False
+            method = quant_config.get("quant_method")
+            if method is not None:
+                return isinstance(method, str) and method.lower() == "fp8"
+        return True
+
     def _sanitize_model_config(
         self, model_config: Optional[VLLMModelConfig]
     ) -> VLLMModelConfig:
@@ -1685,7 +1729,11 @@ class VLLMModel(WeightCachedModel, LLM):
             )
         ):
             if model_config.get("quantization") in (None, "none"):
-                model_config["quantization"] = "fp8"
+                # Catalog FP8 checkpoints can use another vLLM quantizer,
+                # such as compressed-tensors. Let vLLM detect those itself.
+                model_config["quantization"] = (
+                    "fp8" if self._should_force_fp8() else None
+                )
         else:
             model_config.setdefault("quantization", None)
         model_config.setdefault("max_model_len", None)
@@ -2200,6 +2248,14 @@ class VLLMModel(WeightCachedModel, LLM):
 
         if (enable_thinking or tools) and generate_config:
             generate_config["skip_special_tokens"] = False
+        if (
+            _is_gpt_oss_model(getattr(self, "model_family", None))
+            and not tools
+            and generate_config
+        ):
+            # Preserve Harmony control tokens so the channel parser can strip
+            # framing without confusing analysis and final output.
+            generate_config["skip_special_tokens"] = False
 
         anthropic = bool((generate_config or {}).get("_anthropic_request"))
         if anthropic and generate_config is not None:
@@ -2237,7 +2293,7 @@ class VLLMModel(WeightCachedModel, LLM):
         stream = sanitized_generate_config.pop("stream")
         stream_options = sanitized_generate_config.pop("stream_options", None)
         include_usage = (
-            stream_options["include_usage"]
+            stream_options.get("include_usage", False)
             if isinstance(stream_options, dict)
             else False
         )
@@ -2883,6 +2939,7 @@ class VLLMChatModel(VLLMModel, ChatModelMixin):
         if tools:
             if (
                 model_family in QWEN_TOOL_CALL_FAMILY
+                or model_family in LLAMA3_TOOL_CALL_FAMILY
                 or model_family in GEMMA_TOOL_CALL_FAMILY
                 or model_family in DEEPSEEK_TOOL_CALL_FAMILY
                 or model_family in GLM5_TOOL_CALL_FAMILY
@@ -2930,7 +2987,9 @@ class VLLMChatModel(VLLMModel, ChatModelMixin):
             return await self._forced_tool_chat(messages, generate_config, request_id)
         plain_json = self._use_legacy_constraints(generate_config, anthropic)
         parallel_tool_calls = generate_config.pop("parallel_tool_calls", True)
-        generate_config.pop("tool_choice", None)
+        choice = generate_config.pop("tool_choice", None)
+        if choice == "none":
+            generate_config.pop("tools", None)
         full_prompt, tools, chat_template_kwargs, generate_config = (
             await self._prepare_chat_inputs(messages, generate_config)
         )
@@ -2949,12 +3008,36 @@ class VLLMChatModel(VLLMModel, ChatModelMixin):
             full_prompt, generate_config, chat_template_kwargs
         )
         stream = generate_config.get("stream", False)
+        parse_harmony = (
+            _is_gpt_oss_model(getattr(self, "model_family", None)) and not tools
+        )
+        structured_output = plain_json or (
+            (generate_config.get("response_format") or {}).get("type")
+            in {"json_schema", "json_object"}
+            or generate_config.get("guided_json") is not None
+            or bool(generate_config.get("guided_json_object"))
+        )
+        expose_reasoning = chat_template_kwargs.get(
+            "reasoning_content",
+            getattr(self.reasoning_parser, "reasoning_content", False),
+        )
 
         if stream:
             agen = await self.async_generate(
                 full_prompt, generate_config, tools, request_id=request_id
             )
             assert isinstance(agen, AsyncGenerator)
+            if parse_harmony:
+                from ..harmony import async_stream_harmony_chat_completion_chunks
+
+                raw_stream = self._async_to_chat_completion_chunks(
+                    agen, None, chat_template_kwargs
+                )
+                return async_stream_harmony_chat_completion_chunks(
+                    raw_stream,
+                    expose_reasoning=expose_reasoning,
+                    structured_output=structured_output,
+                )
             if tools:
                 result_stream = self._async_to_tool_completion_chunks(
                     agen, chat_template_kwargs, tools
@@ -2977,6 +3060,15 @@ class VLLMChatModel(VLLMModel, ChatModelMixin):
             if tools:
                 result = self._post_process_completion(
                     self.model_family, self.model_uid, c, tools
+                )
+            elif parse_harmony:
+                from ..harmony import parse_harmony_chat_completion
+
+                raw_completion = self._to_chat_completion(c, None)
+                result = await parse_harmony_chat_completion(
+                    raw_completion,
+                    expose_reasoning=expose_reasoning,
+                    structured_output=structured_output,
                 )
             else:
                 result = self._to_chat_completion(c, parser)
@@ -3497,7 +3589,9 @@ class VLLMMultiModel(VLLMModel, ChatModelMixin):
             return await self._forced_tool_chat(messages, generate_config, request_id)
         plain_json = self._use_legacy_constraints(generate_config, anthropic)
         parallel_tool_calls = generate_config.pop("parallel_tool_calls", True)
-        generate_config.pop("tool_choice", None)
+        choice = generate_config.pop("tool_choice", None)
+        if choice == "none":
+            generate_config.pop("tools", None)
         inputs, tools, chat_template_kwargs, generate_config = (
             await self._prepare_chat_inputs(messages, generate_config)
         )

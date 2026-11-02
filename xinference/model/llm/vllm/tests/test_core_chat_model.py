@@ -12,19 +12,130 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# CI: linux
 import base64
 import copy
+import json
 import sys
 import tempfile
 import types
 from contextlib import nullcontext
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from packaging import version
 
 from ...tool_parsers.qwen_tool_parser import QwenToolParser
+
+
+class TestVLLMFP8Quantization:
+    @pytest.fixture
+    def model(self, monkeypatch, tmp_path):
+        from ...llm_family import match_llm
+        from .. import core
+
+        monkeypatch.setattr(core, "VLLM_VERSION", version.parse("0.22.0"))
+        family = copy.deepcopy(match_llm("glm-4.5", "fp8", 106, "FP8", "huggingface"))
+        model = core.VLLMChatModel("test-glm-fp8", family, str(tmp_path), {})
+        model._device_count = 1
+        return model
+
+    @pytest.mark.parametrize("section", [None, "text_config"])
+    @pytest.mark.parametrize(
+        "quant_config,expected",
+        [
+            ({"quant_method": "compressed-tensors"}, None),
+            ({"quant_method": "fp8"}, "fp8"),
+            ({"quant_method": "unknown"}, None),
+            ({"quant_method": 8}, None),
+            ({"quant_method": ""}, None),
+            ({"quant_method": None}, "fp8"),
+            ({}, "fp8"),
+            (None, "fp8"),
+            ([], None),
+        ],
+    )
+    def test_checkpoint_quantizer(
+        self, model, tmp_path, section, quant_config, expected
+    ):
+        config = {"quantization_config": quant_config}
+        if section:
+            config = {section: config}
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert model._sanitize_model_config({})["quantization"] == expected
+
+    @pytest.mark.parametrize(
+        "top,nested,expected",
+        [
+            ("fp8", "compressed-tensors", "fp8"),
+            ("compressed-tensors", "fp8", None),
+            (None, "compressed-tensors", None),
+        ],
+    )
+    def test_top_level_precedence(self, model, tmp_path, top, nested, expected):
+        (tmp_path / "config.json").write_text(
+            json.dumps(
+                {
+                    "quantization_config": {"quant_method": top},
+                    "text_config": {"quantization_config": {"quant_method": nested}},
+                }
+            )
+        )
+        assert model._sanitize_model_config({})["quantization"] == expected
+
+    @pytest.mark.parametrize("config", [None, {}])
+    @pytest.mark.parametrize("launch_config", [None, {}, {"quantization": "none"}])
+    def test_missing_metadata_keeps_fp8(self, model, tmp_path, config, launch_config):
+        if config is not None:
+            (tmp_path / "config.json").write_text(json.dumps(config))
+        assert model._sanitize_model_config(launch_config)["quantization"] == "fp8"
+
+    @pytest.mark.parametrize("contents", ["{", "null", "[]", '{"text_config": []}'])
+    def test_malformed_config_defers_to_vllm(self, model, tmp_path, contents):
+        (tmp_path / "config.json").write_text(contents)
+        assert model._sanitize_model_config({})["quantization"] is None
+
+    def test_unreadable_config_defers_to_vllm(self, model, tmp_path, caplog):
+        (tmp_path / "config.json").mkdir()
+        assert model._sanitize_model_config({})["quantization"] is None
+        assert "Cannot read checkpoint quantization config" in caplog.text
+
+    @pytest.mark.parametrize("method", ["fp8", "compressed-tensors"])
+    @pytest.mark.parametrize(
+        "launch_config,expected",
+        [
+            (
+                {"model_quantization": "compressed-tensors", "quantization": "fp8"},
+                "compressed-tensors",
+            ),
+            ({"quantization": "compressed-tensors"}, "compressed-tensors"),
+            ({"model_quantization": "fp8"}, "fp8"),
+        ],
+    )
+    def test_explicit_quantizer_wins(
+        self, model, tmp_path, method, launch_config, expected
+    ):
+        (tmp_path / "config.json").write_text(
+            json.dumps(
+                {
+                    "quantization_config": {"quant_method": method},
+                }
+            )
+        )
+        assert model._sanitize_model_config(launch_config)["quantization"] == expected
+
+    @pytest.mark.parametrize("model_format", ["pytorch", "gptq", "awq", "fp4", "bnb"])
+    def test_non_fp8_format_keeps_default(self, model, tmp_path, model_format):
+        model.model_spec.model_format = model_format
+        (tmp_path / "config.json").write_text(
+            json.dumps(
+                {
+                    "quantization_config": {"quant_method": "fp8"},
+                }
+            )
+        )
+        assert model._sanitize_model_config({})["quantization"] is None
 
 
 def filter_ids_and_created(data):
@@ -37,6 +148,27 @@ def filter_ids_and_created(data):
             if k not in ["id", "created"]
         }
     return data
+
+
+@pytest.mark.parametrize(
+    "family_name,model_name,architecture,expected",
+    [
+        (None, "test-model", False, False),
+        (None, "gpt-oss", False, True),
+        ("gpt-oss", "custom", False, True),
+        ("custom", "custom", True, True),
+    ],
+)
+def test_gpt_oss_detection_is_optional(family_name, model_name, architecture, expected):
+    from ..core import _is_gpt_oss_model
+
+    assert _is_gpt_oss_model(None) is False
+    family = types.SimpleNamespace(
+        model_family=family_name,
+        model_name=model_name,
+        has_architecture=lambda _: architecture,
+    )
+    assert _is_gpt_oss_model(family) is expected
 
 
 class TestVLLMMultiModelChatTemplate:
@@ -460,6 +592,16 @@ class TestVLLMChatModel:
     async def create_mock_chunks(self, chunks_data):
         for chunk in chunks_data:
             yield chunk
+
+    @pytest.fixture
+    def gpt_oss_chat_model(self, real_vllm_chat_model):
+        model = real_vllm_chat_model
+        model.model_family = types.SimpleNamespace(
+            model_family=None,
+            model_name="gpt-oss",
+            has_architecture=lambda _: False,
+        )
+        return model
 
     @pytest.mark.asyncio
     async def test_async_to_tool_completion_chunks_without_thinking(
@@ -1942,6 +2084,335 @@ class TestVLLMChatModel:
             expected_result = filter_ids_and_created(expected_chunks[i])
             assert result == expected_result
             i = i + 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("stream", [False, True])
+    @pytest.mark.parametrize("reasoning_content", [False, True])
+    async def test_gpt_oss_async_chat_parses_final_channel(
+        self, gpt_oss_chat_model, stream, reasoning_content
+    ):
+        model = gpt_oss_chat_model
+        token_groups = [
+            [
+                "<|channel|>",
+                "analysis",
+                "<|message|>",
+                "The user asks: calculate 17*23.",
+            ],
+            [
+                "<|end|>",
+                "<|start|>",
+                "assistant",
+                "<|channel|>",
+                "final",
+                "<|message|>",
+                "39",
+            ],
+            ["1", "<|end|>"],
+        ]
+        generated_text = "".join(token for group in token_groups for token in group)
+
+        def logprobs_for(tokens):
+            return {
+                "text_offset": [0] * len(tokens),
+                "tokens": tokens,
+                "token_logprobs": [-0.1] * len(tokens),
+                "top_logprobs": [{token: -0.1} for token in tokens],
+            }
+
+        request_config = {
+            "stream": stream,
+            "logprobs": True,
+            "chat_template_kwargs": {"reasoning_content": reasoning_content},
+        }
+
+        async def prepare_chat_inputs(messages, config):
+            chat_template_kwargs = config.pop("chat_template_kwargs", {})
+            tools = config.pop("tools", None)
+            return "prompt", tools, chat_template_kwargs, config
+
+        model._prepare_chat_inputs = AsyncMock(side_effect=prepare_chat_inputs)
+
+        completion = {
+            "id": "gpt-oss-test",
+            "object": "text_completion",
+            "created": 1,
+            "model": "gpt-oss",
+            "choices": [
+                {
+                    "index": 0,
+                    "text": generated_text,
+                    "finish_reason": "stop",
+                    "logprobs": logprobs_for(
+                        [token for group in token_groups for token in group]
+                    ),
+                }
+            ],
+            "usage": {"prompt_tokens": 2, "completion_tokens": 5, "total_tokens": 7},
+        }
+
+        async def generated_chunks():
+            for tokens in token_groups:
+                text = "".join(tokens)
+                logprobs = logprobs_for(tokens)
+                yield {
+                    "id": "gpt-oss-test",
+                    "object": "text_completion",
+                    "created": 1,
+                    "model": "gpt-oss",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "text": text,
+                            "finish_reason": None,
+                            "logprobs": logprobs,
+                        }
+                    ],
+                }
+            yield {
+                "id": "gpt-oss-test",
+                "object": "text_completion",
+                "created": 1,
+                "model": "gpt-oss",
+                "choices": [
+                    {
+                        "index": 0,
+                        "text": "",
+                        "finish_reason": "stop",
+                        "logprobs": None,
+                    }
+                ],
+            }
+            yield {
+                "id": "gpt-oss-test",
+                "object": "text_completion",
+                "created": 1,
+                "model": "gpt-oss",
+                "choices": [],
+                "usage": {
+                    "prompt_tokens": 2,
+                    "completion_tokens": 5,
+                    "total_tokens": 7,
+                },
+            }
+
+        async def async_generate(prompt, config, tools, request_id=None):
+            assert prompt == "prompt"
+            assert not tools
+            return generated_chunks() if stream else completion
+
+        model.async_generate = async_generate
+        result = await model.async_chat(
+            [{"role": "user", "content": "What is 17*23?"}], request_config
+        )
+
+        if stream:
+            chunks = [chunk async for chunk in result]
+            choices = [chunk["choices"][0] for chunk in chunks if chunk["choices"]]
+            content = "".join(
+                choice["delta"].get("content") or "" for choice in choices
+            )
+            reasoning = "".join(
+                choice["delta"].get("reasoning_content") or "" for choice in choices
+            )
+            assert choices[-1]["finish_reason"] == "stop"
+            assert chunks[-1]["choices"] == []
+            assert chunks[-1]["usage"]["total_tokens"] == 7
+            if not reasoning_content:
+                assert all("reasoning_content" not in c["delta"] for c in choices)
+            entries = [
+                entry
+                for choice in choices
+                for entry in (choice.get("logprobs") or {}).get("content", [])
+            ]
+        else:
+            message = result["choices"][0]["message"]
+            content = message["content"]
+            reasoning = message.get("reasoning_content") or ""
+            assert result["choices"][0]["finish_reason"] == "stop"
+            if not reasoning_content:
+                assert "reasoning_content" not in message
+            entries = result["choices"][0]["logprobs"]["content"]
+
+        assert content == "391"
+        assert [entry["token"] for entry in entries] == ["39", "1"]
+        assert all(entry["logprob"] == -0.1 for entry in entries)
+        assert ("calculate 17*23" in reasoning) is reasoning_content
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("stream", [False, True])
+    @pytest.mark.parametrize(
+        "parts,expected",
+        [
+            (("analysis", "\n", '{"answer":', "391}"), {"answer": 391}),
+            (
+                ('{"answer":"', "analysis", ' complete"}'),
+                {"answer": "analysis complete"},
+            ),
+        ],
+    )
+    async def test_gpt_oss_async_chat_keeps_constrained_json_in_content(
+        self, gpt_oss_chat_model, stream, parts, expected
+    ):
+        model = gpt_oss_chat_model
+        generated_text = "".join(parts)
+        request_config = {"stream": stream, "guided_json_object": True}
+
+        async def prepare_chat_inputs(messages, config):
+            chat_template_kwargs = config.pop("chat_template_kwargs", {})
+            tools = config.pop("tools", None)
+            return "prompt", tools, chat_template_kwargs, config
+
+        model._prepare_chat_inputs = AsyncMock(side_effect=prepare_chat_inputs)
+
+        completion = {
+            "id": "gpt-oss-json-test",
+            "object": "text_completion",
+            "created": 1,
+            "model": "gpt-oss",
+            "choices": [
+                {
+                    "index": 0,
+                    "text": generated_text,
+                    "finish_reason": "stop",
+                    "logprobs": None,
+                }
+            ],
+            "usage": {},
+        }
+
+        async def generated_chunks():
+            for text in parts:
+                yield {
+                    "id": "gpt-oss-json-test",
+                    "object": "text_completion",
+                    "created": 1,
+                    "model": "gpt-oss",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "text": text,
+                            "finish_reason": None,
+                            "logprobs": None,
+                        }
+                    ],
+                }
+            yield {
+                "id": "gpt-oss-json-test",
+                "object": "text_completion",
+                "created": 1,
+                "model": "gpt-oss",
+                "choices": [
+                    {
+                        "index": 0,
+                        "text": "",
+                        "finish_reason": "stop",
+                        "logprobs": None,
+                    }
+                ],
+            }
+
+        async def async_generate(prompt, config, tools, request_id=None):
+            assert prompt == "prompt"
+            assert config["guided_json_object"] is True
+            assert not tools
+            return generated_chunks() if stream else completion
+
+        model.async_generate = async_generate
+        result = await model.async_chat(
+            [{"role": "user", "content": "Return the answer as JSON."}],
+            request_config,
+        )
+
+        if stream:
+            chunks = [chunk async for chunk in result]
+            content = "".join(
+                chunk["choices"][0]["delta"].get("content") or ""
+                for chunk in chunks
+                if chunk["choices"]
+            )
+            assert chunks[-1]["choices"][0]["finish_reason"] == "stop"
+        else:
+            content = result["choices"][0]["message"]["content"]
+
+        assert json.loads(content) == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model_class", ["VLLMChatModel", "VLLMMultiModel"])
+@pytest.mark.parametrize("tool_choice", ["none", "auto", None, "absent"])
+@pytest.mark.parametrize("tools_state", ["populated", "empty", "absent"])
+@pytest.mark.parametrize("stream", [False, True])
+async def test_async_chat_tool_choice_rendering(
+    monkeypatch, model_class, tool_choice, tools_state, stream
+):
+    from .. import core
+
+    model = object.__new__(getattr(core, model_class))
+    family = json.loads((Path(__file__).parents[2] / "models/qwen3.json").read_text())[
+        0
+    ]
+    model.model_family = types.SimpleNamespace(
+        **family, model_family=None, has_architecture=lambda _: False
+    )
+    model.model_uid = "test-model"
+    model.reasoning_parser = None
+    model.tool_parser = QwenToolParser()
+    model._get_tokenizer = AsyncMock(return_value=None)
+    # Run text-only preparation inline; no background media I/O is needed.
+    monkeypatch.setattr(
+        core.asyncio,
+        "to_thread",
+        AsyncMock(side_effect=lambda fn, *a, **kw: fn(*a, **kw)),
+    )
+    # Text-only requests still import the optional multimodal readers.
+    monkeypatch.setitem(
+        sys.modules,
+        "qwen_omni_utils",
+        types.SimpleNamespace(
+            process_audio_info=None, process_mm_info=None, process_vision_info=None
+        ),
+    )
+    tools = [
+        {
+            "type": "function",
+            "function": {"name": "get_weather", "parameters": {"type": "object"}},
+        }
+    ]
+    config = {"stream": stream, "stop_token_ids": [151645]}
+    if tool_choice != "absent":
+        config["tool_choice"] = tool_choice
+    if tools_state != "absent":
+        config["tools"] = tools if tools_state == "populated" else []
+    original = copy.deepcopy(config)
+    enabled = tools_state == "populated" and tool_choice != "none"
+
+    async def generate(prompt, generate_config, tools, request_id=None):
+        rendered = prompt["prompt"] if isinstance(prompt, dict) else prompt
+        assert ("get_weather" in rendered) is enabled
+        assert bool(tools) is enabled
+        assert "tool_choice" not in generate_config
+        completion = {
+            "id": "test",
+            "model": model.model_uid,
+            "created": 1,
+            "choices": [{"index": 0, "text": "Hello", "finish_reason": "stop"}],
+            "usage": {},
+        }
+
+        async def chunks():
+            yield completion
+
+        return chunks() if stream else completion
+
+    model.async_generate = generate
+    result = await model.async_chat([{"role": "user", "content": "Hi"}], config)
+    if stream:
+        chunks = [chunk async for chunk in result]
+        assert chunks[-1]["choices"][0]["finish_reason"] == "stop"
+    else:
+        assert result["choices"][0]["message"]["content"] == "Hello"
+    assert config == original
 
 
 class TestVLLMSanitizeGenerateConfig:

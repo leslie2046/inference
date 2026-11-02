@@ -792,3 +792,31 @@ msgstr "存储保持现有方法签名、行字典和 API Key 名称校验错误
 #: ../../development/xinference_internals.rst
 msgid "The API service, offline administrator-password recovery and legacy JSON auth importer use the same selection mechanism. With a provider configured, ``--db-path`` is passed to its context; it does not override the provider's connection configuration. Use the same extension and backend configuration for the service and these tools. Unlike request/actor hooks, this synchronous initialization hook may connect to storage during startup. Store operations remain synchronous; asynchronous or incomplete implementations are rejected. Providers must keep connection credentials out of logs and error messages. Without a provider, SQLite behavior and dependencies are unchanged."
 msgstr "API 服务、离线管理员密码恢复和旧 JSON 鉴权导入使用同一选择机制。配置提供方后，``--db-path`` 传入其上下文，不会覆盖提供方的连接配置。服务与这些工具应使用相同的扩展和后端配置。与请求/Actor hook 不同，此同步初始化 hook 可以在启动时连接存储。存储操作保持同步；异步或不完整实现会被拒绝。提供方不得在日志或错误消息中输出连接凭据。未配置提供方时，SQLite 行为和依赖保持不变。"
+
+#: ../../source/development/xinference_internals.rst:310
+msgid "Provider stores shared by multiple API processes can set ``api_key_cache_enabled = False`` before service initialization. This bypasses the process-local API-key cache and reads the current key, owner status and model grants on each lookup. Omit the attribute or set it to ``True`` to retain caching; non-boolean values are rejected. Storage failures propagate instead of reusing earlier authorization."
+msgstr "多个 API 进程共享的扩展存储可在服务初始化前设置 ``api_key_cache_enabled = False``。这会绕过进程本地的 API Key 缓存，在每次查询时读取当前密钥、所属账号状态和模型权限。省略该属性或将其设为 ``True`` 可保留缓存；非布尔值会被拒绝。存储故障会直接向上传递，不会复用先前的授权结果。"
+
+#: ../../source/development/xinference_internals.rst
+msgid "Model favorites storage"
+msgstr "模型收藏存储"
+
+#: ../../source/development/xinference_internals.rst
+msgid "Extensions may implement ``create_model_favorites_store(context)`` during API initialization, after auth-store selection. ``ModelFavoritesStoreContext`` supplies ``db_path`` and the selected ``auth_store`` (``None`` without authentication). Return a ``xinference.core.model_favorites_store.ModelFavoritesStore`` with synchronous ``list(owner)``, ``add(owner, model_name)`` and ``remove(owner, model_name)`` methods, or ``None`` for SQLite. Owners are positive account IDs, or ``None`` for the shared anonymous collection; account IDs must never be reassigned to another account after deletion. Operations must be persistent, owner-isolated and idempotent, and run in the API thread pool. Multiple providers, invalid stores and initialization failures abort startup without selecting a fallback. ``db_path`` is the configured ``XINFERENCE_AUTH_DB_PATH``. The SQLite default reuses the local path of the selected auth store, or this configured path without authentication. Providers must reuse the selected database; non-SQLite auth storage without a favorites provider aborts startup."
+msgstr "扩展可在 API 初始化且已选定认证存储后实现 ``create_model_favorites_store(context)``。``ModelFavoritesStoreContext`` 提供 ``db_path`` 和选定的 ``auth_store`` (未启用认证时为 ``None``)。返回实现同步 ``list(owner)``、``add(owner, model_name)`` 和 ``remove(owner, model_name)`` 方法的 ``xinference.core.model_favorites_store.ModelFavoritesStore``，或返回 ``None`` 以使用 SQLite。所有者是正整数账号 ID；共享匿名收藏使用 ``None``。账号删除后，其 ID 绝不能重新分配给其他账号。操作必须持久化、隔离所有者且具有幂等性，并在 API 线程池中运行。多个提供方、无效存储或初始化失败都会中止启动，不会选择回退存储。 ``db_path`` 是配置的 ``XINFERENCE_AUTH_DB_PATH``。默认 SQLite 实现复用所选认证存储的本地路径；未启用认证时使用该配置路径。提供方必须复用所选数据库；非 SQLite 认证存储缺少收藏提供方时会中止启动。"
+
+#: ../../source/development/xinference_internals.rst
+msgid "Launch history storage"
+msgstr "启动历史存储"
+
+#: ../../source/development/xinference_internals.rst
+msgid "Extensions may implement ``create_launch_history_store(context)`` during API and supervisor initialization. ``LaunchHistoryStoreContext`` supplies ``db_path`` (the configured ``XINFERENCE_LAUNCH_HISTORY_DB_PATH``), ``service`` (``api`` or ``supervisor``) and ``auth_store`` (the selected API auth store, or ``None`` without authentication and in the supervisor). Both services must select the same persistent history backend."
+msgstr "扩展可在 API 和 supervisor 初始化期间实现 ``create_launch_history_store(context)``。``LaunchHistoryStoreContext`` 提供 ``db_path``（配置的 ``XINFERENCE_LAUNCH_HISTORY_DB_PATH``）、``service``（``api`` 或 ``supervisor``）以及 ``auth_store``（API 选定的认证存储；未启用认证或在 supervisor 中为 ``None``）。两个服务必须选择同一个持久化历史后端。"
+
+#: ../../source/development/xinference_internals.rst
+msgid "Return a ``xinference.core.launch_history_store.LaunchHistoryStorage`` or ``None`` to retain the existing SQLite path and schema. Its synchronous methods are ``list``, ``upsert``, ``delete``, ``list_autostart``, ``upsert_autostart``, ``update_autostart_launch_config`` and ``remove_autostart``. Preserve the existing row dictionaries, owner filtering, redaction and UI metadata behavior. Autostart writes must be atomic across processes, with at most one enabled entry per model UID; disabling autostart must retain history. Database drivers and schema upgrades belong to the provider."
+msgstr "返回 ``xinference.core.launch_history_store.LaunchHistoryStorage``，或返回 ``None`` 保留现有 SQLite 路径和表结构。同步方法包括 ``list``、``upsert``、``delete``、``list_autostart``、``upsert_autostart``、``update_autostart_launch_config`` 和 ``remove_autostart``。保持现有记录字典、所有者过滤、脱敏和 UI 元数据行为。自启动写入必须跨进程保持原子性，每个模型 UID 最多有一条启用记录；禁用自启动必须保留历史。数据库驱动和表结构升级由提供方负责。"
+
+#: ../../source/development/xinference_internals.rst
+msgid "At most one extension may provide the hook. Multiple providers, incomplete or asynchronous stores and provider failures abort initialization without falling back to SQLite. The synchronous startup hook may connect to storage; API operations run in the thread pool and supervisor operations use its executor. Providers must keep connection credentials out of logs and errors. No provider leaves existing storage and dependencies unchanged."
+msgstr "最多允许一个扩展提供此 hook。多个提供方、不完整或异步存储以及提供方故障都会中止初始化，不会回退到 SQLite。同步启动 hook 可以连接存储；API 操作在线程池中运行，supervisor 操作使用其执行器。提供方不得在日志和错误中输出连接凭据。未配置提供方时，现有存储和依赖保持不变。"

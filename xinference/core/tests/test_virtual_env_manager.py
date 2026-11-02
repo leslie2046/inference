@@ -255,6 +255,13 @@ def test_dependency_install_progress_counts_matching_child_distributions(tmp_pat
         (tmp_path / "example-2.0.dist-info" / "METADATA").write_text(
             "Metadata-Version: 2.1\nName: example\nVersion: 2.0\n"
         )
+        # importlib.metadata caches directory discovery by parent mtime.
+        # Windows can create the fixture within the same filesystem clock tick.
+        directory_stat = tmp_path.stat()
+        os.utime(
+            tmp_path,
+            ns=(directory_stat.st_atime_ns, directory_stat.st_mtime_ns + 2_000_000_000),
+        )
         deadline = time.monotonic() + 3
         while (1, 1) not in counts and time.monotonic() < deadline:
             time.sleep(0.05)
@@ -1522,6 +1529,31 @@ class TestGetEngineCriticalDependencySpecs:
         ):
             specs = get_engine_critical_dependency_specs("sglang", ["sglang>=0.5.6"])
         assert specs == []
+
+    @pytest.mark.parametrize("compatible", [False, True])
+    def test_trt_inherited_engine_enforces_its_runtime_requirements(self, compatible):
+        versions = {
+            "tensorrt_llm": "1.2.1",
+            "torch": "2.9.1+cu130" if compatible else "2.10.0+cu130",
+            "numpy": "1.26.4" if compatible else "2.3.0",
+            "transformers": "4.57.3" if compatible else "5.5.0",
+        }
+        declared = ["torch<=2.10.0a0,>=2.9.1", "numpy<2", "transformers==4.57.3"]
+        with self._patch_metadata(versions, {"tensorrt_llm": declared}):
+            specs = get_engine_critical_dependency_specs(
+                "TRT-LLM", get_engine_virtualenv_packages("TRT-LLM")
+            )
+        assert set(specs) == (set() if compatible else set(declared))
+
+    def test_trt_fresh_install_accepts_both_distribution_spellings(self):
+        with self._patch_metadata(
+            {"tensorrt_llm": "1.2.1", "numpy": "2.3.0"},
+            {"tensorrt_llm": ["numpy<2"]},
+        ):
+            assert (
+                get_engine_critical_dependency_specs("TRT-LLM", ["tensorrt-llm==1.1.0"])
+                == []
+            )
 
     def test_engine_absent_from_parent_is_noop(self):
         """Without a parent copy the venv resolves the engine and its full

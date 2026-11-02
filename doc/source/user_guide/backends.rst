@@ -7,6 +7,12 @@ Backends
 Xinference supports multiple backends for different models. After the user specifies the model,
 xinference will automatically select the appropriate backend.
 
+.. raw:: html
+
+   <span id="speculative-decoding"></span>
+
+For speculative decoding methods and launch options, see :ref:`speculative_decoding`.
+
 .. _llama_cpp_backend:
 
 llama.cpp
@@ -142,8 +148,9 @@ Currently, supported model includes:
 
 .. vllm_start
 
-- ``code-llama``, ``code-llama-instruct``, ``code-llama-python``, ``deepseek``, ``deepseek-chat``, ``deepseek-coder``, ``deepseek-coder-instruct``, ``deepseek-r1-distill-llama``, ``HuatuoGPT-o1-LLaMA-3.1``, ``llama-2``, ``llama-2-chat``, ``llama-3``, ``llama-3-instruct``, ``llama-3.1``, ``llama-3.1-instruct``, ``llama-3.3-instruct``, ``minicpm5-1b``, ``tiny-llama``, ``Yi``, ``Yi-1.5``, ``Yi-1.5-chat``, ``Yi-1.5-chat-16k``, ``Yi-200k``, ``Yi-chat``
+- ``code-llama``, ``code-llama-instruct``, ``code-llama-python``, ``deepseek``, ``deepseek-chat``, ``deepseek-coder``, ``deepseek-coder-instruct``, ``deepseek-r1-distill-llama``, ``HuatuoGPT-o1-LLaMA-3.1``, ``llama-2``, ``llama-2-chat``, ``llama-3``, ``llama-3-instruct``, ``llama-3.1``, ``llama-3.1-instruct``, ``llama-3.3-instruct``, ``minicpm5-1b``, ``minicpm5-2b``, ``tiny-llama``, ``Yi``, ``Yi-1.5``, ``Yi-1.5-chat``, ``Yi-1.5-chat-16k``, ``Yi-200k``, ``Yi-chat``
 - ``codestral-v0.1``, ``mistral-instruct-v0.1``, ``mistral-instruct-v0.2``, ``mistral-instruct-v0.3``, ``mistral-large-instruct``, ``mistral-nemo-instruct``, ``mistral-v0.1``, ``openhermes-2.5``, ``seallm_v2``
+- ``Spark-X2.5``, ``Spark-X2.5-Base``
 - ``Baichuan-M2``, ``codeqwen1.5``, ``codeqwen1.5-chat``, ``deepseek-r1-distill-qwen``, ``DianJin-R1``, ``fin-r1``, ``HuatuoGPT-o1-Qwen2.5``, ``KAT-V1``, ``marco-o1``, ``qwen1.5-chat``, ``qwen2-instruct``, ``qwen2.5``, ``qwen2.5-coder``, ``qwen2.5-coder-instruct``, ``qwen2.5-instruct``, ``qwen2.5-instruct-1m``, ``qwenLong-l1``, ``QwQ-32B``, ``QwQ-32B-Preview``, ``seallms-v3``, ``skywork-or1``, ``skywork-or1-preview``, ``vibethinker``, ``XiYanSQL-QwenCoder-2504``
 - ``llama-3.2-vision``, ``llama-3.2-vision-instruct``
 - ``baichuan-2``, ``baichuan-2-chat``
@@ -219,118 +226,44 @@ MLX can also serve supported audio models on Apple silicon. Whisper models,
 :ref:`Audio engines <audio>`.
 
 
-.. _speculative_decoding:
 
-Speculative decoding
-====================
-Some models ship a small paired drafter checkpoint that predicts several tokens
-ahead, which the target model then verifies in one pass. Output is unchanged,
-decoding gets faster. Gemma 4 calls this multi-token prediction (MTP) and
-publishes a ``*-it-assistant`` drafter for every variant.
+.. _trt_llm_backend:
 
-Pass ``--enable_mtp true`` at launch to download the drafter declared by the
-model spec and run it alongside the target model:
+TRT-LLM
+========
 
-.. code-block:: bash
+.. versionadded:: v4.1.0
 
-   xinference launch --model-name gemma-4 --model-engine vllm \
-     --model-format pytorch --size-in-billions 12 --quantization none \
-     --enable_mtp true
+The TRT-LLM backend uses the Python LLM API inside the model process. It requires Linux, NVIDIA CUDA GPUs and ``tensorrt-llm==1.2.1``. Model support follows the text architectures implemented by that version, including Qwen2/2.5, Qwen3 (dense, MoE and Next), Llama, Mistral/Mixtral, Gemma3, Phi3, DeepSeek, GLM MoE, MiniMax M2, GPT-OSS, Hunyuan, EXAONE, Nemotron, SeedOSS and Starcoder2. Fine-tuned and custom models use the same architecture matching.
 
-In the Web UI the same options live under *Advanced Configuration → Speculative
-Decoding*, which only appears for a format/size that actually ships a drafter.
+Ordinary replicas accept ``pytorch``, ``fp8`` and ``fp4`` checkpoints, with quantization inferred from the checkpoint configuration. This includes compatible ModelOpt exports and native FP8 block-scaled or MXFP4 weights. Use ModelOpt exports for AWQ; generic Hugging Face AWQ/GPTQ, bitsandbytes, GGUF and MLX checkpoint formats are not supported by this PyTorch loader. TRT validates the checkpoint recipe and GPU kernel requirements at startup. Ordinary replicas accept ``dtype="auto"``, ``"float16"`` or ``"bfloat16"``; TP=PP=CP=1 still applies. Shared caching and P/D have the additional constraints below.
 
-Optional parameters:
+The example launches two independent replicas with a shared 512 MiB Xavier CPU cache. Each replica uses one GPU. Install TRT-LLM in a compatible CUDA environment and set ``enable_virtual_env=False``, or use a per-model virtual environment with matching dependencies. Each replica currently requires TP=PP=CP=1, with TRT's worker running directly in the Xinference model process. Qwen3 weights and KV pages use BF16.
 
-* ``--num_speculative_tokens <n>``: how many tokens the drafter proposes per
-  round, including the bonus token. Left unset, MLX reads it from the drafter,
-  which runs at the depth it was trained for (``4`` for Gemma 4). Gemma 4 on
-  llama.cpp, vLLM, and SGLang follows the same model-size recipe: ``2`` for
-  E2B, ``4`` for E4B and 26B-A4B, and the lower end (``4``) of the recommended
-  ``4-8`` range for 12B and 31B. Other llama.cpp models keep xllamacpp's own
-  default.
-* ``--draft_quantization <quantization>``: which drafter conversion to use, when
-  the spec declares more than one — the MLX build of Gemma 4 12B publishes
-  eight. Defaults to the first declared, which is the least quantized one: a
-  drafter is small and quantizing it costs acceptance rate, so pairing a
-  quantized target with an unquantized drafter is the recommended setup.
-* ``--draft_model_path <path>``: use a local drafter instead of the one declared
-  by the spec. Implies ``--enable_mtp true``.
+.. code-block:: python
 
-The drafter must match the target model family and size — it shares the target's
-KV cache, so a mismatched checkpoint is rejected rather than silently degrading.
+   from xinference.client import Client
 
-Engine support:
+   client = Client("http://localhost:9997")
+   client.launch_model(
+       model_uid="qwen-trt",
+       model_name="qwen3",
+       model_size_in_billions="0_6",
+       model_format="pytorch",
+       model_engine="TRT-LLM",
+       quantization="none",
+       replica=2,
+       n_gpu=1,
+       context_length=4096,
+       enable_virtual_env=False,
+       enable_xavier=True,
+       xavier_cache_bytes=512 * 1024**2,
+   )
 
-.. list-table::
-   :header-rows: 1
-   :widths: 18 32 50
+Xavier publishes complete 64-token BF16 KV pages and restores matching prefixes in another replica through actor RPC. Partial pages and the final prompt token are computed locally. The shared cache uses bounded storage and LRU eviction; transfers currently use synchronous CPU staging.
 
-   * - Engine
-     - Requirement
-     - Notes
-   * - :ref:`vLLM <vllm_backend>`
-     - ``vllm>=0.22.0``, ``transformers>=5.8.0``
-     - Translated into ``speculative_config`` with ``method: mtp``. An
-       explicitly provided ``speculative_config`` is left untouched. Older
-       vLLM treats the drafter as a generic draft model, while older
-       Transformers does not recognize ``gemma4_assistant``; either case is
-       rejected before engine initialization. Virtual-environment launches
-       also synchronize ``flashinfer-cubin`` with ``flashinfer-python`` before
-       starting vLLM, repairing stale environments that contain mismatched
-       FlashInfer packages.
-   * - :ref:`SGLang <sglang_backend>`
-     - ``sglang==0.5.13.post1``, ``transformers==5.8.1``
-     - Translated into ``--speculative-algorithm NEXTN`` with the matching
-       ``speculative_num_steps`` / ``speculative_num_draft_tokens``. An
-       explicitly provided ``speculative_algorithm`` is left untouched.
-   * - :ref:`MLX <mlx_backend>`
-     - ``mlx-vlm>=0.5.0`` (``>=0.6.1`` for Gemma 4 12B)
-     - Served by the MLX vision engine, the one that runs multimodal models
-       such as Gemma 4. The drafter is validated against the target when the
-       model loads.
-   * - :ref:`llama.cpp <llama_cpp_backend>`
-     - ``xllamacpp>=2026.6.9713``
-     - Translated into the ``draft-mtp`` speculative implementation. The
-       drafter is a single gguf published inside the target's own repository,
-       so its quantizations are its own (``BF16``, ``F16``, ``Q8_0`` for Gemma
-       4) and independent of the target's. Earlier llama.cpp builds do not
-       know the ``gemma4-assistant`` architecture and cannot load it.
+Shared caching and same-engine P/D require TP=PP=CP=1, BF16 weights and KV, and disabled chunked prefill and overlap scheduling. Quantization, hybrid attention, multimodal input, LoRA, speculative decoding and ``cache_salt`` are not supported in these configurations. Ordinary replicas support :ref:`speculative_decoding` with NGram or Draft/Target. For supported cross-engine P/D combinations, see :ref:`user_guide_pd_separation`.
 
-Not supported by the Transformers engine: it runs its own continuous-batching
-loop rather than ``generate()``, so there is nowhere to attach a drafter.
+For same-engine P/D, set explicit prefill/decode roles in ``replica_config`` as described in :ref:`user_guide_pd_separation`. The default ``transfer_backend_type="xavier"`` uses NIXL to transfer KV pages directly between GPUs. Set ``transfer_backend_type="nixl"`` for TRT's native context/generation protocol and NIXL transport; do not also set ``enable_xavier=True``. Both paths support generation, chat, streaming and cancellation through the same Xinference API.
 
-When it pays off
-----------------
-Speculation is only worth it when a drafting step is cheap *relative to* a
-target decoding step. The drafter is a small dense model whose cost does not
-change with the target, so the ratio is what decides the outcome — and a
-mixture-of-experts target can land on the wrong side of it, because only its
-activated slice is read per token:
-
-.. list-table::
-   :header-rows: 1
-   :widths: 34 22 22 22
-
-   * - gemma-4 MLX, 4bit, M5 Pro
-     - Without a drafter
-     - With MTP
-     - Accepted per round
-   * - 31B (dense, 18.4 GB read per token)
-     - 14.9 tok/s
-     - **31.0 tok/s** (2.1x)
-     - 2.08 of 4
-   * - 26B-A4B (MoE, ~2.2 GB read per token)
-     - 73.2 tok/s
-     - 65.9 tok/s (0.9x)
-     - 1.40 of 4
-
-The 0.83 GB drafter costs about 5% of a 31B decoding step but 39% of a
-26B-A4B one, so on the MoE the three drafting steps of a round already exceed
-one plain decoding step — and the round has to win that back from a lower
-acceptance rate. The MoE is still the faster model here in absolute terms; it
-simply has no headroom left for speculation.
-
-So measure before leaving it on, and note that the verification step itself is
-not the problem: a four-token forward costs only ~40% more than a single-token
-one on either model.
+The shared cache actor reports ``imported_pages`` after copies into the destination KV pool complete. Use this counter to verify cross-instance imports. Measure latency and throughput for your workload; transfer costs can exceed the saved prefill computation.

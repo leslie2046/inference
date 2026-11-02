@@ -19,6 +19,7 @@ import logging
 from typing import TYPE_CHECKING, Awaitable, Callable, Literal, Optional
 
 from fastapi import Depends, HTTPException, Query, Request, Security
+from starlette.concurrency import run_in_threadpool
 
 from ..dependencies import get_api
 from ..responses import JSONResponse
@@ -63,8 +64,14 @@ async def create_launch_history(
         ui_data = body.get("ui_data")
         if not model_name:
             raise HTTPException(status_code=400, detail="model_name is required")
+        if "model_python_executable" in data:
+            raise HTTPException(
+                status_code=400,
+                detail="model_python_executable is reserved for internal recovery",
+            )
         username = user.get("username", "") if user else ""
-        api._launch_history_store.upsert(
+        await run_in_threadpool(
+            api._launch_history_store.upsert,
             model_name=model_name,
             model_uid=model_uid,
             data=data,

@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# CI: linux
 import asyncio
 
 import pytest
@@ -286,11 +287,16 @@ def test_resolve_allow_share_no_conflict():
     assert targets[0][1] == [0] and targets[1][1] == [0]
 
 
-def test_resolve_local_mode_ignores_worker_ip():
+@pytest.mark.parametrize("roles_separated", [False, True])
+def test_resolve_local_mode_ignores_worker_ip(roles_separated):
     # Local deployment: a single worker whose address == supervisor address.
     local_addr = "127.0.0.1:9978"
     w = _FakeWorker(local_addr, total=[0, 1])
     sup = _make_supervisor([w], address=local_addr)
+    if roles_separated:
+        sup.address = "supervisor-new:9999"
+        sup._local_deployment = True
+        sup._local_worker_address = local_addr
     assert sup.is_local_deployment() is True
     # worker_ip does not match, but local mode pins to the local worker anyway.
     targets, _ = asyncio.run(
@@ -333,3 +339,29 @@ def test_nvidia_mlx_topology_keeps_hardware_on_separate_roles(prefill, decode, v
     else:
         with pytest.raises(ValueError, match="MLX on one role"):
             validate_pd_replica_configs(configs, "vLLM", "LLM")
+
+
+@pytest.mark.parametrize("other", ["vLLM", "SGLang", "MLX"])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_trt_cross_engine_accepts_supported_engines(other, reverse):
+    engines = ["TRT-LLM", other]
+    if reverse:
+        engines.reverse()
+    configs = [
+        ReplicaConfig(role=role, model_engine=engine)
+        for role, engine in zip(("prefill", "decode"), engines)
+    ]
+    assert validate_pd_replica_configs(configs, "vLLM", "LLM")
+
+
+@pytest.mark.parametrize("role", ["hybrid", "prefill", "decode"])
+def test_replica_engine_config_rejects_internal_interpreter(role):
+    configs = [
+        ReplicaConfig(
+            role=role, engine_config={"model_python_executable": "/arbitrary/python"}
+        )
+    ]
+    with pytest.raises(
+        ValueError, match="Reserved replica engine_config keys: model_python_executable"
+    ):
+        validate_pd_replica_configs(configs, "vLLM", "LLM")

@@ -1,3 +1,5 @@
+# CI: linux
+
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -1017,7 +1019,7 @@ def test_non_llm_excludes_unlaunchable_spec(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "engine", ["vLLM", "SGLang", "MLX", "Transformers", "llama.cpp", "LMDeploy"]
+    "engine", ["vLLM", "SGLang", "MLX", "Transformers", "llama.cpp"]
 )
 def test_recommendation_preserves_unified_context(engine):
     result = recommend(
@@ -1027,9 +1029,7 @@ def test_recommendation_preserves_unified_context(engine):
     assert result["config"]["context_length"] == 32768
     if engine == "llama.cpp":
         assert result["config"]["n_parallel"] == 1
-    assert not any(
-        key in result["config"] for key in ["max_model_len", "n_ctx", "session_len"]
-    )
+    assert not any(key in result["config"] for key in ["max_model_len", "n_ctx"])
 
 
 @pytest.mark.asyncio
@@ -1068,7 +1068,7 @@ async def test_supervisor_rejects_invalid_launch_context_before_placement(value)
 
     with pytest.raises(ValueError, match="context_length"):
         await SupervisorActor.launch_builtin_model(
-            SimpleNamespace(),
+            SupervisorActor.__new__(SupervisorActor),
             "test",
             "test",
             4,

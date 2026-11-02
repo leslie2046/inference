@@ -186,6 +186,7 @@ def validate_pd_replica_configs(
         (cfg.model_engine or model_engine or "").lower() for cfg in configs or []
     }
     reserved = {
+        "model_python_executable",
         "model_uid",
         "model_name",
         "model_size_in_billions",
@@ -234,11 +235,11 @@ def validate_pd_replica_configs(
             raise ValueError("Per-replica engine settings require explicit PD roles")
         return False
     if (
-        not engines <= {"vllm", "sglang", "mlx"}
+        not engines <= {"vllm", "sglang", "mlx", "trt-llm"}
         or (model_type or "LLM").lower() != "llm"
     ):
         raise ValueError(
-            "PD separation requires model_type=LLM and model_engine=vLLM, SGLang or MLX"
+            "PD separation requires model_type=LLM and model_engine=vLLM, SGLang, MLX or TRT-LLM"
         )
     if roles != {"prefill", "decode"}:
         raise ValueError(
@@ -254,7 +255,8 @@ def validate_pd_replica_configs(
             for role in ("prefill", "decode")
         }
         if not any(
-            role_engines[role] == {"mlx"} and role_engines[other] <= {"vllm", "sglang"}
+            role_engines[role] == {"mlx"}
+            and role_engines[other] <= {"vllm", "sglang", "trt-llm"}
             for role, other in (("prefill", "decode"), ("decode", "prefill"))
         ):
             raise ValueError(

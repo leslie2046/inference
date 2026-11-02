@@ -18,6 +18,7 @@ import inspect
 import json
 import os
 import queue
+import threading
 import time
 import types
 import uuid
@@ -30,6 +31,7 @@ from typing import (
     Generator,
     List,
     Optional,
+    Set,
     Union,
     no_type_check,
 )
@@ -45,6 +47,7 @@ from ..constants import (
 
 if TYPE_CHECKING:
     from .progress_tracker import ProgressTrackerActor
+    from .realtime.runtime import RealtimeRuntime
     from .worker import WorkerActor
     from ..model.llm.core import LLM
     from ..model.llm.weight_cache import WeightCachedModel
@@ -55,7 +58,8 @@ import logging
 logger = logging.getLogger(__name__)
 
 from ..device_utils import empty_cache
-from .exceptions import ModelNotReadyError
+from .exceptions import InvalidModelRequestError, ModelNotReadyError
+from .model_generation import ModelGenerationMixin
 from .rpc_context import rpc_context
 from .utils import CancelMixin, json_dumps, log_async, parse_replica_model_uid
 
@@ -77,6 +81,33 @@ XINFERENCE_TEST_OUT_OF_MEMORY_ERROR = bool(
 )
 
 
+async def _await_owned_task(task: asyncio.Future):
+    """Cancellation cannot abandon native work that still owns model resources."""
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                continue
+            except BaseException:
+                break
+        try:
+            task.result()
+        except BaseException:
+            pass  # Consume native errors without replacing client cancellation.
+        raise
+
+
+class _RealtimeFileStream:
+    def __init__(self, raw, request_id: Optional[str]):
+        self.raw = raw
+        self.request_id = request_id
+        self.cancelled = threading.Event()
+        self.done = asyncio.get_running_loop().create_future()
+
+
 def register_batching_multimodal_models(*model_names: str):
     def decorator(cls):
         for name in model_names:
@@ -96,11 +127,17 @@ def request_limit(fn):
 
     async def wrapped_func(self, *args, **kwargs):
         if getattr(self, "_model_state", None) == "reloading":
-            raise ModelNotReadyError("Model is reloading")
+            admission = self.__dict__.get("_reload_admission")
+            if admission is None:
+                raise ModelNotReadyError("Model is reloading")
+            await admission.wait()
+            self._require_ready()
         logger.debug(
             f"Request {fn.__name__}, current serve request count: {self._serve_count}, request limit: {self._request_limits} for the model {self.model_uid()}"
         )
-        if 1 + self._serve_count <= self._request_limits:
+        realtime = getattr(self, "_realtime_runtime", None)
+        realtime_count = realtime.active_count if realtime is not None else 0
+        if 1 + self._serve_count + realtime_count <= self._request_limits:
             self._serve_count += 1
         else:
             await self.record_metrics(
@@ -211,10 +248,16 @@ def oom_check(fn):
         return _wrapper
 
 
-class ModelActor(xo.StatelessActor, CancelMixin):
+class ModelActor(ModelGenerationMixin, xo.StatelessActor, CancelMixin):
     _replica_model_uid: Optional[str]
+    _realtime_runtime: Optional["RealtimeRuntime"]
+    _model_state: str
 
     async def __pre_destroy__(self):
+        await ModelActor._drain_realtime(self)
+        await self.close_model_generations()
+        for cache in self.__dict__.get("_generation_caches", {}).values():
+            await asyncio.to_thread(cache.stop)
         from ..model.embedding.core import EmbeddingModel
         from ..model.llm.sglang.core import SGLANGModel
         from ..model.llm.transformers.core import PytorchModel as LLMPytorchModel
@@ -267,6 +310,23 @@ class ModelActor(xo.StatelessActor, CancelMixin):
             gc.collect()
             empty_cache()
 
+    async def _drain_realtime(self):
+        runtime = getattr(self, "_realtime_runtime", None)
+        if runtime is not None:
+            self._model_state = "draining"
+            streams = list(self._realtime_file_streams)
+            for stream in streams:
+                stream.cancelled.set()
+            await runtime.stop()
+            if streams:
+                await _await_owned_task(asyncio.gather(*(s.done for s in streams)))
+            # File inference uses the same lock and may still own native work
+            # after its client disconnects. Drain it before unloading weights.
+            assert self._lock is not None
+            async with self._lock:
+                pass
+            self._realtime_runtime = None
+
     def __init__(
         self,
         supervisor_address: str,
@@ -279,8 +339,10 @@ class ModelActor(xo.StatelessActor, CancelMixin):
         shard: Optional[int] = 0,
         driver_info: Optional[dict] = None,  # for model across workers
         model_engine: Optional[str] = None,
+        model_python_executable: Optional[str] = None,
     ):
         super().__init__()
+        self._generation_python_executable = model_python_executable
 
         from ..model.llm.vllm.core import VLLMModel
 
@@ -298,8 +360,12 @@ class ModelActor(xo.StatelessActor, CancelMixin):
             None if getattr(self._model, "allow_batch", False) else asyncio.locks.Lock()
         )
         self._worker_ref = None
+        self._worker_generation = 0
         self._progress_tracker_ref = None
         self._serve_count = 0
+        self._realtime_runtime = None
+        self._realtime_file_streams: Set[_RealtimeFileStream] = set()
+        self._realtime_start_lock = asyncio.Lock()
         model_type = self._model_description.get("model_type", "unknown")
         if model_type == "video":
             engine_label = model_engine or ""
@@ -325,7 +391,7 @@ class ModelActor(xo.StatelessActor, CancelMixin):
             ),
         }
         self._loop: Optional[asyncio.AbstractEventLoop] = None
-        self._model_state: str = "registering"
+        self._model_state = "registering"
         # model across workers
         self._n_worker = n_worker
         self._shard = shard
@@ -375,6 +441,12 @@ class ModelActor(xo.StatelessActor, CancelMixin):
 
     @rpc_context
     async def decrease_serve_count(self):
+        # API stream cleanup can arrive while a cancelled next() is still
+        # executing. Do not release its request-limit slot before native drain.
+        # This legacy RPC has no request ID, so conservatively join live leases.
+        streams = list(self.__dict__.get("_realtime_file_streams", ()))
+        if streams:
+            await _await_owned_task(asyncio.gather(*(s.done for s in streams)))
         self._serve_count = max(0, self._serve_count - 1)
         await self.record_metrics(
             "model_serve_count",
@@ -399,6 +471,7 @@ class ModelActor(xo.StatelessActor, CancelMixin):
             store_address=self._xavier_config.get("store_address"),  # type: ignore
             store_port=self._xavier_config.get("store_port"),  # type: ignore
             world_addresses=rank_addresses,
+            cache_backend=self._xavier_config.get("cache_backend"),
             freeze_initialization_gc=(
                 self._model._is_vllm_v1()
                 and self._xavier_config.get("gpu_cache_bytes") is None
@@ -445,13 +518,41 @@ class ModelActor(xo.StatelessActor, CancelMixin):
             )
         await asyncio.gather(*coros)
 
+    def get_worker_binding(self):
+        binding = {"protocol": 1, "address": self._worker_address}
+        if self.__dict__.get("_serving_generation") is not None or self.__dict__.get(
+            "_retiring_generations"
+        ):
+            binding["generation_routing"] = 1
+        return binding
+
+    def rebind_worker(self, expected_address: str, address: str, generation: int):
+        """Replace the control-plane binding without touching the model runtime."""
+        current = self._worker_generation
+        if generation >= current and self._worker_address == address:
+            # A process recovered by the new owner is already bound here.
+            if generation != current:
+                self._worker_ref = None
+            self._worker_generation = generation
+            return True
+        if self._worker_address != expected_address or generation <= current:
+            raise RuntimeError("Stale model worker binding")
+        self._worker_address = address
+        self._worker_generation = generation
+        self._worker_ref = None
+        self._metrics_labels["worker_address"] = address
+        return True
+
     async def _get_worker_ref(self) -> xo.ActorRefType["WorkerActor"]:
         from .worker import WorkerActor
 
-        if self._worker_ref is None:
-            self._worker_ref = await xo.actor_ref(
-                address=self._worker_address, uid=WorkerActor.default_uid()
-            )
+        while self._worker_ref is None:
+            address = self._worker_address
+            generation = self._worker_generation
+            ref = await xo.actor_ref(address=address, uid=WorkerActor.default_uid())
+            if address != self._worker_address or generation != self._worker_generation:
+                continue
+            self._worker_ref = ref
         return self._worker_ref
 
     async def _get_progress_tracker_ref(
@@ -489,12 +590,27 @@ class ModelActor(xo.StatelessActor, CancelMixin):
 
         return isinstance(self._model, SGLANGModel)
 
+    def get_limit_mm_per_prompt(self) -> Optional[Dict[str, int]]:
+        from ..model.llm.vllm.core import VLLMModel
+
+        if not isinstance(self._model, VLLMModel):
+            return None
+        return self._model.get_limit_mm_per_prompt()
+
     def get_sglang_pd_bootstrap(self) -> dict:
         from ..model.llm.sglang.core import SGLANGModel
 
         if not isinstance(self._model, SGLANGModel):
             raise ValueError("SGLang P/D bootstrap requires a SGLang replica")
         return self._model.get_pd_bootstrap()
+
+    @rpc_context
+    async def release_trt_pd_request(self, request_id: str) -> None:
+        from ..model.llm.trt_llm.core import TRTLLMModel
+
+        if not isinstance(self._model, TRTLLMModel):
+            raise ValueError("TRT-LLM P/D release requires a TRT-LLM replica")
+        await self._model.release_pd_request(request_id)
 
     async def load(self):
         self._model_state = "loading"
@@ -537,7 +653,79 @@ class ModelActor(xo.StatelessActor, CancelMixin):
     async def wait_for_load(self):
         if hasattr(self._model, "wait_for_load"):
             await asyncio.to_thread(self._model.wait_for_load)
+        await self._start_realtime_runtime()
         self._model_state = "ready"
+
+    async def _start_realtime_runtime(self):
+        async with self._realtime_start_lock:
+            await self._start_realtime_runtime_unlocked()
+
+    async def _start_realtime_runtime_unlocked(self):
+        if self._realtime_runtime is not None:
+            return
+        capabilities = getattr(self._model, "get_realtime_capabilities", None)
+        if capabilities is None or not capabilities().get("tasks"):
+            return
+        if self._lock is None:
+            raise ValueError("Realtime adapters require serialized inference")
+        from urllib.parse import urlsplit
+
+        from .realtime.protocol import RealtimeLimits
+        from .realtime.runtime import RealtimeRuntime
+
+        base_uid, _ = parse_replica_model_uid(self._replica_model_uid or "")
+        max_sessions = int(os.environ.get("XINFERENCE_REALTIME_MAX_SESSIONS", "1"))
+        if not 1 <= max_sessions <= 128:
+            raise ValueError("XINFERENCE_REALTIME_MAX_SESSIONS must be in [1, 128]")
+        runtime = RealtimeRuntime(
+            self._model,
+            base_uid,
+            self._replica_model_uid or "",
+            limits=RealtimeLimits(max_sessions=max_sessions),
+            inference_lock=self._lock,
+            admission=lambda: self._model_state == "ready"
+            and self._serve_count + runtime.active_count < self._request_limits,
+        )
+        worker_host = urlsplit(
+            self._worker_address
+            if "://" in self._worker_address
+            else "tcp://" + self._worker_address
+        ).hostname
+        host = os.environ.get(
+            "XINFERENCE_REALTIME_BIND_HOST", worker_host or "127.0.0.1"
+        )
+        advertised = os.environ.get(
+            "XINFERENCE_REALTIME_ADVERTISE_HOST", worker_host or host
+        )
+        if advertised in ("0.0.0.0", "::"):
+            raise ValueError("Configure a routable XINFERENCE_REALTIME_ADVERTISE_HOST")
+        await runtime.start(host, advertised)
+        self._realtime_runtime = runtime
+
+    def get_realtime_endpoint(self, subject: str, task: str) -> Dict[str, Any]:
+        """Connect-time discovery only; never append/poll media over Actor RPC."""
+        self._require_ready()
+        from .realtime.protocol import RealtimeError
+
+        if self._realtime_runtime is None:
+            raise RealtimeError(
+                "unsupported_task", "Model has no realtime input adapter"
+            )
+        return self._realtime_runtime.issue_ticket(subject, task)
+
+    def get_realtime_status(self) -> Dict[str, Any]:
+        """Low-frequency control-plane observation, not result polling."""
+        runtime = self._realtime_runtime
+        if runtime is None:
+            return {"readiness": False, "active_sessions": 0}
+        return {
+            "readiness": bool(runtime.endpoint) and not runtime.draining,
+            "runtime_generation": runtime.generation,
+            "active_sessions": runtime.active_count,
+            "completed_sessions": runtime.completed_count,
+            "failed_sessions": runtime.failed_count,
+            "input_queue_peak": runtime.input_queue_peak,
+        }
 
     def _get_weight_cached_model(self) -> "WeightCachedModel":
         from ..model.llm.weight_cache import WeightCachedModel
@@ -547,7 +735,16 @@ class ModelActor(xo.StatelessActor, CancelMixin):
         return self._model
 
     def get_reload_config(self) -> Dict[str, Any]:
-        return self._get_weight_cached_model().get_reload_config()
+        import sys
+        from importlib.metadata import PackageNotFoundError, version
+
+        config = self._get_weight_cached_model().get_reload_config()
+        config["python_executable"] = sys.executable
+        try:
+            config["engine_version"] = version(config["engine"])
+        except PackageNotFoundError:
+            config["engine_version"] = None
+        return config
 
     async def validate_reload(self, model_config: Dict[str, Any]) -> Dict[str, Any]:
         self._require_ready()
@@ -566,6 +763,7 @@ class ModelActor(xo.StatelessActor, CancelMixin):
         await self.validate_reload(model_config)
         model = self._get_weight_cached_model()
         self._model_state = "reloading"
+        self._reload_admission = asyncio.Event()
         self._reload_status = {"stage": "draining"}
         try:
             deadline = time.monotonic() + drain_timeout
@@ -594,6 +792,8 @@ class ModelActor(xo.StatelessActor, CancelMixin):
             self._model_state = "ready"
             self._reload_status.update(stage="ready")
             return not model._is_hot_patch(model_config)
+        finally:
+            self._reload_admission.set()
 
     def need_create_pools(self):
         return getattr(self._model, "need_create_pools", False)
@@ -647,6 +847,11 @@ class ModelActor(xo.StatelessActor, CancelMixin):
 
     async def stop(self):
         self._model_state = "stopping"
+        # WorkerActor calls stop() before destroy_actor(), so teardown alone is
+        # too late to protect resources released by the model's stop()/close().
+        await ModelActor._drain_realtime(self)
+        self._model_state = "stopping"
+        await self.close_model_generations()
         await ModelActor._close_gpu_caches(self)
         if hasattr(self._model, "stop"):
             await asyncio.to_thread(self._model.stop)
@@ -805,7 +1010,8 @@ class ModelActor(xo.StatelessActor, CancelMixin):
     async def _handle_pending_requests(self):
         logger.info("Start requests handler.")
         while True:
-            gen, stream_out, stop = await self._pending_requests.get()
+            pending = await self._pending_requests.get()
+            gen, stream_out, stop = pending[:3]
 
             async def _async_wrapper(_gen):
                 try:
@@ -825,6 +1031,53 @@ class ModelActor(xo.StatelessActor, CancelMixin):
                 except Exception as e:
                     return e
 
+            if len(pending) == 4:
+                # For realtime-enabled adapters, lock ownership was transferred
+                # from generator creation to this pending stream, not released.
+                lease = pending[3]
+                try:
+                    while not lease.cancelled.is_set():
+                        if inspect.isgenerator(gen):
+                            r = await _await_owned_task(
+                                asyncio.create_task(asyncio.to_thread(_wrapper, gen))
+                            )
+                        else:
+                            r = await _await_owned_task(
+                                asyncio.create_task(_async_wrapper(gen))
+                            )
+                        if lease.cancelled.is_set():
+                            break
+                        if r is stop:
+                            break
+                        stream_out.put_nowait(r)
+                        if isinstance(r, Exception):
+                            break
+                finally:
+
+                    async def close_stream():
+                        try:
+                            # Close both the metrics/SSE wrapper and the raw
+                            # generator under the lease, including native cleanup.
+                            if inspect.isgenerator(gen):
+                                try:
+                                    await asyncio.to_thread(gen.close)
+                                finally:
+                                    await asyncio.to_thread(lease.raw.close)
+                            else:
+                                try:
+                                    await gen.aclose()
+                                finally:
+                                    await lease.raw.aclose()
+                        finally:
+                            stream_out.put_nowait(stop)
+                            assert self._lock is not None
+                            self._lock.release()
+                            self._realtime_file_streams.discard(lease)
+                            lease.done.set_result(None)
+
+                    await _await_owned_task(asyncio.create_task(close_stream()))
+                continue
+
             while True:
                 try:
                     if inspect.isgenerator(gen):
@@ -843,6 +1096,48 @@ class ModelActor(xo.StatelessActor, CancelMixin):
                     logger.exception("stream encountered an error.")
                 break
 
+    def _queue_realtime_file_stream(self, output_type: str, raw, request_id):
+        lease = _RealtimeFileStream(raw, request_id)
+        stop = object()
+        stream_out: Union[queue.Queue, asyncio.Queue]
+        if inspect.isgenerator(raw):
+            gen = self._to_generator(output_type, raw)
+            stream_out = queue.Queue()
+
+            def outputs():
+                try:
+                    while True:
+                        item = stream_out.get()
+                        if item is stop:
+                            return
+                        if isinstance(item, Exception):
+                            raise item
+                        yield item
+                finally:
+                    lease.cancelled.set()
+
+            result = outputs()
+        else:
+            gen = self._to_async_gen(output_type, raw)
+            stream_out = asyncio.Queue()
+
+            async def async_outputs():
+                try:
+                    while True:
+                        item = await stream_out.get()
+                        if item is stop:
+                            return
+                        if isinstance(item, Exception):
+                            raise item
+                        yield item
+                finally:
+                    lease.cancelled.set()
+
+            result = async_outputs()
+        self._realtime_file_streams.add(lease)
+        self._pending_requests.put_nowait((gen, stream_out, stop, lease))
+        return result
+
     async def _call_wrapper_json(self, fn: Callable, *args, **kwargs):
         return await self._call_wrapper("json", fn, *args, **kwargs)
 
@@ -851,7 +1146,9 @@ class ModelActor(xo.StatelessActor, CancelMixin):
 
     @oom_check
     async def _call_wrapper(self, output_type: str, fn: Callable, *args, **kwargs):
-        wait_for_sync_on_cancel = kwargs.pop("_wait_for_sync_on_cancel", False)
+        wait_for_sync_on_cancel = kwargs.pop("_wait_for_sync_on_cancel", False) or (
+            getattr(self, "_realtime_runtime", None) is not None
+        )
 
         async def _invoke():
             if inspect.iscoroutinefunction(fn):
@@ -863,17 +1160,26 @@ class ModelActor(xo.StatelessActor, CancelMixin):
             # actor task (and therefore its request-limit slot) alive until the
             # worker thread has observed cancellation and reaped that process.
             thread_task = asyncio.create_task(asyncio.to_thread(fn, *args, **kwargs))
-            try:
-                return await asyncio.shield(thread_task)
-            except asyncio.CancelledError:
-                try:
-                    await asyncio.shield(thread_task)
-                except BaseException:
-                    pass
-                raise
+            return await _await_owned_task(thread_task)
 
         self._add_running_task(kwargs.get("request_id"))
-        if self._lock is None:
+        if getattr(self, "_realtime_runtime", None) is not None:
+            assert self._lock is not None
+            await self._lock.acquire()
+            transferred = False
+            try:
+                self._require_ready()
+                ret = await _invoke()
+                if inspect.isgenerator(ret) or inspect.isasyncgen(ret):
+                    result = self._queue_realtime_file_stream(
+                        output_type, ret, kwargs.get("request_id")
+                    )
+                    transferred = True
+                    return result
+            finally:
+                if not transferred:
+                    self._lock.release()
+        elif self._lock is None:
             ret = await _invoke()
 
             if inspect.isgenerator(ret):
@@ -941,6 +1247,19 @@ class ModelActor(xo.StatelessActor, CancelMixin):
             if not getattr(self._model, "supports_cache_salt", False):
                 raise ValueError("cache_salt is not supported by this model engine")
 
+    def _get_async_request_id(self, args: tuple, kwargs: dict) -> str:
+        if "request_id" in kwargs:
+            return str(kwargs["request_id"])
+        from ..model.llm.trt_llm.core import TRTLLMModel
+
+        if isinstance(self._model, TRTLLMModel):
+            # REST keeps TRT's public ID in the generation config. Promote it
+            # before _call_wrapper registers the actor task for explicit abort.
+            config = args[0] if args else kwargs.get("generate_config")
+            if isinstance(config, dict) and config.get("request_id") is not None:
+                return str(config["request_id"])
+        return str(uuid.uuid1())
+
     @request_limit
     @xo.generator
     @log_async(logger=logger)
@@ -971,11 +1290,7 @@ class ModelActor(xo.StatelessActor, CancelMixin):
             await self._record_non_stream_completion_metrics(response, start_time)
             return response
         if hasattr(self._model, "async_generate"):
-            if "request_id" not in kwargs:
-                kwargs["request_id"] = str(uuid.uuid1())
-            else:
-                # model only accept string
-                kwargs["request_id"] = str(kwargs["request_id"])
+            kwargs["request_id"] = self._get_async_request_id(args, kwargs)
             response = await self._call_wrapper_json(
                 self._model.async_generate,
                 prompt,
@@ -1015,11 +1330,7 @@ class ModelActor(xo.StatelessActor, CancelMixin):
                 )
                 return response
             if hasattr(self._model, "async_chat"):
-                if "request_id" not in kwargs:
-                    kwargs["request_id"] = str(uuid.uuid1())
-                else:
-                    # model only accept string
-                    kwargs["request_id"] = str(kwargs["request_id"])
+                kwargs["request_id"] = self._get_async_request_id(args, kwargs)
                 response = await self._call_wrapper_json(
                     self._model.async_chat, messages, *args, **kwargs
                 )
@@ -1066,9 +1377,47 @@ class ModelActor(xo.StatelessActor, CancelMixin):
     ) -> str:
         from ..model.scheduler.core import AbortRequestMessage
 
+        stream_cancelled = False
+        for stream in self.__dict__.get("_realtime_file_streams", ()):
+            if stream.request_id == request_id:
+                stream.cancelled.set()
+                stream_cancelled = True
+
+        generation_results = []
+        active_error = None
+        active = self.__dict__.get("_serving_generation")
+        for ref in [
+            active,
+            *self.__dict__.get("_retiring_generations", []),
+        ]:
+            if ref is not None:
+                try:
+                    generation_results.append(
+                        await ref.abort_request(request_id, block_duration)
+                    )
+                except Exception as error:
+                    if ref == active:
+                        active_error = error
+                    logger.debug("Generation could not abort request", exc_info=True)
+        generation_result = next(
+            (
+                value
+                for value in generation_results
+                if value != AbortRequestMessage.NO_OP.name
+            ),
+            AbortRequestMessage.NO_OP.name,
+        )
+        if (generation_results or active_error is not None) and not self._serve_count:
+            if (
+                active_error is not None
+                and generation_result == AbortRequestMessage.NO_OP.name
+            ):
+                raise active_error
+            return generation_result
+
         # Always cancel the running task first
         task = self._running_tasks.get(request_id)
-        cancelled = (
+        cancelled = stream_cancelled or (
             task is not None
             and not task.done()
             and task.get_name() != self._CANCEL_TASK_NAME
@@ -1078,16 +1427,27 @@ class ModelActor(xo.StatelessActor, CancelMixin):
         # If model has abort_request method, delegate to it
         if hasattr(self._model, "abort_request"):
             result = await self._model.abort_request(request_id)
-            if result is not None and (
-                not cancelled or result != AbortRequestMessage.NO_OP.name
+            if (
+                result is not None
+                and (not cancelled or result != AbortRequestMessage.NO_OP.name)
+                and (
+                    result != AbortRequestMessage.NO_OP.name
+                    or generation_result == AbortRequestMessage.NO_OP.name
+                )
+                and (result != AbortRequestMessage.NO_OP.name or active_error is None)
             ):
                 return result
 
-        if cancelled:
+        if cancelled or stream_cancelled:
             return AbortRequestMessage.DONE.name
 
         # Otherwise return NO_OP for legacy models or when model doesn't handle abort
-        return AbortRequestMessage.NO_OP.name
+        if (
+            active_error is not None
+            and generation_result == AbortRequestMessage.NO_OP.name
+        ):
+            raise active_error
+        return generation_result
 
     @request_limit
     @log_async(logger=logger)
@@ -1285,7 +1645,10 @@ class ModelActor(xo.StatelessActor, CancelMixin):
             from ..model.utils import resolve_media_seed
 
             if "seed" in kwargs:
-                seed = resolve_media_seed(kwargs["seed"])
+                try:
+                    seed = resolve_media_seed(kwargs["seed"])
+                except ValueError as e:
+                    raise InvalidModelRequestError(str(e)) from e
                 if seed is None:
                     kwargs.pop("seed")
                 else:
@@ -1769,4 +2132,21 @@ class ModelActor(xo.StatelessActor, CancelMixin):
             )
         raise AttributeError(
             f"Model {self._model.model_spec} is not for controlnet_model_list."
+        )
+
+
+class ModelGenerationActor(ModelActor):
+    """A fresh interpreter loads the model wrapper from its installed package."""
+
+    def __init__(self, snapshot, supervisor_address, worker_address):
+        from .model_generation import build_generation_model
+
+        super().__init__(
+            supervisor_address,
+            worker_address,
+            build_generation_model(snapshot),
+            replica_model_uid=snapshot["model_uid"],
+            model_engine=snapshot.get("model_engine", snapshot["engine"]),
+            request_limits=snapshot["request_limits"],
+            model_python_executable=snapshot.get("model_python_executable"),
         )

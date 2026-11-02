@@ -11,6 +11,7 @@ User Guide
    launch
    backends
    client_api
+   realtime
    anthropic
    SD WebUI API compatibility <sd_webui>
 
@@ -19,6 +20,7 @@ User Guide
    :caption: Deployment
 
    using_docker_swarm
+   zero_downtime_upgrade
 
 .. toctree::
    :maxdepth: 2
@@ -34,6 +36,7 @@ User Guide
    :caption: Advanced performance
 
    continuous_batching
+   speculative_decoding
    distributed_inference
-   vllm_enhancement
+   Xavier <vllm_enhancement>
    PD separation <pd_separation>

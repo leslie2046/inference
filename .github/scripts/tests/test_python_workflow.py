@@ -1,9 +1,8 @@
-"""Check static platform matrices and their path selection in Python CI."""
+"""Check job dependencies, static matrices and path selection in Python CI."""
 
 import ast
 import json
 import os
-import re
 import subprocess
 import sys
 import tempfile
@@ -14,12 +13,22 @@ from unittest.mock import patch
 import yaml
 
 ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(ROOT / ".github/scripts"))
+from check_test_platform_coverage import changed_paths  # noqa: E402
+from check_test_platform_coverage import coverage_errors  # noqa: E402
+from check_test_platform_coverage import (  # noqa: E402
+    classified_test as _classified_test,
+)
+
 WORKFLOW = yaml.safe_load((ROOT / ".github/workflows/python.yaml").read_text())
 JOBS = WORKFLOW["jobs"]
 PLATFORM_STEP = next(
     step for step in JOBS["changes"]["steps"] if step.get("id") == "platform"
 )
 GPU_STEP = next(step for step in JOBS["changes"]["steps"] if step.get("id") == "gpu")
+INSTALL_STEP = next(
+    step for step in JOBS["changes"]["steps"] if step.get("id") == "install"
+)
 TEST_STEP = next(
     step
     for step in JOBS["build_test_job"]["steps"]
@@ -30,14 +39,7 @@ LINUX_PATHS = TEST_STEP["env"]["LINUX_TEST_PATHS"].split()
 
 
 def classified_test(path, content):
-    if any(
-        path == target or path.startswith(target + "/")
-        for target in PLATFORM_PATHS + LINUX_PATHS
-    ):
-        return True
-    if path.startswith("xinference/model/llm/mlx/tests/"):
-        return True  # Discovered by the macOS unit/Metal jobs.
-    return re.search(r"^# CI: linux$", content, re.MULTILINE) is not None
+    return _classified_test(path, content, PLATFORM_PATHS + LINUX_PATHS)
 
 
 class TestPythonWorkflow(unittest.TestCase):
@@ -85,13 +87,15 @@ class TestPythonWorkflow(unittest.TestCase):
             )
             return [json.loads(line) for line in trace.read_text().splitlines()]
 
-    def select(self, paths, *, event="pull_request", diff_available=True):
+    def select(
+        self, paths, *, event="pull_request", diff_available=True, step=PLATFORM_STEP
+    ):
         with tempfile.TemporaryDirectory() as directory:
             work = Path(directory)
             (work / "changed-files.txt").write_text("\n".join(paths) + "\n")
             output = work / "outputs"
             script = (
-                PLATFORM_STEP["run"]
+                step["run"]
                 .replace("${{ github.event_name }}", event)
                 .replace(
                     "${{ steps.gpu.outputs.diff_available }}",
@@ -141,6 +145,70 @@ class TestPythonWorkflow(unittest.TestCase):
         self.assertNotIn("schedule", triggers)
         self.assertIn("workflow_dispatch", triggers)
 
+    def test_installer_only_runs_after_lint_in_the_parent_workflow(self):
+        caller = JOBS["install_script"]
+        self.assertEqual(caller["needs"], ["lint", "changes"])
+        self.assertEqual(caller["if"], "${{ needs.changes.outputs.install == 'true' }}")
+        self.assertEqual(
+            JOBS["changes"]["outputs"]["install"],
+            "${{ steps.install.outputs.install }}",
+        )
+        installer = yaml.safe_load((ROOT / caller["uses"]).read_text())
+        self.assertEqual(
+            installer.get("on", installer.get(True)), {"workflow_call": None}
+        )
+        # The caller owns cancellation; a shared concurrency group in the
+        # reusable workflow could cancel its own parent.
+        self.assertNotIn("concurrency", installer)
+        self.assertEqual(
+            installer["jobs"]["install"]["strategy"]["matrix"]["os"],
+            ["ubuntu-latest", "macos-latest", "windows-latest"],
+        )
+
+    def test_installer_path_selection(self):
+        for path in (
+            "scripts/install.sh",
+            "scripts/install.ps1",
+            "scripts/check_install.py",
+            "scripts/manage_install.py",
+            "pyproject.toml",
+            "xinference/deploy/service.py",
+            "xinference/deploy/cmdline.py",
+            "xinference/deploy/test/test_service.py",
+            "xinference/deploy/test/test_installer.py",
+            ".github/workflows/install-script.yaml",
+            ".github/workflows/python.yaml",
+        ):
+            for event in ("pull_request", "push"):
+                with self.subTest(path=path, event=event):
+                    self.assertEqual(
+                        self.select([path], event=event, step=INSTALL_STEP),
+                        {"install": "true"},
+                    )
+        for paths in (
+            [],
+            ["README.md", "doc/source/getting_started.rst"],
+            ["frontend/src/app/page.tsx", "xinference/core/worker.py"],
+            ["scripts/other.py", ".github/workflows/assign.yaml"],
+        ):
+            with self.subTest(paths=paths):
+                self.assertEqual(
+                    self.select(paths, step=INSTALL_STEP), {"install": "false"}
+                )
+
+    def test_installer_runs_when_diff_is_unavailable(self):
+        for event in ("pull_request", "push", "workflow_dispatch"):
+            with self.subTest(event=event):
+                self.assertEqual(
+                    self.select(
+                        ["README.md"],
+                        event=event,
+                        diff_available=False,
+                        step=INSTALL_STEP,
+                    ),
+                    {"install": "true"},
+                )
+
     def test_docs_frontend_and_unrelated_changes_skip_platforms(self):
         for paths in (
             [],
@@ -182,6 +250,7 @@ class TestPythonWorkflow(unittest.TestCase):
         for path in (
             "xinference/model/llm/vllm/core.py",
             "xinference/model/llm/sglang/core.py",
+            "xinference/model/llm/trt_llm/core.py",
             "xinference/model/llm/transformers/core.py",
             "xinference/model/llm/llama_cpp/core.py",
             "xinference/model/embedding/core.py",
@@ -330,7 +399,7 @@ class TestPythonWorkflow(unittest.TestCase):
             "xinference/model/llm/mlx",
             "xinference/model/llm/vllm",
             "xinference/model/llm/sglang",
-            "xinference/model/llm/lmdeploy",
+            "xinference/model/llm/trt_llm",
             "xinference/model/embedding/vllm",
             "xinference/model/rerank/vllm",
         ):
@@ -381,7 +450,7 @@ class TestPythonWorkflow(unittest.TestCase):
             "rerank": {"llama_cpp", "sentence_transformers", "tests"},
         }
         restricted = {
-            "llm": {"lmdeploy", "mlx", "sglang", "vllm"},
+            "llm": {"mlx", "sglang", "trt_llm", "vllm"},
             "embedding": {"vllm"},
             "rerank": {"vllm"},
         }
@@ -510,6 +579,7 @@ class TestPythonWorkflow(unittest.TestCase):
 
     def test_explicit_linux_test_files_are_classified(self):
         for path in (
+            "xinference/model/llm/trt_llm/tests",
             "xinference/model/llm/vllm/xavier/test/test_v1_engine.py",
             "xinference/model/llm/sglang/tests/test_runtime.py",
             "xinference/model/audio/tests/test_audio_batching.py",
@@ -536,33 +606,8 @@ class TestPythonWorkflow(unittest.TestCase):
             self.skipTest(
                 "GitHub supplies TEST_BASE_SHA for PR/main coverage classification"
             )
-        changed = subprocess.run(
-            [
-                "git",
-                "diff",
-                "--no-renames",
-                "--diff-filter=AM",
-                "--name-only",
-                f"{base}...{head}",
-            ],
-            cwd=ROOT,
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.splitlines()
-        for name in changed:
-            if not name.startswith("xinference/") or not Path(name).name.startswith(
-                "test_"
-            ):
-                continue
-            if name.startswith("xinference/thirdparty/"):
-                continue
-            self.assertTrue(
-                classified_test(name, (ROOT / name).read_text()),
-                f"{name}: add it to PLATFORM_TEST_PATHS, LINUX_TEST_PATHS "
-                "(or the macOS scope), or declare "
-                "'# CI: linux' for a portable/Linux-only regression. Do not silently omit new tests.",
-            )
+        changed = changed_paths(ROOT, base=base, head=head)
+        self.assertEqual(coverage_errors(ROOT, changed), [])
 
     def test_pr_classification_excludes_main_changes_in_merge_checkout(self):
         lint_step = next(
@@ -574,8 +619,17 @@ class TestPythonWorkflow(unittest.TestCase):
             lint_step["env"]["TEST_HEAD_SHA"],
             "${{ github.event.pull_request.head.sha || github.sha }}",
         )
+        pre_commit_step = next(
+            step
+            for step in JOBS["lint"]["steps"]
+            if step.get("name") == "Run pre-commit"
+        )
+        self.assertEqual(pre_commit_step["env"], lint_step["env"])
         with tempfile.TemporaryDirectory() as directory:
             work = Path(directory)
+            workflow = work / ".github/workflows/python.yaml"
+            workflow.parent.mkdir(parents=True)
+            workflow.write_text(yaml.safe_dump(WORKFLOW))
 
             def git(*args):
                 return subprocess.check_output(

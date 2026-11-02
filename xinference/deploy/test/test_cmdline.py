@@ -28,6 +28,7 @@ from ..cmdline import (
     model_launch,
     model_list,
     model_terminate,
+    query_engine_by_model_name,
     register_model,
     remove_cache,
     unregister_model,
@@ -278,9 +279,17 @@ def test_cmdline_of_custom_model(setup):
     assert "custom_model" not in result.output
 
 
-def test_worker_command_passes_endpoint_and_internal_address(monkeypatch):
+@pytest.mark.parametrize("replacement", [None, "127.0.0.1:9978"])
+@pytest.mark.parametrize("hosted", [False, True])
+def test_worker_command_passes_endpoint_and_internal_address(
+    monkeypatch, replacement, hosted
+):
     runner = CliRunner()
     calls = {}
+    if hosted:
+        monkeypatch.setenv("XINFERENCE_WORKER_HOST_SOCKET", "/tmp/host.sock")
+    else:
+        monkeypatch.delenv("XINFERENCE_WORKER_HOST_SOCKET", raising=False)
 
     class DummyRESTfulClient:
         def __init__(self, base_url):
@@ -295,6 +304,7 @@ def test_worker_command_passes_endpoint_and_internal_address(monkeypatch):
 
     monkeypatch.setattr(cmdline_module, "RESTfulClient", DummyRESTfulClient)
     monkeypatch.setattr("xinference.deploy.worker.main", fake_main)
+    monkeypatch.setattr("logging.config.dictConfig", lambda config: None)
 
     result = runner.invoke(
         worker,
@@ -305,14 +315,23 @@ def test_worker_command_passes_endpoint_and_internal_address(monkeypatch):
             "127.0.0.1",
             "--worker-port",
             "12345",
-        ],
+        ]
+        + (["--replace-worker", replacement] if replacement else []),
     )
 
+    if replacement and not hosted:
+        assert result.exit_code == 2
+        assert "relaunch" in result.output
+        assert not calls
+        return
     assert result.exit_code == 0
     assert calls["base_url"] == "http://127.0.0.1:9997"
     assert calls["resolved"] is True
     assert calls["main_kwargs"]["supervisor_address"] == "test://supervisor-internal"
     assert calls["main_kwargs"]["supervisor_endpoint"] == "http://127.0.0.1:9997"
+
+    assert calls["main_kwargs"].get("replace_worker") == replacement
+    assert calls["main_kwargs"].get("use_process_host", False) is (not hosted)
 
 
 @pytest.mark.platform_slow
@@ -689,3 +708,122 @@ def test_launch_fails_when_model_is_terminated(monkeypatch):
     assert result.exit_code == 1
     assert "test-model-uid was terminated before it became ready" in result.output
     assert "Model uid: test-model-uid" not in result.output
+
+
+@pytest.mark.parametrize("legacy_first", [False, True])
+def test_cached_columns_align_for_mixed_worker_metadata(monkeypatch, legacy_first):
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    known = {
+        "model_name": "current",
+        "model_type": "LLM",
+        "model_engine": ["vLLM"],
+        "path": "/current",
+    }
+    legacy = {
+        "model_name": "legacy",
+        "path": "/legacy",
+        "model_type": None,
+        "model_engine": None,
+    }
+    records = [legacy, known] if legacy_first else [known, legacy]
+    client = SimpleNamespace(list_cached_models=MagicMock(return_value=records))
+    monkeypatch.setattr(cmdline_module, "RESTfulClient", lambda **kwargs: client)
+    result = CliRunner().invoke(
+        list_cached_models,
+        ["--endpoint", "http://127.0.0.1:9997", "--api-key", "test-key"],
+    )
+    assert result.exit_code == 0, result.output
+    rows = [
+        [cell.strip() for cell in line.split("|")[1:-1]]
+        for line in result.output.splitlines()
+        if line.startswith("|")
+    ]
+    by_name = {
+        row["model_name"]: row
+        for row in [dict(zip(rows[0], values)) for values in rows[1:]]
+    }
+    assert by_name["current"]["path"] == "/current"
+    assert by_name["current"]["model_type"] == "LLM"
+    assert by_name["current"]["model_engine"] == "['vLLM']"
+    assert by_name["legacy"]["path"] == "/legacy"
+    assert by_name["legacy"]["model_type"] == "-"
+    assert by_name["legacy"]["model_engine"] == "-"
+
+
+def test_list_shows_running_flexible_models(monkeypatch):
+    class DummyRESTfulClient:
+        def __init__(self, base_url, api_key=None):
+            pass
+
+        def list_models(self):
+            return {
+                "my-flexible": {
+                    "model_type": "flexible",
+                    "model_name": "my-flexible-model",
+                }
+            }
+
+    monkeypatch.setattr(cmdline_module, "RESTfulClient", DummyRESTfulClient)
+    result = CliRunner().invoke(
+        model_list, ["--endpoint", "http://127.0.0.1:9997", "--api-key", "k"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "my-flexible" in result.output
+    assert "my-flexible-model" in result.output
+
+
+@pytest.mark.parametrize(
+    "option, value, expected_quantization",
+    [
+        ("--model-size-in-billions", "0.5", "Q4_K_M"),
+        ("--quantization", "q4_k_m", "Q4_K_M"),
+    ],
+)
+def test_engine_matches_parameters_like_launch(
+    monkeypatch, option, value, expected_quantization
+):
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    engines = {
+        "llama.cpp": [
+            {
+                "model_name": "qwen2.5-instruct",
+                "model_format": "ggufv2",
+                "model_size_in_billions": "0_5",
+                "quantizations": ["Q4_K_M"],
+            }
+        ]
+    }
+    client = SimpleNamespace(
+        query_engine_by_model_name=MagicMock(return_value=engines),
+        _set_token=MagicMock(),
+    )
+    monkeypatch.setattr(cmdline_module, "RESTfulClient", lambda **kwargs: client)
+    result = CliRunner().invoke(
+        query_engine_by_model_name,
+        [
+            "--endpoint",
+            "http://127.0.0.1:9997",
+            "--api-key",
+            "test-key",
+            "--model-name",
+            "qwen2.5-instruct",
+            option,
+            value,
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "does not support" not in result.output
+    rows = [line.split() for line in result.output.splitlines()]
+    assert [
+        "qwen2.5-instruct",
+        "llama.cpp",
+        "ggufv2",
+        "0_5",
+        expected_quantization,
+    ] in rows

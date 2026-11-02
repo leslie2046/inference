@@ -38,6 +38,9 @@ jobs:
       - name: Install lint and workflow test dependencies
         run: pip install pre-commit pytest
       - name: Run pre-commit
+        env:
+          TEST_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          TEST_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: pre-commit run --all-files
       - name: Test CI workflow
         env:
@@ -57,6 +60,12 @@ jobs:
         run: cd frontend && npm run test:permissions
       - name: Test catalog refresh controls
         run: cd frontend && npm run test:catalog-refresh
+      - name: Test persistent model favorites
+        run: cd frontend && npm run test:model-favorites
+      - name: Test structured realtime launch options
+        run: cd frontend && npm run test:realtime-options
+      - name: Test model and service upgrade controls
+        run: cd frontend && npm run test:model-reload && npm run test:worker-relaunch && npm run test:service-relaunch && npm run test:software-update
       - name: Build frontend (static export)
         run: cd frontend && npm run build
       - name: Verify static export output
@@ -71,6 +80,12 @@ jobs:
           pytest --noconftest -vv \
             xinference/api/tests/test_frontend_static.py \
             xinference/api/tests/test_frontend_static_real_export.py
+      - name: Test Worker host as container PID 1
+        env:
+          XINFERENCE_TEST_WORKER_HOST_DOCKER: "1"
+        run: |
+          pip install psutil
+          pytest --noconftest -vv xinference/deploy/test/test_worker_host.py
 
 
   changes:
@@ -82,6 +97,7 @@ jobs:
       platform: ${{ steps.platform.outputs.platform }}
       metal: ${{ steps.platform.outputs.metal }}
       platform_suite: ${{ steps.platform.outputs.suite }}
+      install: ${{ steps.install.outputs.install }}
     steps:
       - name: Check out code
         uses: actions/checkout@v7
@@ -123,6 +139,21 @@ jobs:
             # workflows, ...) do not need GPU CI at all.
             while IFS= read -r file; do
               case "$file" in
+                # This T4 suite exercises Transformers, selected audio engines,
+                # stable diffusion, and shared embedding/rerank code. Other
+                # engine implementations are not exercised by this job.
+                xinference/model/llm/vllm/*|xinference/model/llm/sglang/*|xinference/model/llm/mlx/*|xinference/model/llm/llama_cpp/*|xinference/model/llm/xavier/*) ;;
+                xinference/model/embedding/vllm/*|xinference/model/rerank/vllm/*) ;;
+                xinference/model/audio/*_mlx.py|xinference/model/audio/mlx_audio.py) ;;
+                # These engines have no active cases in this T4 test list.
+                xinference/model/audio/cosyvoice.py|xinference/model/audio/qwen3_tts.py|xinference/model/audio/qwen3_asr.py|xinference/model/audio/voxcpm.py|xinference/model/audio/indextts2.py) ;;
+                # Keep the integration files below eligible, while test-only
+                # regressions run in the existing CPU/platform jobs.
+                xinference/core/tests/test_continuous_batching.py|xinference/model/llm/tests/test_llm_model.py|xinference/model/llm/transformers/tests/test_tensorizer.py) llm=true ;;
+                xinference/model/embedding/tests/test_integrated_embedding.py|xinference/model/embedding/tests/test_qwen3_vl_engine_params.py|xinference/model/rerank/tests/test_qwen3_vl_reranker_virtualenv.py) embedding=true ;;
+                xinference/model/image/tests/test_stable_diffusion.py) image=true ;;
+                xinference/model/audio/tests/test_whisper.py|xinference/model/audio/tests/test_funasr.py|xinference/model/audio/tests/test_chattts.py|xinference/model/audio/tests/test_f5tts.py|xinference/model/audio/tests/test_melotts.py|xinference/model/audio/tests/test_kokoro.py|xinference/model/audio/tests/test_fish_speech.py|xinference/model/audio/tests/test_megatts.py) audio=true ;;
+                */tests/test_*.py|*/test/test_*.py) ;;
                 xinference/model/audio/*) audio=true ;;
                 xinference/model/image/*) image=true ;;
                 xinference/model/embedding/*|xinference/model/rerank/*) embedding=true ;;
@@ -170,7 +201,7 @@ jobs:
                 xinference/model/*) full=true; break ;;
                 # The rest of the package (deploy/, docs, examples, other
                 # top-level modules) is not exercised by any GPU test.
-                .github/workflows/python.yaml|.github/requirements/model-ci-constraints.txt|pyproject.toml|build_backend.py|build_web.py) full=true; break ;;
+                .github/workflows/python.yaml|.github/scripts/install_gpu_test_dependencies.sh|.github/requirements/model-ci-constraints.txt|pyproject.toml|build_backend.py|build_web.py) full=true; break ;;
               esac
             done < changed-files.txt
           fi
@@ -219,7 +250,7 @@ jobs:
                 # MLX uses SGLang's Xavier settings and directory.
                 xinference/model/llm/sglang/xavier/*) metal=true ;;
                 # Other engine implementations do not affect Metal.
-                xinference/model/llm/llama_cpp/*|xinference/model/llm/lmdeploy/*|xinference/model/llm/sglang/*|xinference/model/llm/transformers/*|xinference/model/llm/vllm/*) ;;
+                xinference/model/llm/llama_cpp/*|xinference/model/llm/sglang/*|xinference/model/llm/transformers/*|xinference/model/llm/trt_llm/*|xinference/model/llm/vllm/*) ;;
                 xinference/model/llm/*|xinference/model/audio/*|xinference/model/scheduler/*|xinference/thirdparty/*) metal=true ;;
                 xinference/model/*)
                   # Top-level model modules are shared by every engine.
@@ -236,6 +267,36 @@ jobs:
           echo "metal=$metal" >> "$GITHUB_OUTPUT"
           echo "suite=$suite" >> "$GITHUB_OUTPUT"
           echo "Platform CI: $platform (suite: $suite); Metal CI: $metal"
+
+      - name: Detect installer CI changes
+        id: install
+        shell: bash
+        run: |
+          set -euo pipefail
+          install=false
+
+          # Reuse the PR/main diff; manual runs and unknown diffs run all checks.
+          if [ "${{ steps.gpu.outputs.diff_available }}" != "true" ]; then
+            install=true
+          else
+            while IFS= read -r file; do
+              case "$file" in
+                scripts/install*|scripts/check_install.py|scripts/manage_install.py|pyproject.toml|xinference/deploy/service.py|xinference/deploy/cmdline.py|xinference/deploy/test/test_service.py|xinference/deploy/test/test_installer.py|.github/workflows/install-script.yaml|.github/workflows/python.yaml)
+                  install=true; break ;;
+              esac
+            done < changed-files.txt
+          fi
+
+          echo "install=$install" >> "$GITHUB_OUTPUT"
+          echo "Installer CI required: $install"
+
+  install_script:
+    name: Install Script CI
+    needs: [lint, changes]
+    if: ${{ needs.changes.outputs.install == 'true' }}
+    permissions:
+      contents: read
+    uses: ./.github/workflows/install-script.yaml
 
   build_test_job:
     name: build_test_job (${{ matrix.os }}, ${{ matrix.python-version }}, ${{ matrix.module }})
@@ -394,8 +455,13 @@ jobs:
           # CLI/services, and one small llama.cpp inference smoke test.
           PLATFORM_TEST_PATHS: >-
             xinference/api/tests/test_auth_store_provider.py
+            xinference/api/tests/test_launch_history.py
+            xinference/api/tests/test_launch_history_provider.py
+            xinference/api/tests/test_model_favorites.py
+            xinference/api/tests/test_launch_history.py
             xinference/api/tests/test_frontend_static.py
             xinference/api/tests/test_runtime_logs.py
+            xinference/api/tests/test_realtime_api.py
             xinference/client/tests
             xinference/core/tests/test_download_task_store.py
             xinference/core/tests/test_monitor_config_store.py
@@ -403,6 +469,8 @@ jobs:
             xinference/core/tests/test_router_config_store.py
             xinference/core/tests/test_router_node_store.py
             xinference/core/tests/test_subpool_hardening.py
+            xinference/core/tests/test_realtime_runtime.py
+            xinference/core/tests/test_realtime_data_plane.py
             xinference/core/tests/test_system_settings_store.py
             xinference/core/tests/test_tokenizer_asset_store.py
             xinference/core/tests/test_utils.py
@@ -410,6 +478,8 @@ jobs:
             xinference/core/tests/test_virtual_env_manager.py
             xinference/core/tests/test_virtualenv_package_rewrite.py
             xinference/core/tests/test_worker.py
+            xinference/core/tests/test_worker_handoff.py
+            xinference/core/tests/test_worker_relaunch.py
             xinference/core/tests/test_worker_address_resolution.py
             xinference/deploy/test
             xinference/model/llm/llama_cpp/tests/test_gguf.py
@@ -423,10 +493,17 @@ jobs:
             xinference/tests/test_persisted_secret.py
           # Linux engine/P-D regressions and portable MLX mock tests.
           LINUX_TEST_PATHS: >-
+            xinference/model/llm/tests/test_internvl_prompt.py
+            xinference/model/llm/trt_llm/tests
             benchmark/tests/test_benchmark_pd.py
             benchmark/tests/test_benchmark_sglang_pd.py
             benchmark/tests/test_analyze_pd_profile.py
             xinference/model/audio/tests/test_audio_batching.py
+            xinference/model/audio/tests/test_cosyvoice_security.py
+            xinference/model/audio/tests/test_kokoro.py::test_kokoro_dependencies_exclude_broken_preshed
+            xinference/model/audio/tests/test_funasr_realtime.py
+            xinference/model/audio/tests/test_funasr_realtime_probe.py
+            xinference/model/audio/tests/test_funasr_realtime_sdk.py
             xinference/model/llm/sglang/tests/test_xavier.py
             xinference/model/llm/sglang/tests/test_xavier_pd.py
             xinference/model/llm/sglang/tests/test_pd.py
@@ -439,9 +516,12 @@ jobs:
             xinference/model/llm/vllm/tests/test_cache_salt.py
             xinference/model/llm/vllm/tests/test_reasoning_adapter.py
             xinference/model/llm/vllm/tests/test_core_chat_model.py::TestVLLMSanitizeGenerateConfig
+            xinference/model/llm/vllm/tests/test_core_chat_model.py::TestVLLMFP8Quantization
+            xinference/model/llm/vllm/tests/test_core_chat_model.py::test_async_chat_tool_choice_rendering
             xinference/model/llm/mlx/tests/test_anthropic_runtime.py
             xinference/model/llm/mlx/tests/test_structured.py
             xinference/model/llm/mlx/tests/test_context_length.py
+            xinference/model/llm/mlx/tests/test_stop.py
             xinference/model/llm/vllm/tests/test_distributed_executor_v1.py
             xinference/model/llm/vllm/tests/test_executor_routing.py
             xinference/model/llm/vllm/tests/test_speculative_config.py
@@ -491,7 +571,7 @@ jobs:
           platform_ignores=()
           if [ "$TEST_PLATFORM" != "ubuntu-latest" ]; then
             platform_ignores+=(
-              --ignore xinference/model/llm/lmdeploy
+              --ignore xinference/model/llm/trt_llm
               --ignore xinference/model/embedding/vllm
               --ignore xinference/model/rerank/vllm
             )
@@ -513,6 +593,7 @@ jobs:
             for test_file in \
               xinference/model/llm/mlx/tests/test_mlx.py \
               xinference/model/llm/mlx/tests/test_structured.py \
+              xinference/model/llm/mlx/tests/test_stop.py \
               xinference/model/llm/mlx/tests/test_xavier.py \
               xinference/model/audio/tests/test_whisper_mlx.py \
               xinference/model/audio/tests/test_f5tts_mlx.py \
@@ -543,6 +624,7 @@ jobs:
               --ignore xinference/model/llm/tests/test_llm_model.py \
               --ignore xinference/model/llm/vllm \
               --ignore xinference/model/llm/sglang \
+              --ignore xinference/model/llm/trt_llm \
               --ignore xinference/client/tests/test_client.py \
               --ignore xinference/client/tests/test_async_client.py \
               --ignore xinference/model/llm/mlx \
@@ -642,8 +724,8 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: gpu-pip-${{ hashFiles('.github/workflows/python.yaml', '.github/requirements/model-ci-constraints.txt', 'pyproject.toml') }}
-          restore-keys: gpu-pip-
+          key: gpu-pip-v2-${{ runner.os }}-py3.12-${{ needs.changes.outputs.groups }}-${{ hashFiles('.github/scripts/install_gpu_test_dependencies.sh', '.github/requirements/model-ci-constraints.txt', 'pyproject.toml') }}
+          restore-keys: gpu-pip-v2-${{ runner.os }}-py3.12-${{ needs.changes.outputs.groups }}-
 
       # funasr downloads its auxiliary models (fsmn-vad, ct-punc, cam++) from
       # ModelScope, whose CDN is very slow from GitHub's US runners (~15min
@@ -654,6 +736,7 @@ jobs:
       # (see get_xinference_home in xinference/constants.py), so that is the
       # directory to cache — ~/.cache/modelscope is never created.
       - name: Restore ModelScope model cache
+        if: ${{ contains(needs.changes.outputs.groups, 'audio') }}
         uses: actions/cache@v4
         with:
           path: ~/.xinference/modelscope
@@ -665,68 +748,9 @@ jobs:
           python -m pip install -U pip "setuptools<82"
 
       - name: Install dependencies
-        run: |
-          export PIP_CONSTRAINT="$PWD/.github/requirements/model-ci-constraints.txt"
-          pip install -U -e ".[audio,dev]"
-          pip install -U "openai>1"
-          pip install -U modelscope
-          pip install -U gguf
-          pip install -U uv
-          pip install -U sse_starlette
-          pip install -U xoscar
-          pip install -U "python-jose[cryptography]"
-          pip install -U "passlib[bcrypt]"
-          pip install -U "aioprometheus[starlette]"
-          pip install -U "pynvml"
-          pip install transformers
-          pip install "funasr==1.2.7"
-          conda install -y -c conda-forge "pynini==2.1.5" "ffmpeg<7"
-          pip install -U "nemo_text_processing<1.1.0"
-          pip install -U omegaconf~=2.3.0
-          pip install -U "WeTextProcessing<1.0.4"
-          pip install -U librosa
-          pip install -U xxhash
-          pip install -U "ChatTTS==0.2.4"
-          pip install -U HyperPyYAML
-          pip uninstall -y matcha-tts
-          pip install -U 'onnxruntime-gpu==1.22.0; sys_platform == "linux"'
-          pip install -U openai-whisper
-          pip install -U "torch==2.7.0" "torchaudio==2.7.0" "torchvision==0.22.0"
-          pip install -U "loguru"
-          pip install -U "natsort"
-          pip install -U "loralib"
-          pip install -U "ormsgpack"
-          pip uninstall -y opencc
-          pip uninstall -y "faster_whisper"
-          pip install -U accelerate
-          pip install -U verovio
-          pip install -U cachetools
-          pip install -U silero-vad
-          pip install -U pydantic
-          pip install -U "diffusers==0.35.1"
-          pip install -U onnx
-          pip install -U onnxconverter_common
-          pip install -U torchdiffeq
-          pip install -U "x_transformers>=1.31.14"
-          pip install -U pypinyin
-          pip install -U tomli
-          pip install -U vocos
-          pip install -U jieba
-          pip install -U soundfile
-          pip install tensorizer
-          pip install -U "sentence-transformers==5.1.1"
-          pip install -U "FlagEmbedding==1.3.5"
-          pip install -U "peft>=0.18.0"
-          pip install "xllamacpp>=0.2.0" --index-url https://xorbitsai.github.io/xllamacpp/whl/cu124 --extra-index-url https://pypi.org/simple
-          pip install hf_transfer
-          # espeak-ng (TTS phonemization) is not packaged on conda-forge;
-          # install it from apt.
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq espeak-ng
-          # Resolve the shared stack together, including transitive datasets.
-          pip install "numpy>=2" -r .github/requirements/model-ci-constraints.txt
-          python -c "from datasets import Dataset; from transformers import AutoModel; from peft import PeftModel; from sentence_transformers import SentenceTransformer, CrossEncoder; from FlagEmbedding import BGEM3FlagModel; from diffusers import DiffusionPipeline"
-        working-directory: .
+        env:
+          GPU_TEST_GROUPS: ${{ needs.changes.outputs.groups }}
+        run: bash .github/scripts/install_gpu_test_dependencies.sh
 
       - name: Test with pytest
         env:
@@ -796,7 +820,7 @@ jobs:
                 ;;
               image)
                 # test_got_ocr2 is intentionally omitted: it self-skips on
-                # transformers >= 4.48.0 and this job pins 4.53.2, so it never
+                # transformers >= 4.48.0 (including the constrained version), so it never
                 # runs a single case here.
                 run_pytest \
                   xinference/model/image/tests/test_stable_diffusion.py

@@ -33,7 +33,7 @@ classifiers = [
 ]
 dynamic = ["version"]
 dependencies = [
-    "xoscar>=0.12.0",
+    "xoscar>=0.12.2",
     "psutil>=5.9.0",
     "torch",
     "pillow",
@@ -48,6 +48,7 @@ dependencies = [
     "python-multipart>=0.0.18",  # required by FastAPI's Form/File/UploadFile params; used to come in transitively via gradio
     "orjson",  # used by core.utils.json_dumps for all REST API JSON responses; used to come in transitively via gradio
     "uvicorn",
+    "websockets>=12",  # WebSocket transport for the generic realtime API
     "PyYAML",
     "huggingface-hub>=0.19.4",
     "filelock>=3.30.0",  # preserve_lock_file keeps Wan MLX conversion locks stable on Windows
@@ -69,7 +70,7 @@ dependencies = [
     "peft>=0.18.0",
     "timm",
     "setproctitle",
-    "uv",
+    "uv>=0.10.9",
 ]
 
 [project.urls]
@@ -93,6 +94,9 @@ xinference_xavier = "xinference.model.llm.sglang.xavier.plugin:register"
 xinference_reasoning = "xinference.model.llm.sglang.reasoning:register"
 
 [project.optional-dependencies]
+xavier-lmcache = [
+    "lmcache>=0.5.6,<0.6; sys_platform == 'linux' and python_version < '3.14'",
+]
 dev = [
     "jsonschema>=4.18,<5",  # Built-in model catalog authoring/CI validation
     "xxhash",  # CPU tests for the Xavier connector
@@ -194,6 +198,12 @@ vllm = [
 sglang = [
     "sglang[srt]>=0.4.2.post4 ; sys_platform=='linux'",
 ]
+trt-llm = [
+    "tensorrt-llm==1.2.1 ; sys_platform=='linux'",
+    "xoscar[nixl]>=0.11.1 ; sys_platform=='linux'",
+    # TRT-LLM 1.2.1 requires NumPy 1; PyArrow 26 requires NumPy 2 at import.
+    "pyarrow==20.0.0 ; sys_platform=='linux'",
+]
 mlx = [
     "llguidance>=1.7.0 ; sys_platform=='darwin' and platform_machine=='arm64'",
     "mlx-lm>=0.31.3 ; sys_platform=='darwin' and platform_machine=='arm64'",
@@ -256,7 +266,7 @@ audio = [
     "conformer",  # For CosyVoice, matcha
     "diffusers>=0.32.0",  # For CosyVoice, matcha
     "gdown",  # For CosyVoice, matcha
-    "pyarrow",  # For CosyVoice, matcha
+    "pyarrow>=23.0.1",  # For CosyVoice, matcha
     "HyperPyYAML",  # For CosyVoice
     "onnxruntime>=1.16.0",  # For CosyVoice, use onnxruntime-gpu==1.16.0 if possible
     "pyworld>=0.3.4",  # For CosyVoice
@@ -288,6 +298,8 @@ audio = [
     "gruut[de,es,fr]",  # For MeloTTS
     "kokoro>=0.7.15",  # Kokoro, already included misaki[en]
     "misaki[en,zh]>=0.7.15",  # Kokoro
+    # Preshed 3.0.14 wheels overflow on spaCy's uint64 tokenizer keys.
+    "preshed!=3.0.14",
     "langdetect",  # MegaTTS3
     "pyloudnorm",  # MegaTTS3
     "json5",  # IndexTTS2

@@ -6,10 +6,26 @@ Model Launching Instructions
 
 This document aims to provide a functional overview of model launching.
 
+.. note::
+
+   The LMDeploy backend has been removed because its Xinference integration is
+   no longer maintained. For InternVL models, select vLLM or Transformers instead.
+
 Updating the model catalog
 ==========================
 
 On the **Launch Model** page, choose the model type beside **Update**. **Update** refreshes the whole category. Choose **Update one model** and enter the exact Hub model name (or world family name) to update just that model, including a model not yet listed. Other catalog entries are preserved. This updates shared metadata without downloading weights or restarting running models. With authentication enabled, both actions require administrator or ``models:register`` permission.
+
+Model favorites
+===============
+
+Stars on the **Launch Model** page are saved for the current account and survive browser changes and server restarts. Favorites are identified by model name across model categories. Reading or changing favorites requires ``models:list`` permission. Without authentication, all visitors share one collection. With authentication enabled, changes require a user session; API keys can only read.
+
+Favorites use a ``model_favorites`` table in the selected authentication database. With the default SQLite backend, this is ``<XINFERENCE_HOME>/auth/auth.db`` (configured by ``XINFERENCE_AUTH_DB_PATH``). Without authentication, the same path stores the shared collection and only the favorites table is initialized.
+
+Old browser favorites are not imported automatically because they have no account identity. Choose **Import browser favorites** to add them to the current account. The browser copy is retained if any write fails or the account changes during import; retrying does not create duplicates.
+
+``GET /v1/model_favorites`` returns a list of model names for the authenticated account. ``PUT`` and ``DELETE`` on the same path accept ``{"model_name": "org/model"}`` to add or remove one name. Both operations are idempotent. The server derives the owner from authentication; clients cannot choose another owner.
 
 .. _launch_recommendations:
 
@@ -135,7 +151,7 @@ The slider's upper bound comes from the registered model. Context selections are
 preserved in configuration history and passed to the recommendation API.
 
 The launch layer maps this setting to vLLM's ``max_model_len``, SGLang,
-Transformers and MLX's ``context_length``, LMDeploy's ``session_len``, and
+Transformers and MLX's ``context_length``, and
 llama.cpp's ``n_ctx=context_length*n_parallel`` total slot capacity. Existing engine
 parameters still work; contradictory unified and native values are rejected.
 Omitting the setting preserves engine defaults. This setting does not extend the
@@ -216,6 +232,8 @@ launch would also need to preserve its runtime allocation state.
 
 In a distributed deployment, ``worker_ip`` can select the worker whose local
 cache receives the files. If it is omitted, the supervisor selects one worker.
+
+``GET /v1/cache/models`` includes ``model_type`` and ``model_engine`` for each cached model. The engine list reports candidates discovered on the worker that owns its files, including that worker's virtual environment setting. Rerank and world cache versions identify only the model name, so their candidates are not checked against a cached format. ``null`` means the metadata is unknown or discovery failed; an empty list means no matching engine is currently discoverable. Listing caches does not download weights, prepare environments, or launch models.
 
 Replica
 =======
@@ -503,20 +521,67 @@ copies the remaining launch options into the form without starting a model.
 
 .. _launch_weight_cache_reload:
 
-Reconfigure without reloading weights
-=====================================
+.. _reconfigure-without-reloading-weights:
+
+Reconfigure and upgrade running models
+======================================
 
 .. versionadded:: v4.0.0
 
 Enable ``enable_weight_cache=true`` when launching a model, or select **Keep GPU weights for reload** in the deployment dialog. This opt-in feature requires vLLM 0.31.0+ or SGLang 0.5.21+, Linux with CUDA or ROCm, one worker, one replica, and fixed tensor parallelism. It is disabled by default, even on supported engine versions.
 
-Xinference keeps GPU weights in an upstream cache daemon while rebuilding the engine, KV cache and CUDA graphs. Reload waits for current requests, including streams, to finish and temporarily rejects new requests with HTTP 503. A drain timeout leaves the original engine running. If rebuilding fails, Xinference attempts to restore the previous configuration. Terminating the model releases the weights; a worker process failure requires loading them again.
+.. figure:: /_static/keep_weight_for_reload.png
+   :alt: Enable Keep GPU weights for reload before deploying the model.
+   :width: 560px
+   :align: center
 
-``POST /v1/models/{model_uid}/reload`` accepts a partial ``model_config`` object and optional ``drain_timeout`` in seconds (default 300, maximum 3600). It returns HTTP 202 with an ``operation_id``. Poll ``GET /v1/models/{model_uid}/reload`` until ``status`` is ``ready`` or ``error``. On error, ``restored=true`` means the previous engine is serving again. Query ``GET /v1/models/{model_uid}/reload/config`` for supported parameters and current explicit values. Invalid patches return HTTP 400; a reload already in progress returns HTTP 409. The model UID and GPU reservation stay the same.
+   Enable Keep GPU weights for reload before deploying the model.
+
+.. figure:: /_static/reconfigure_in_running.png
+   :alt: Open model reconfiguration from Running Models.
+   :width: 100%
+   :align: center
+
+   Open model reconfiguration from Running Models.
+
+.. figure:: /_static/reconfigure_in_detail.png
+   :alt: Open Reconfigure / upgrade model from the model's detail view.
+   :width: 100%
+   :align: center
+
+   Open Reconfigure / upgrade model from the model's detail view.
+
+With retained weights enabled, Xinference prepares a replacement model process while the current engine keeps serving. The replacement shares compatible cached weights and builds its own KV cache and CUDA graphs. New requests switch only after loading and a health check succeed; existing requests, including streams, finish on their original engine. Failed preparation leaves the current engine serving. The model UID and GPU reservation stay the same. Terminating the model releases its processes and cached weights.
+
+``POST /v1/models/{model_uid}/reload`` accepts a partial ``model_config`` object and optional ``python_executable`` and ``drain_timeout`` fields. It returns HTTP 202 with an ``operation_id``. Poll ``GET /v1/models/{model_uid}/reload`` until ``status`` is ``ready`` or ``error``. On error, ``restored=true`` means the previous engine is serving. Query ``GET /v1/models/{model_uid}/reload/config`` for supported parameters, current values, engine version and Python executable. Invalid patches return HTTP 400; a reload already in progress returns HTTP 409. ``drain_timeout`` controls the wait for parser-only updates (default 300 seconds, maximum 3600); engine replacements never force existing requests to stop.
+
+Both engines need runtime memory during the switch: shared weights do not share KV cache or CUDA graphs. Reserve enough GPU memory for both engines. Before starting a replacement, Xinference checks free memory while preserving the current engine's configured budget, and rejects insufficient memory or unavailable driver process accounting. Both Xinference environments, and the version that originally launched the model, must support seamless model replacement.
+
+Insufficient memory never triggers an in-place rebuild. Even models launched with the default 0.9 memory fraction need enough spare memory for replacement; otherwise reload fails while inference continues on the current engine.
+
+For consecutive upgrades, ``drain_timeout`` also bounds waiting for previous engine retirement. A timeout leaves current requests running; a later upgrade retries failed retirement.
+
+When authentication is enabled, selecting ``python_executable`` requires administrator access. The current interpreter path is only included in reload metadata for administrators.
+
+To change the model environment, set ``python_executable`` to an installed absolute Python path on the Worker machine. The target must already contain Xinference and the model engine; packages are not installed by reload. Compatible engine and PyTorch versions reuse the retained weights. Different versions use a separate weight cache and need additional GPU memory; upstream compatibility checks remain enabled. In the Web UI, use **Reconfigure / upgrade model** in the running model's detail view.
+
+.. code-block:: python
+
+    from xinference.client import Client
+
+    client = Client("http://127.0.0.1:9997")
+    operation = client.reload_model(
+        "my-model", {}, python_executable="/opt/xinference-new/bin/python"
+    )
+
+.. code-block:: bash
+
+    xinference reload --model-uid my-model \
+      --python-executable /opt/xinference-new/bin/python
 
 vLLM supports changing ``max_num_seqs``, ``max_num_batched_tokens``, ``max_model_len``, ``gpu_memory_utilization`` and ``enforce_eager``.
 
-For reasoning-capable models, both engines also accept ``reasoning_content`` through the same reload API. This changes only the Xinference reasoning parser and leaves the engine and GPU weights intact. It works without ``enable_weight_cache`` or the minimum engine versions required for weight retention. Existing requests, including streams, finish before the new setting is applied; new requests are temporarily rejected while draining. The ``hot_parameters`` field in reload metadata lists these settings; ``enabled`` still indicates launch-time weight retention. Hot updates also require one worker and one replica. ``weights_reused`` is true only when an engine rebuild uses retained weights.
+For reasoning-capable models, both engines also accept ``reasoning_content`` through the same reload API. This changes only the Xinference reasoning parser and leaves the engine and GPU weights intact. It works without ``enable_weight_cache`` or the minimum engine versions required for weight retention. Existing requests, including streams, finish before the new setting is applied; new requests wait until the parser change is applied. The ``hot_parameters`` field in reload metadata lists these settings; ``enabled`` still indicates launch-time weight retention. Hot updates also require one worker and one replica. ``weights_reused`` is true only when an engine rebuild uses retained weights.
 
 For vLLM vision models launched with weight retention, ``limit_mm_per_prompt`` can change a positive image count to another positive count, for example ``{"image": 8}``. Unspecified modality limits are preserved in the engine, recovery and automatic-startup configuration. The engine is rebuilt to apply multimodal memory profiling and cache budgets while reusing the retained weights. Setting the image count to zero or enabling images from an initially disabled encoder is rejected; limits for other modalities cannot change through this operation.
 
@@ -524,7 +589,7 @@ SGLang supports changing ``max_running_requests``, ``max_prefill_tokens``, ``con
 
 For SGLang vision models launched with weight retention, ``limit_mm_data_per_request`` accepts a partial image-count patch, for example ``{"image": 8}``. The engine is rebuilt with retained weights so the new tokenizer process applies the limit. Other modality limits are preserved in the engine, recovery and automatic-startup configuration. An initially unlimited or zero image count can become a positive count because this setting only validates request counts; it does not disable the vision encoder. New image limits must be positive integers. Returning to an unlimited or zero image count requires relaunching the model. With an initial zero image count, Xinference skips SGLang's default image warmup.
 
-Parallelism, GPU placement, model path, precision, quantization and weight-layout options cannot change through reload. Pipeline/data parallelism, multi-worker deployments, LoRA, speculative decoding, weight offloading and PD deployments are not supported by this integration yet. Quantized models must pass the upstream IPC compatibility checks. For vLLM, multi-GPU caching uses its native multiprocessing executor. In the running-model detail page, choose **Reload parameters** to edit the supported values and follow progress.
+Parallelism, GPU placement, model path, precision, quantization and weight-layout options cannot change through reload. Pipeline/data parallelism, multi-worker deployments, LoRA, speculative decoding, weight offloading and PD deployments are not supported by this integration yet. Quantized models must pass the upstream IPC compatibility checks. For vLLM, multi-GPU caching uses its native multiprocessing executor. In the running-model detail page, choose **Reconfigure / upgrade model** to edit the supported values and follow progress.
 
 .. code-block:: python
 
@@ -535,6 +600,7 @@ Parallelism, GPU placement, model path, precision, quantization and weight-layou
         model_name="qwen2.5-instruct", model_engine="vLLM",
         model_size_in_billions="0_5", model_format="pytorch",
         quantization="none", n_gpu=1, enable_weight_cache=True,
+        gpu_memory_utilization=0.4,
     )
     job = client.reload_model(uid, {"max_num_seqs": 32})
     print(job["operation_id"])

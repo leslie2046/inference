@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# CI: linux
 import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -239,6 +240,8 @@ class _StopCheckLoop(Exception):
 
 
 class _DummyDeadWorkerSupervisor:
+    _ownership_registry = SupervisorActor._ownership_registry
+    _remove_dead_worker = SupervisorActor._remove_dead_worker
     _clear_worker_model_gpu_memory = SupervisorActor._clear_worker_model_gpu_memory
     _discard_worker_metadata = SupervisorActor._discard_worker_metadata
     _invalidate_list_models_debounce_cache = (
@@ -342,3 +345,51 @@ async def test_autostart_successful_launch_resets_retry_attempts():
     assert state["last_error"] is None
     assert isinstance(state["last_attempt_ts"], int)
     assert isinstance(state["last_started_ts"], int)
+
+
+@pytest.mark.asyncio
+async def test_public_launch_rejects_interpreter_but_trusted_autostart_replays_it():
+    supervisor = SupervisorActor.__new__(SupervisorActor)
+    supervisor._launch_builtin_model = AsyncMock(return_value="model")
+    with pytest.raises(ValueError, match="reserved for internal recovery"):
+        await supervisor.launch_builtin_model(
+            model_python_executable="/arbitrary/python"
+        )
+    supervisor._launch_builtin_model.assert_not_called()
+    assert (
+        await supervisor._launch_autostart_model(
+            {
+                "model_name": "test",
+                "model_uid": "model",
+                "model_python_executable": "/admin-selected/python",
+            }
+        )
+        == "model"
+    )
+    assert (
+        supervisor._launch_builtin_model.await_args.kwargs["model_python_executable"]
+        == "/admin-selected/python"
+    )
+
+
+@pytest.mark.asyncio
+async def test_trusted_autostart_interpreter_is_loaded_but_never_disclosed():
+    from xinference.core.autostart import redact_autostart_model_entries
+
+    supervisor = _DummySupervisor(
+        [
+            {
+                "launch": {
+                    "model_name": "test",
+                    "model_python_executable": "/private/python",
+                }
+            }
+        ]
+    )
+    entries = await supervisor._load_autostart_entries("ordinary")
+    assert entries[0]["launch"]["model_python_executable"] == "/private/python"
+    assert (
+        "model_python_executable"
+        not in redact_autostart_model_entries(entries)[0]["launch"]
+    )
+    assert entries[0]["launch"]["model_python_executable"] == "/private/python"

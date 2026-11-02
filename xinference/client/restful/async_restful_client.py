@@ -54,10 +54,11 @@ async def _get_error_string(response: aiohttp.ClientResponse) -> str:
             result = json_data["detail"]
     except Exception:
         pass
-    try:
-        response.raise_for_status()
-    except aiohttp.ClientError as e:
-        result = str(e)
+    if result is None:
+        try:
+            response.raise_for_status()
+        except aiohttp.ClientError as e:
+            result = str(e)
     if result is None:
         result = "Unknown error"
     await _release_response(response)
@@ -102,7 +103,7 @@ class AsyncRESTfulModelHandle:
         self.timeout = aiohttp.ClientTimeout(total=1800)
         self._session_loop = asyncio.get_running_loop()
         self.session = aiohttp.ClientSession(
-            connector=aiohttp.TCPConnector(force_close=True)
+            connector=aiohttp.TCPConnector(force_close=True), timeout=self.timeout
         )
 
     async def close(self):
@@ -371,9 +372,9 @@ class AsyncRESTfulImageModelHandle(AsyncRESTfulModelHandle):
             "kwargs": json.dumps(kwargs),
         }
         params = _filter_params(params)
-        files: List[Any] = []
+        data = aiohttp.FormData()
         for key, value in params.items():
-            files.append((key, (None, value)))
+            data.add_field(key, str(value))
 
         # Handle both single image and list of images
         if isinstance(image, list):
@@ -381,18 +382,31 @@ class AsyncRESTfulImageModelHandle(AsyncRESTfulModelHandle):
                 raise ValueError("Image list cannot be empty")
             elif len(image) == 1:
                 # Single image in list, use it directly
-                files.append(("image", ("image", image[0], "application/octet-stream")))
+                data.add_field(
+                    "image",
+                    image[0],
+                    filename="image",
+                    content_type="application/octet-stream",
+                )
             else:
                 # Multiple images - send all images with same field name
                 # FastAPI will collect them into a list
                 for img_data in image:
-                    files.append(
-                        ("image", ("image", img_data, "application/octet-stream"))
+                    data.add_field(
+                        "image",
+                        img_data,
+                        filename="image",
+                        content_type="application/octet-stream",
                     )
         else:
             # Single image
-            files.append(("image", ("image", image, "application/octet-stream")))
-        response = await self.session.post(url, data=files, headers=self.auth_headers)
+            data.add_field(
+                "image",
+                image,
+                filename="image",
+                content_type="application/octet-stream",
+            )
+        response = await self.session.post(url, data=data, headers=self.auth_headers)
         if response.status != 200:
             raise RuntimeError(
                 f"Failed to variants the images, detail: {await _get_error_string(response)}"
@@ -613,17 +627,19 @@ class AsyncRESTfulImageModelHandle(AsyncRESTfulModelHandle):
             "kwargs": json.dumps(kwargs),
         }
         params = _filter_params(params)
-        files: List[Any] = []
+        data = aiohttp.FormData()
         for key, value in params.items():
-            files.append((key, (None, value)))
-        files.append(("image", ("image", image, "application/octet-stream")))
-        files.append(
-            (
-                "mask_image",
-                ("mask_image", mask_image, "application/octet-stream"),
-            )
+            data.add_field(key, str(value))
+        data.add_field(
+            "image", image, filename="image", content_type="application/octet-stream"
         )
-        response = await self.session.post(url, data=files, headers=self.auth_headers)
+        data.add_field(
+            "mask_image",
+            mask_image,
+            filename="mask_image",
+            content_type="application/octet-stream",
+        )
+        response = await self.session.post(url, data=data, headers=self.auth_headers)
         if response.status != 200:
             raise RuntimeError(
                 f"Failed to inpaint the images, detail: {await _get_error_string(response)}"
@@ -798,25 +814,21 @@ class AsyncRESTfulVideoModelHandle(AsyncRESTfulModelHandle):
             "kwargs": json.dumps(kwargs),
         }
         params = _filter_params(params)
-        files: List[Any] = []
-        for key, value in params.items():
-            files.append((key, (None, value)))
-        files.append(
-            ("first_frame", ("image", first_frame, "application/octet-stream"))
-        )
-        files.append(("last_frame", ("image", last_frame, "application/octet-stream")))
-        # Convert files list to FormData for proper multipart encoding
         data = aiohttp.FormData()
-        for item in files:
-            if len(item) == 3 and isinstance(item[1], tuple):
-                # Format: (field_name, (filename, content, content_type))
-                field_name, (filename, content, content_type) = item
-                data.add_field(
-                    field_name, content, filename=filename, content_type=content_type
-                )
-            else:
-                # Format: (field_name, content)
-                data.add_field(item[0], item[1])
+        for key, value in params.items():
+            data.add_field(key, str(value))
+        data.add_field(
+            "first_frame",
+            first_frame,
+            filename="image",
+            content_type="application/octet-stream",
+        )
+        data.add_field(
+            "last_frame",
+            last_frame,
+            filename="image",
+            content_type="application/octet-stream",
+        )
         response = await self.session.post(url, data=data, headers=self.auth_headers)
         if response.status != 200:
             raise RuntimeError(
@@ -1085,7 +1097,9 @@ class AsyncRESTfulAudioModelHandle(AsyncRESTfulModelHandle):
         params = _filter_params(params)
         data = aiohttp.FormData()
         for key, value in params.items():
-            data.add_field(key, str(value) if value is not None else "")
+            # One field per list item, as requests sends it in the sync client.
+            for item in value if isinstance(value, list) else (value,):
+                data.add_field(key, str(item))
         data.add_field(
             "file", audio, filename="file", content_type="application/octet-stream"
         )
@@ -1152,7 +1166,9 @@ class AsyncRESTfulAudioModelHandle(AsyncRESTfulModelHandle):
         params = _filter_params(params)
         data = aiohttp.FormData()
         for key, value in params.items():
-            data.add_field(key, str(value) if value is not None else "")
+            # One field per list item, as requests sends it in the sync client.
+            for item in value if isinstance(value, list) else (value,):
+                data.add_field(key, str(item))
         data.add_field(
             "file", audio, filename="file", content_type="application/octet-stream"
         )
@@ -1245,8 +1261,16 @@ class AsyncRESTfulAudioModelHandle(AsyncRESTfulModelHandle):
             )
 
         if stream:
-            await _release_response(response)
-            return response.content.iter_chunked(1024)
+            # Release only after the body is read; a released response
+            # fails every later read with "Connection closed".
+            async def stream_content():
+                try:
+                    async for chunk in response.content.iter_chunked(1024):
+                        yield chunk
+                finally:
+                    await _release_response(response)
+
+            return stream_content()
 
         # Read content before releasing connection
         content = await response.read()
@@ -1257,6 +1281,7 @@ class AsyncRESTfulAudioModelHandle(AsyncRESTfulModelHandle):
 class AsyncRESTfulFlexibleModelHandle(AsyncRESTfulModelHandle):
     async def infer(
         self,
+        *args,
         **kwargs,
     ):
         """
@@ -1277,6 +1302,7 @@ class AsyncRESTfulFlexibleModelHandle(AsyncRESTfulModelHandle):
         url = f"{self._base_url}/v1/flexible/infers"
         params: Dict = {  # type: ignore
             "model": self._model_uid,
+            "args": args,
         }
         params.update(kwargs)
 
@@ -1285,8 +1311,9 @@ class AsyncRESTfulFlexibleModelHandle(AsyncRESTfulModelHandle):
             raise RuntimeError(
                 f"Failed to predict, detail: {await _get_error_string(response)}"
             )
+        response_data = await response.json()
         await _release_response(response)
-        return response.content
+        return response_data
 
 
 class AsyncClient:
@@ -1535,7 +1562,7 @@ class AsyncClient:
             response = await self.session.post(url, json=payload, headers=self._headers)
         else:
             response = await self.session.post(
-                url, json=payload, headers=self._headers, params={"wait_ready": False}
+                url, json=payload, headers=self._headers, params={"wait_ready": "false"}
             )
         if response.status != 200:
             raise RuntimeError(
@@ -1591,7 +1618,11 @@ class AsyncClient:
         return response_data
 
     async def reload_model(
-        self, model_uid: str, model_config: Dict[str, Any], drain_timeout: float = 300
+        self,
+        model_uid: str,
+        model_config: Dict[str, Any],
+        drain_timeout: float = 300,
+        python_executable: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Start an asynchronous parameter reload with the same model UID.
 
@@ -1600,9 +1631,12 @@ class AsyncClient:
         ``get_model_reload_status`` to wait for ready/error after HTTP 202.
         """
         url = f"{self.base_url}/v1/models/{quote(model_uid, safe='')}/reload"
+        payload = {"model_config": model_config, "drain_timeout": drain_timeout}
+        if python_executable is not None:
+            payload["python_executable"] = python_executable
         response = await self.session.post(
             url,
-            json={"model_config": model_config, "drain_timeout": drain_timeout},
+            json=payload,
             headers=self._headers,
         )
         if response.status != 202:
@@ -2262,6 +2296,51 @@ class AsyncClient:
         response_data = await response.json()
         await _release_response(response)
         return response_data
+
+    async def relaunch_worker(
+        self,
+        worker_address: str,
+        python_executable: Optional[str] = None,
+        request_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Relaunch a Worker and return its asynchronous operation status."""
+        response = await self.session.post(
+            f"{self.base_url}/v1/workers/{quote(worker_address, safe='')}/relaunch",
+            json={"python_executable": python_executable, "request_id": request_id},
+            headers=self._headers,
+        )
+        if response.status != 202:
+            raise RuntimeError(
+                f"Failed to relaunch worker: {await _get_error_string(response)}"
+            )
+        result = await response.json()
+        await _release_response(response)
+        return result
+
+    async def get_worker_relaunch(self, operation_id: str) -> Dict[str, Any]:
+        response = await self.session.get(
+            f"{self.base_url}/v1/worker-relaunches/{quote(operation_id, safe='')}",
+            headers=self._headers,
+        )
+        if response.status != 200:
+            raise RuntimeError(
+                f"Failed to get worker relaunch: {await _get_error_string(response)}"
+            )
+        result = await response.json()
+        await _release_response(response)
+        return result
+
+    async def list_worker_relaunches(self) -> List[Dict[str, Any]]:
+        response = await self.session.get(
+            f"{self.base_url}/v1/worker-relaunches", headers=self._headers
+        )
+        if response.status != 200:
+            raise RuntimeError(
+                f"Failed to list worker relaunches: {await _get_error_string(response)}"
+            )
+        result = await response.json()
+        await _release_response(response)
+        return result
 
     async def get_supervisor_info(self):
         url = f"{self.base_url}/v1/supervisor"

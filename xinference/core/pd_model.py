@@ -111,6 +111,7 @@ class PDModelActor(xo.StatelessActor):
         # Prefill request map, used to skip the timeout task for specific request id.
         self._request_set: Set[str] = set()
         self._direct_transfers: dict[str, dict] = {}
+        self._trt_prefill_requests: dict[str, xo.ActorRef] = {}
 
         self._model_uid = model_uid
         self._transport_backend = transport_backend
@@ -123,6 +124,7 @@ class PDModelActor(xo.StatelessActor):
         self._prefill_replicas: Dict[str, xo.ActorRefType["ModelActor"]] = {}
         self._decode_replicas: Dict[str, xo.ActorRefType["ModelActor"]] = {}
         self._sglang_bootstrap: dict[str, dict] = {}
+        self._trt_prefill_replicas: set[str] = set()
 
         self._prefill_policy: Optional[SchedulingPolicy] = None
         self._decode_policy: Optional[SchedulingPolicy] = None
@@ -163,8 +165,11 @@ class PDModelActor(xo.StatelessActor):
         self,
         replica_uid: str,
         actor: xo.ActorRefType["ModelActor"],
+        model_engine: Optional[str] = None,
     ):
         """添加 Prefill Actor"""
+        if (model_engine or "").lower() == "trt-llm":
+            self._trt_prefill_replicas.add(replica_uid)
         if self._prefill_replicas.get(replica_uid) != actor:
             if self._model_engine == "sglang" and self._transport_backend == "nixl":
                 self._sglang_bootstrap[replica_uid] = await actor_call(
@@ -214,6 +219,7 @@ class PDModelActor(xo.StatelessActor):
         if replica_uid in self._prefill_replicas:
             del self._prefill_replicas[replica_uid]
             self._sglang_bootstrap.pop(replica_uid, None)
+            self._trt_prefill_replicas.discard(replica_uid)
             # 更新调度策略的副本列表
             if self._prefill_replicas and self._prefill_policy:
                 self._prefill_policy.update_replicas(
@@ -289,6 +295,12 @@ class PDModelActor(xo.StatelessActor):
         logger.debug(
             f"[PDModelActor] Free prefill model cache for request {request_id}"
         )
+        trt_prefill = self._trt_prefill_requests.pop(request_id, None)
+        if trt_prefill is not None:
+            try:
+                await actor_call(trt_prefill, "release_trt_pd_request", request_id)
+            except Exception:
+                logger.warning("Failed to release TRT-LLM P/D source", exc_info=True)
         handoff = self._direct_transfers.pop(request_id, None)
         if handoff:
             try:
@@ -338,6 +350,11 @@ class PDModelActor(xo.StatelessActor):
 
     async def is_vllm_backend(self):
         return True
+
+    async def get_limit_mm_per_prompt(self) -> Optional[Dict[str, int]]:
+        # P/D limits depend on the replicas selected during scheduling.
+        # Let those replicas validate the request against their live limits.
+        return None
 
     @log_async(logger=logger)
     async def prepare_anthropic_request(
@@ -463,6 +480,8 @@ class PDModelActor(xo.StatelessActor):
         if isinstance(prefill_kwargs.get("raw_params"), dict):
             prefill_kwargs["raw_params"].update(max_tokens=1, stream=False)
         self._request_set.add(request_id)
+        if self._model_engine == "trt-llm":
+            self._trt_prefill_requests[request_id] = prefill
         prefill_start = time.perf_counter()
         try:
             result = await actor_call(
@@ -601,6 +620,11 @@ class PDModelActor(xo.StatelessActor):
         prefill_kwargs = copy.deepcopy(kwargs)
         if isinstance(prefill_kwargs.get("raw_params"), dict):
             prefill_kwargs["raw_params"].update(max_tokens=1, stream=False)
+        if any(
+            self._prefill_replicas.get(uid) == prefill
+            for uid in self._trt_prefill_replicas
+        ):
+            self._trt_prefill_requests[request_id] = prefill
         p_task = asyncio.create_task(
             actor_call(prefill, method, inputs, *prefill_args, **prefill_kwargs)
         )

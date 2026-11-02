@@ -18,6 +18,8 @@ from typing import TYPE_CHECKING
 from ..utils import has_cuda_device
 from .docanalyze.mineru25 import Mineru2_5Model
 from .engine_family import SUPPORTED_ENGINES, ImageEngineModel
+from .fibo2 import Fibo2ImageModel
+from .flux3 import Flux3Model
 from .hidream_o1 import HIDREAM_O1_MODEL_NAMES, HiDreamO1Model
 from .iris import IrisModel
 from .ming_image import MingImageModel
@@ -45,7 +47,19 @@ class DiffusersImageModel(DiffusionModel, ImageEngineModel):
             "ming_image",
             "iris",
             "moss_image",
+            "fibo2",
+            "flux3",
         )
+
+
+class Fibo2DiffusersImageModel(Fibo2ImageModel, ImageEngineModel):
+    engine_model_format = "diffusers"
+    engine_quantization = "none"
+    required_libs = ("torch", "diffusers", "transformers")
+
+    @classmethod
+    def match(cls, model_family: "ImageModelFamilyV2") -> bool:
+        return model_family.model_family == "fibo2"
 
 
 class MOSSDiffusersImageModel(MOSSImageModel, ImageEngineModel):
@@ -56,6 +70,16 @@ class MOSSDiffusersImageModel(MOSSImageModel, ImageEngineModel):
     @classmethod
     def match(cls, model_family: "ImageModelFamilyV2") -> bool:
         return model_family.model_family == "moss_image"
+
+
+class Flux3ImageModel(Flux3Model, ImageEngineModel):
+    engine_model_format = "diffusers"
+    engine_quantization = "none"
+    required_libs = ("torch", "transformers", "diffusers")
+
+    @classmethod
+    def match(cls, model_family: "ImageModelFamilyV2") -> bool:
+        return model_family.model_family == "flux3"
 
 
 class TransformersSenseNovaU1ImageModel(SenseNovaU1Model, ImageEngineModel):
@@ -151,9 +175,11 @@ class VLLMMinerUImageModel(Mineru2_5Model, ImageEngineModel):
 
 def register_builtin_image_engines() -> None:
     SUPPORTED_ENGINES["diffusers"] = [
+        Flux3ImageModel,
         HiDreamO1ImageModel,
         MingImageEngineModel,
         MOSSDiffusersImageModel,
+        Fibo2DiffusersImageModel,
         DiffusersImageModel,
     ]
     SUPPORTED_ENGINES["transformers"] = [

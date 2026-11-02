@@ -18,6 +18,7 @@ import inspect
 import json
 import logging
 import os
+import re
 import time
 import typing
 import uuid
@@ -344,6 +345,26 @@ class ChatModelMixin:
         )
 
     @staticmethod
+    @functools.lru_cache(maxsize=64)
+    def _chat_template_needs_null_tool_content(chat_template: Optional[str]) -> bool:
+        # Recognize the positive assistant/null guard used by DeepSeek-style
+        # templates, with tool_calls accessed inside that branch. A template
+        # merely rendering None successfully may silently stringify it instead.
+        return (
+            chat_template is not None
+            and re.search(
+                r"\{%\-?\s*(?:if|elif)\s+message\[['\"]role['\"]\]\s*==\s*"
+                r"['\"]assistant['\"]\s+and\s+message\[['\"]content['\"]\]"
+                r"\s+is\s+none\s*\-?%\}"
+                r"(?:(?!\{%\-?\s*(?:elif|else|endif)\b).)*"
+                r"message(?:\[['\"]tool_calls['\"]\]|\.tool_calls)",
+                chat_template,
+                re.DOTALL,
+            )
+            is not None
+        )
+
+    @staticmethod
     def _normalize_tool_call_arguments_to_dict(messages: List[Dict]) -> List[Dict]:
         # OpenAI spec sends tool_calls.function.arguments as a JSON-encoded
         # string, but Coder-style templates (Qwen3-Coder / qwen3.5 / qwen3.6)
@@ -411,9 +432,22 @@ class ChatModelMixin:
     ) -> str:
         compiled_template = self._compile_jinja_template(chat_template)
         rendered = compiled_template.render(
-            messages=messages, **{"add_generation_prompt": True, **kwargs}
+            messages=self._prepare_chat_template_messages(messages, chat_template),
+            **{"add_generation_prompt": True, **kwargs},
         )
         return rendered
+
+    def _prepare_chat_template_messages(
+        self, messages: List[Dict], chat_template: Optional[str]
+    ) -> List[Dict]:
+        if self._chat_template_needs_dict_arguments(chat_template):
+            messages = self._normalize_tool_call_arguments_to_dict(messages)
+        return self.prefill_messages(
+            messages,
+            fill_tool_calls=not self._chat_template_needs_null_tool_content(
+                chat_template
+            ),
+        )
 
     @staticmethod
     def _close_reasoning_prompt(prompt: str, parser: Optional[ReasoningParser]) -> str:
@@ -429,15 +463,18 @@ class ChatModelMixin:
         return prompt
 
     @staticmethod
-    def prefill_messages(messages: List[Dict]) -> List[Dict]:
+    def prefill_messages(
+        messages: List[Dict], *, fill_tool_calls: bool = False
+    ) -> List[Dict]:
         """
-        Preprocess messages to ensure content is not None
+        Fill missing content, deferring assistant tool-call content to the template.
 
         Args:
             messages: Original message list
+            fill_tool_calls: Also replace null tool-call content with a string
 
         Returns:
-            Processed message list, where content is not None
+            Processed message list without changing the original dictionaries
         """
         processed_messages = []
 
@@ -445,7 +482,13 @@ class ChatModelMixin:
             if isinstance(msg, dict):
                 if msg.get("content") is None:
                     msg_copy = msg.copy()
-                    msg_copy["content"] = ""  # Replace None with empty string
+                    msg_copy["content"] = (
+                        None
+                        if msg.get("role") == "assistant"
+                        and msg.get("tool_calls")
+                        and not fill_tool_calls
+                        else ""
+                    )
                     processed_messages.append(msg_copy)
                 else:
                     processed_messages.append(msg)
@@ -466,6 +509,13 @@ class ChatModelMixin:
             getattr(self.model_family, "model_family", None)
             or self.model_family.model_name
         )
+        thinking_modes = {
+            "baichuan-m2": {True: "on", False: "off"},
+            "minimax-m3": {True: "enabled", False: "disabled"},
+        }.get(family.lower())
+        enable_thinking = kwargs.get("enable_thinking")
+        if thinking_modes is not None and isinstance(enable_thinking, bool):
+            kwargs.setdefault("thinking_mode", thinking_modes[enable_thinking])
         if isinstance(
             getattr(self, "tool_parser", None), Glm4ToolParser
         ) and family.lower() in {"glm4-chat", "glm4-chat-1m", "glm4-0414"}:
@@ -490,11 +540,6 @@ class ChatModelMixin:
                 else:
                     glm_messages.append(message)
             messages = glm_messages
-        normalization_template = chat_template
-        if normalization_template is None and tokenizer is not None:
-            normalization_template = getattr(tokenizer, "chat_template", None)
-        if self._chat_template_needs_dict_arguments(normalization_template):
-            messages = self._normalize_tool_call_arguments_to_dict(messages)
         if (
             "vision" not in self.model_family.model_ability
             and "audio" not in self.model_family.model_ability
@@ -537,6 +582,17 @@ class ChatModelMixin:
                 return prompt
             else:
                 try:
+                    get_chat_template = getattr(tokenizer, "get_chat_template", None)
+                    if callable(get_chat_template):
+                        selected_template = get_chat_template(
+                            chat_template, tools=kwargs.get("tools")
+                        )
+                    else:
+                        selected_template = chat_template
+                        if selected_template is None:
+                            selected_template = getattr(
+                                tokenizer, "chat_template", None
+                            )
                     template_kwargs = {
                         "tokenize": tokenize,
                         "add_generation_prompt": True,
@@ -545,7 +601,10 @@ class ChatModelMixin:
                     if chat_template is not None:
                         template_kwargs["chat_template"] = chat_template
                     full_context = tokenizer.apply_chat_template(
-                        messages, **template_kwargs
+                        self._prepare_chat_template_messages(
+                            messages, selected_template
+                        ),
+                        **template_kwargs,
                     )
                     logger.debug("Prompt: %s", full_context)
                     return full_context
@@ -645,18 +704,8 @@ class ChatModelMixin:
         _messages.append({"role": "assistant", "content": ""})
 
         if "internvl" in model_family.lower():
-            system_prompt = (
-                messages[0]["content"] if messages[0]["role"] == "system" else ""
-            )
             intra_message_sep = "<|im_end|>"
-            ret = (
-                "<s>"
-                if system_prompt == ""
-                else "<s><|im_start|>system\n"  # type: ignore
-                + system_prompt
-                + intra_message_sep
-                + "\n"
-            )
+            ret = "<s>"
             images = []  # type: ignore
             for message in _messages:
                 role = "<|im_start|>" + message["role"]
@@ -667,14 +716,15 @@ class ChatModelMixin:
                     else:
                         ret += role + "\n"
                 elif isinstance(content, list):
-                    text = ""
+                    texts = []
                     image_urls = []
                     for c in content:
                         c_type = c.get("type")
                         if c_type == "text":
-                            text = c["text"]
+                            texts.append(c["text"])
                         elif c_type == "image_url":
                             image_urls.append(c["image_url"]["url"])
+                    text = " ".join(texts)
                     image_futures = []
                     from concurrent.futures import ThreadPoolExecutor
 
@@ -1123,7 +1173,12 @@ class ChatModelMixin:
             return c
         if self.tool_parser is None:
             return c
-        _id = chunk_id if chunk_id is not None else str(uuid.uuid4())
+        # ChatGLM's override is an engine ID; c may already be a chat chunk.
+        _id = (
+            "chat" + chunk_id
+            if chunk_id is not None
+            else self._get_chat_completion_chunk_id(c)
+        )
         tool_result = None
         finish_reason = None
         token = request_tools_var.set(tools)
@@ -1249,7 +1304,7 @@ class ChatModelMixin:
         else:
             usage = self._sanitize_usage(c.get("usage"))
         return {
-            "id": "chat" + f"cmpl-{_id}",
+            "id": _id,
             "model": model_uid,
             "object": "chat.completion.chunk",
             "created": int(time.time()),

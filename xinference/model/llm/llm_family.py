@@ -399,10 +399,23 @@ SGLANG_CLASSES: List[Type[LLM]] = []
 TRANSFORMERS_CLASSES: List[Type[LLM]] = []
 VLLM_CLASSES: List[Type[LLM]] = []
 MLX_CLASSES: List[Type[LLM]] = []
-LMDEPLOY_CLASSES: List[Type[LLM]] = []
+TRTLLM_CLASSES: List[Type[LLM]] = []
 
 LLM_ENGINES: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
 SUPPORTED_ENGINES: Dict[str, List[Type[LLM]]] = {}
+
+
+def get_llm_family_by_name(model_name: str) -> Optional[LLMFamilyV2]:
+    from .custom import get_user_defined_llm_families
+
+    return next(
+        (
+            family
+            for family in BUILTIN_LLM_FAMILIES + get_user_defined_llm_families()
+            if family.model_name == model_name
+        ),
+        None,
+    )
 
 
 # Add decorator definition
@@ -692,7 +705,10 @@ def check_engine_by_spec_parameters_with_virtual_env(
     quantization: str,
     llm_family: Optional["LLMFamilyV2"] = None,
 ) -> Type[LLM]:
-    from ..utils import _collect_virtualenv_engine_markers
+    from ..utils import (
+        _collect_virtualenv_engine_markers,
+        _collect_virtualenv_installable_engines,
+    )
 
     def get_model_engine_from_spell(engine_str: str) -> str:
         for engine in LLM_ENGINES[model_name].keys():
@@ -721,6 +737,18 @@ def check_engine_by_spec_parameters_with_virtual_env(
     ) -> Optional[Type[LLM]]:
         if not engine_classes:
             return None
+        if model_engine.lower() == "trt-llm":
+            # Installing dependencies cannot extend this adapter's model support.
+            spec = _select_llm_spec(family)
+            return next(
+                (
+                    cls
+                    for cls in engine_classes
+                    if spec is not None
+                    and cls.match_json(family, spec, quantization) is True
+                ),
+                None,
+            )
         abilities = set(getattr(family, "model_ability", []) or [])
         preferred_tokens: List[Tuple[str, ...]] = []
         if any(a in abilities for a in ("vision", "audio", "omni")):
@@ -737,17 +765,16 @@ def check_engine_by_spec_parameters_with_virtual_env(
     if model_name not in LLM_ENGINES:
         raise ValueError(f"Model {model_name} not found.")
     if llm_family is None:
-        llm_family = next(
-            (f for f in BUILTIN_LLM_FAMILIES if f.model_name == model_name), None
-        )
+        llm_family = get_llm_family_by_name(model_name)
     engine_markers = _collect_virtualenv_engine_markers(llm_family)
-    if engine_markers and model_engine.lower() not in engine_markers:
+    installable_engines = _collect_virtualenv_installable_engines(llm_family)
+    if engine_markers and model_engine.lower() not in installable_engines:
         raise ValueError(
             f"Engine {model_engine} is not listed in virtualenv packages for model {model_name}."
         )
     model_engine = get_model_engine_from_spell(model_engine)
     if model_engine not in LLM_ENGINES[model_name]:
-        if model_engine.lower() in engine_markers:
+        if model_engine.lower() in installable_engines:
             if model_engine.lower() == "mlx" and model_format != "mlx":
                 raise ValueError(
                     f"Engine {model_engine} only supports mlx format, got {model_format}."
@@ -787,7 +814,7 @@ def check_engine_by_spec_parameters_with_virtual_env(
             and quantization in param["quantizations"]
         ):
             return param["llm_class"]
-    if model_engine.lower() in engine_markers:
+    if model_engine.lower() in installable_engines:
         if model_engine.lower() == "mlx" and model_format != "mlx":
             raise ValueError(
                 f"Engine {model_engine} only supports mlx format, got {model_format}."

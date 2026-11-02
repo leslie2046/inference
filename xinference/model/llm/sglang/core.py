@@ -62,6 +62,7 @@ from ..utils import (
     DEEPSEEK_TOOL_CALL_FAMILY,
     GEMMA_TOOL_CALL_FAMILY,
     GLM5_TOOL_CALL_FAMILY,
+    LLAMA3_TOOL_CALL_FAMILY,
     MINICPM5_TOOL_CALL_FAMILY,
     QWEN_TOOL_CALL_FAMILY,
     QWEN_TOOL_CALL_SYMBOLS,
@@ -112,6 +113,8 @@ class SGLANGGenerateConfig(TypedDict, total=False):
     max_new_tokens: int
     stop: Optional[Union[str, List[str]]]
     ignore_eos: bool
+    seed: Optional[int]
+    sampling_seed: Optional[int]
     cache_salt: str
     stream: bool
     stream_options: Optional[Union[dict, None]]
@@ -247,7 +250,9 @@ class SGLANGModel(WeightCachedModel, LLM, ChatModelMixin):
         cache_config = self._model_config.pop("_xavier_cache_config", None)  # type: ignore[typeddict-item]
         nixl_config = self._model_config.pop("_nixl_config", None)  # type: ignore[typeddict-item]
         if cache_config is not None:
-            self._model_config.setdefault("dtype", "float16")
+            self._model_config.setdefault(
+                "dtype", cache_config.get("logical_dtype", "float16")
+            )
         self._model_config = self._sanitize_model_config(self._model_config)
         if nixl_config is not None:
             from .pd import configure_nixl
@@ -587,6 +592,11 @@ class SGLANGModel(WeightCachedModel, LLM, ChatModelMixin):
         stream_options = generate_config.get("stream_options")
         generate_config.setdefault("stream_options", stream_options)
         generate_config.setdefault("ignore_eos", False)
+        # SGLang's SamplingParams names the OpenAI ``seed`` ``sampling_seed`` and
+        # rejects unknown keys, so a raw ``seed`` fails the whole request.
+        seed = generate_config.pop("seed", None)
+        if seed is not None:
+            generate_config.setdefault("sampling_seed", seed)
         response_format = generate_config.pop("response_format", None)
         if response_format:
             if response_format.get("type") == "json_object":
@@ -939,16 +949,21 @@ class SGLANGModel(WeightCachedModel, LLM, ChatModelMixin):
                 self._engine.generate_url, json=json_data, headers=self._engine_headers()  # type: ignore
             ) as response:
                 response.raise_for_status()
+                buffer = b""
+                stream_done = False
                 async for chunk, _ in response.content.iter_chunks():
-                    chunk = chunk.decode("utf-8")
-                    if chunk and chunk.startswith("data:"):
-                        stop = "data: [DONE]\n\n"
-                        need_stop = False
-                        if chunk.endswith(stop):
-                            chunk = chunk[: -len(stop)]
-                            need_stop = True
+                    buffer += chunk
+                    # HTTP chunks can split UTF-8 characters or contain several events.
+                    while b"\n" in buffer:
+                        chunk, buffer = buffer.split(b"\n", 1)
+                        if not chunk.startswith(b"data:"):
+                            continue
+                        chunk = chunk[5:].strip()
+                        if chunk == b"[DONE]":
+                            stream_done = True
+                            break
                         if chunk:
-                            data = json.loads(chunk[5:].strip("\n"))
+                            data = json.loads(chunk)
                             if pd_decode:
                                 finished = (
                                     self._check_pd_finish(data["meta_info"]) or finished
@@ -969,8 +984,8 @@ class SGLANGModel(WeightCachedModel, LLM, ChatModelMixin):
                                 )
                                 yield meta_info, cur
                             pos += len(cur)
-                            if need_stop:
-                                break
+                    if stream_done:
+                        break
         if pd_decode and not finished:
             raise RuntimeError("SGLang PD decode stream ended without a finish reason")
 
@@ -1360,7 +1375,7 @@ class SGLANGModel(WeightCachedModel, LLM, ChatModelMixin):
         stream_options = sanitized_generate_config.pop("stream_options")
 
         include_usage = (
-            stream_options.pop("include_usage")
+            stream_options.pop("include_usage", False)
             if isinstance(stream_options, dict)
             else False
         )
@@ -1667,6 +1682,7 @@ class SGLANGChatModel(SGLANGModel):
         if tools:
             if (
                 model_family in QWEN_TOOL_CALL_FAMILY
+                or model_family in LLAMA3_TOOL_CALL_FAMILY
                 or model_family in GEMMA_TOOL_CALL_FAMILY
                 or model_family in DEEPSEEK_TOOL_CALL_FAMILY
                 or model_family in GLM5_TOOL_CALL_FAMILY
